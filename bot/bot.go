@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/cloudapp3/vmflow/engine"
 	tg "github.com/cloudapp3/tgbot"
 	"github.com/cloudapp3/tgbot/ext"
+	"github.com/cloudapp3/vmflow/engine"
 )
 
 type Bot struct {
