@@ -1,0 +1,73 @@
+# Binaries and release artifacts
+/vmflow
+/relayd
+/relayctl
+/relaytui
+/relay
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go build / coverage artifacts
+coverage.out
+coverage-*.out
+.coverprofile
+.cache/
+.gocache/
+
+# Logs and local config
+*.log
+*.local.json
+
+# IDE / editor
+.idea/
+.vscode/
+.DS_Store
+
+# Local agent/tooling state; keep out of public GitHub submissions.
+AGENTS.md
+.lingma/
+.codex
+.agents/
+.claude/
+.adal/
+.augment/
+.bob/
+.codebuddy/
+.commandcode/
+.continue/
+.cortex/
+.crush/
+.factory/
+.goose/
+.iflow/
+.junie/
+.kilocode/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pi/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.trae/
+.vibe/
+.windsurf/
+.zencoder/
+skills/
+skills-lock.json
+/scripts/
+sh/
+
+# Experimental local-only Rust port; not part of the public release.
+/vmflow-rs/

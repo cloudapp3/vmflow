@@ -1,0 +1,41 @@
+version: 1
+
+log:
+  level: info
+  format: text
+
+tunnel_client:
+  server_addr: 127.0.0.1:18080
+  client_id: home-01
+  token: change-me-long-random-token
+  dial_timeout: 10s
+  reconnect_min: 1s
+  reconnect_max: 30s
+
+  # Enable only when tunnel_server.tls.enabled=true.
+  tls:
+    enabled: false
+    server_name: tunnel.example.com
+    insecure_skip_verify: false
+
+  tunnels:
+    - tunnel_id: home-ssh
+      protocol: tcp
+      remote_listen_addr: 0.0.0.0
+      remote_listen_port: 2201
+      local_addr: 127.0.0.1
+      local_port: 22
+
+    - tunnel_id: home-web
+      protocol: tcp
+      remote_listen_addr: 0.0.0.0
+      remote_listen_port: 8080
+      local_addr: 127.0.0.1
+      local_port: 8080
+
+    - tunnel_id: home-dns
+      protocol: udp
+      remote_listen_addr: 0.0.0.0
+      remote_listen_port: 5353
+      local_addr: 127.0.0.1
+      local_port: 53

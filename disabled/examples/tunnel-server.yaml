@@ -1,0 +1,37 @@
+version: 1
+
+# Local admin API for health, tunnel state, stats, and Prometheus metrics.
+admin_listen_addr: 127.0.0.1:19091
+
+log:
+  level: info
+  format: text
+
+# Optional Bearer-token auth for the local tunnel admin API.
+auth:
+  enabled: false
+  tokens:
+    - name: admin
+      token: change-me-admin-token
+      role: admin
+
+tunnel_server:
+  # Public address that tunnel clients connect to.
+  # Keep 127.0.0.1 for local testing; use 0.0.0.0:443 on a public VPS.
+  listen_addr: 0.0.0.0:18080
+  open_timeout: 10s
+
+  # Optional TLS. For the MVP, leave disabled for private/lab networks or put
+  # the tunnel behind a TLS terminator. Enable this for direct Internet use.
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+  clients:
+    - client_id: home-01
+      token: change-me-long-random-token
+      allow:
+        protocols: ["tcp", "udp"]
+        remote_ports: [2201, 8080, 5353]
+        max_tunnels: 8

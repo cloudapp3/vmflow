@@ -1,0 +1,28 @@
+version: 1
+admin_listen_addr: 127.0.0.1:19090
+
+log:
+  level: info
+  format: text # text or json
+
+# Enable before exposing admin_listen_addr outside localhost.
+# relayctl/vmflow ctl can pass the token with -token or VMFLOW_ADMIN_TOKEN.
+auth:
+  enabled: false
+  tokens:
+    - name: admin
+      token: change-me
+      role: admin
+
+rules:
+  - rule_id: ssh-forward
+    name: ssh-forward
+    protocol: tcp
+    listen_addr: 0.0.0.0
+    listen_port: 2201
+    target_addr: 127.0.0.1
+    target_port: 22
+    enabled: true
+    speed_limit: 0
+    max_conn: 0
+    remark: example

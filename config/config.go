@@ -1,0 +1,172 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/cloudapp3/vmflow/engine"
+	"gopkg.in/yaml.v3"
+)
+
+const DefaultAdminListenAddr = "127.0.0.1:19090"
+const DefaultLogLevel = "info"
+const DefaultLogFormat = "text"
+
+const (
+	AuthRoleAdmin  = "admin"
+	AuthRoleViewer = "viewer"
+)
+
+type File struct {
+	Version         int              `json:"version" yaml:"version"`
+	AdminListenAddr string           `json:"admin_listen_addr" yaml:"admin_listen_addr"`
+	Log             LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
+	Auth            AuthConfig       `json:"auth,omitempty" yaml:"auth,omitempty"`
+	BotToken        string           `json:"bot_token,omitempty" yaml:"bot_token,omitempty"`
+	BotChat         int64            `json:"bot_chat,omitempty" yaml:"bot_chat,omitempty"`
+	AcmeChallenge   string           `json:"acme_challenge,omitempty" yaml:"acme_challenge,omitempty"`
+	AcmeHTTP01Addr  string           `json:"acme_http01_addr,omitempty" yaml:"acme_http01_addr,omitempty"`
+	AcmeCacheDir    string           `json:"acme_cache_dir,omitempty" yaml:"acme_cache_dir,omitempty"`
+	AcmeDNS01       DNS01Config      `json:"acme_dns01,omitempty" yaml:"acme_dns01,omitempty"`
+	CertCacheDir    string           `json:"cert_cache_dir,omitempty" yaml:"cert_cache_dir,omitempty"`
+	CertReview      CertReviewConfig `json:"cert_review,omitempty" yaml:"cert_review,omitempty"`
+	Rules           []engine.Rule    `json:"rules" yaml:"rules"`
+}
+
+// CertReviewConfig controls certificate review thresholds.
+type CertReviewConfig struct {
+	ExpiryWarningDays  int `json:"expiry_warning_days,omitempty" yaml:"expiry_warning_days,omitempty"`
+	ExpiryCriticalDays int `json:"expiry_critical_days,omitempty" yaml:"expiry_critical_days,omitempty"`
+	MinRSABits         int `json:"min_rsa_bits,omitempty" yaml:"min_rsa_bits,omitempty"`
+}
+
+// DNS01Config configures DNS-01 ACME challenge solving.
+type DNS01Config struct {
+	Provider             string `json:"provider,omitempty" yaml:"provider,omitempty"`
+	PropagationTimeout   string `json:"propagation_timeout,omitempty" yaml:"propagation_timeout,omitempty"`
+	PollingInterval      string `json:"polling_interval,omitempty" yaml:"polling_interval,omitempty"`
+	CloudflareAPIToken   string `json:"cloudflare_api_token,omitempty" yaml:"cloudflare_api_token,omitempty"`
+	RFC2136Nameserver    string `json:"rfc2136_nameserver,omitempty" yaml:"rfc2136_nameserver,omitempty"`
+	RFC2136TSIGAlgorithm string `json:"rfc2136_tsig_algorithm,omitempty" yaml:"rfc2136_tsig_algorithm,omitempty"`
+	RFC2136TSIGKey       string `json:"rfc2136_tsig_key,omitempty" yaml:"rfc2136_tsig_key,omitempty"`
+	RFC2136TSIGSecret    string `json:"rfc2136_tsig_secret,omitempty" yaml:"rfc2136_tsig_secret,omitempty"`
+	ExecPath             string `json:"exec_path,omitempty" yaml:"exec_path,omitempty"`
+}
+
+// LogConfig controls structured logging for daemon mode.
+type LogConfig struct {
+	Level  string `json:"level,omitempty" yaml:"level,omitempty"`
+	Format string `json:"format,omitempty" yaml:"format,omitempty"`
+}
+
+// AuthConfig controls Admin API bearer-token authentication.
+type AuthConfig struct {
+	Enabled bool        `json:"enabled" yaml:"enabled"`
+	Tokens  []AuthToken `json:"tokens,omitempty" yaml:"tokens,omitempty"`
+}
+
+// AuthToken is one Admin API bearer token. Token values are secrets and must
+// not be logged.
+type AuthToken struct {
+	Name  string `json:"name,omitempty" yaml:"name,omitempty"`
+	Token string `json:"token" yaml:"token"`
+	Role  string `json:"role,omitempty" yaml:"role,omitempty"`
+}
+
+func Load(path string) (File, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return File{}, fmt.Errorf("missing config path")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return File{}, err
+	}
+	return Parse(raw)
+}
+
+func Parse(raw []byte) (File, error) {
+	var cfg File
+	if len(raw) == 0 {
+		return File{}, fmt.Errorf("empty config")
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return File{}, err
+	}
+	if cfg.Version == 0 {
+		cfg.Version = 1
+	}
+	if cfg.Version != 1 {
+		return File{}, fmt.Errorf("unsupported config version: %d", cfg.Version)
+	}
+	cfg.AdminListenAddr = strings.TrimSpace(cfg.AdminListenAddr)
+	if cfg.AdminListenAddr == "" {
+		cfg.AdminListenAddr = DefaultAdminListenAddr
+	}
+	cfg.Log = normalizeLog(cfg.Log)
+	var err error
+	cfg.Auth, err = normalizeAuth(cfg.Auth)
+	if err != nil {
+		return File{}, err
+	}
+	seen := make(map[string]struct{}, len(cfg.Rules))
+	for index, rule := range cfg.Rules {
+		rule = rule.Standardize()
+		if err := rule.Validate(); err != nil {
+			return File{}, fmt.Errorf("rules[%d]: %w", index, err)
+		}
+		if _, ok := seen[rule.RuleID]; ok {
+			return File{}, fmt.Errorf("duplicate rule id: %s", rule.RuleID)
+		}
+		seen[rule.RuleID] = struct{}{}
+		cfg.Rules[index] = rule
+	}
+	return cfg, nil
+}
+
+func normalizeLog(logCfg LogConfig) LogConfig {
+	logCfg.Level = strings.ToLower(strings.TrimSpace(logCfg.Level))
+	if logCfg.Level == "" {
+		logCfg.Level = DefaultLogLevel
+	}
+	logCfg.Format = strings.ToLower(strings.TrimSpace(logCfg.Format))
+	if logCfg.Format == "" {
+		logCfg.Format = DefaultLogFormat
+	}
+	return logCfg
+}
+
+func normalizeAuth(auth AuthConfig) (AuthConfig, error) {
+	seen := make(map[string]struct{}, len(auth.Tokens))
+	for index, token := range auth.Tokens {
+		token.Name = strings.TrimSpace(token.Name)
+		token.Token = strings.TrimSpace(token.Token)
+		token.Role = strings.ToLower(strings.TrimSpace(token.Role))
+		if token.Role == "" {
+			token.Role = AuthRoleAdmin
+		}
+		if token.Role != AuthRoleAdmin && token.Role != AuthRoleViewer {
+			return AuthConfig{}, fmt.Errorf("auth.tokens[%d]: invalid role: %s", index, token.Role)
+		}
+		if token.Token == "" {
+			if auth.Enabled {
+				return AuthConfig{}, fmt.Errorf("auth.tokens[%d]: missing token", index)
+			}
+			auth.Tokens[index] = token
+			continue
+		}
+		if _, ok := seen[token.Token]; ok {
+			return AuthConfig{}, fmt.Errorf("auth.tokens[%d]: duplicate token", index)
+		}
+		seen[token.Token] = struct{}{}
+		if token.Name == "" {
+			token.Name = fmt.Sprintf("token-%d", index+1)
+		}
+		auth.Tokens[index] = token
+	}
+	if auth.Enabled && len(seen) == 0 {
+		return AuthConfig{}, fmt.Errorf("auth enabled but no tokens configured")
+	}
+	return auth, nil
+}
