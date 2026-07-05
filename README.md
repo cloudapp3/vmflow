@@ -118,9 +118,10 @@ vmflow daemon        -config ./examples/config.yaml [-admin-listen 127.0.0.1:190
 vmflow ctl           [-addr http://127.0.0.1:19090] [-token TOKEN] <health|rules|stats|metrics|precheck|reload>
 vmflow tui           [-addr http://127.0.0.1:19090] [-token TOKEN]
 vmflow version       [-json]
+vmflow update        [--check] [--version tag]
 ```
 
-Aliases are available: `daemon=d`, `ctl=c`, `tui=t`, and `version=v`.
+Aliases are available: `daemon=d`, `ctl=c`, `tui=t`, `version=v`, and `update=u`.
 
 ## Admin API
 

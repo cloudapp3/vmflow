@@ -21,6 +21,7 @@ import (
 	"github.com/cloudapp3/vmflow/controlapi"
 	"github.com/cloudapp3/vmflow/engine"
 	"github.com/cloudapp3/vmflow/internal/logging"
+	"github.com/cloudapp3/vmflow/internal/updater"
 	"github.com/cloudapp3/vmflow/metrics"
 	"github.com/cloudapp3/vmflow/tui"
 )
@@ -39,8 +40,9 @@ Usage:
   vmflow ctl           [-addr url] [-token token] <health|rules|stats|metrics|precheck|reload>    Query running daemon
   vmflow tui           [-addr url] [-token token]                      Terminal UI dashboard
   vmflow version       [-json]                                         Show version info
+  vmflow update        [--check] [--version tag]                       Self-update vmflow binary
 
-Aliases: daemon=d, ctl=c, tui=t, version=v
+Aliases: daemon=d, ctl=c, tui=t, version=v, update=u
 `
 
 func main() {
@@ -62,6 +64,8 @@ func main() {
 		runTUI(args[1:])
 	case "version", "v":
 		runVersion(args[1:])
+	case "update", "u":
+		runUpdate(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		flag.Usage()
@@ -342,4 +346,133 @@ func optionalField(value string, markers ...string) string {
 		}
 	}
 	return value
+}
+
+// ── update ──────────────────────────────────────────────────────────
+
+func runUpdate(args []string) {
+	fs := flag.NewFlagSet("update", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage:\n  vmflow update [--check] [--version <tag>]\n\nOptions:\n")
+		fs.PrintDefaults()
+	}
+	var checkOnly bool
+	var targetVersion string
+	fs.BoolVar(&checkOnly, "check", false, "check for updates without installing")
+	fs.StringVar(&targetVersion, "version", "", "install or inspect a specific release tag")
+	fs.Parse(args)
+	if len(fs.Args()) != 0 {
+		fmt.Fprintln(os.Stderr, "update does not accept positional args")
+		os.Exit(1)
+	}
+
+	currentRaw := strings.TrimSpace(version)
+	if !checkOnly && targetVersion == "" && strings.EqualFold(currentRaw, "dev") {
+		fmt.Fprintf(os.Stderr, "self-update requires a tagged release build; current version is %q (use --version vX.Y.Z to install a specific release)\n", version)
+		os.Exit(1)
+	}
+
+	client := updater.New(updater.Config{
+		Repo:        "cloudapp3/vmflow",
+		BinaryName:  "vmflow",
+		CurrentVer:  version,
+		GitHubToken: updateTokenFromEnv(),
+		CacheDir:    updater.CacheDir(),
+	})
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	targetTag := normalizeReleaseTag(targetVersion)
+	var (
+		result *updater.CheckResult
+		err    error
+	)
+	if targetTag != "" {
+		result, err = client.CheckSpecificVersion(ctx, targetTag)
+	} else {
+		result, err = client.CheckForUpdate(ctx)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to check for updates: %v\n", err)
+		os.Exit(1)
+	}
+	if result == nil {
+		fmt.Fprintln(os.Stderr, "failed to check for updates: empty result")
+		os.Exit(1)
+	}
+
+	if checkOnly {
+		writeUpdateCheck(os.Stdout, result, targetTag != "")
+		return
+	}
+
+	if !result.UpdateAvailable {
+		if targetTag != "" && normalizeReleaseTag(result.CurrentVersion) == normalizeReleaseTag(result.LatestVersion) {
+			fmt.Printf("already on requested version: %s\n", formatReleaseTag(result.LatestVersion))
+			return
+		}
+		if targetTag != "" {
+			fmt.Printf("requested version %s is not newer than current %s\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+			return
+		}
+		fmt.Printf("already up to date: %s\n", formatReleaseTag(result.CurrentVersion))
+		return
+	}
+
+	if result.Release == nil {
+		fmt.Fprintln(os.Stderr, "failed to install update: release metadata is unavailable")
+		os.Exit(1)
+	}
+
+	fmt.Printf("updating from %s to %s\n", formatReleaseTag(result.CurrentVersion), formatReleaseTag(result.LatestVersion))
+	if err := client.DownloadAndInstall(ctx, result.Release, os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to install update: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("updated successfully to %s\n", formatReleaseTag(result.LatestVersion))
+}
+
+func writeUpdateCheck(w io.Writer, result *updater.CheckResult, specific bool) {
+	switch {
+	case result.UpdateAvailable && specific:
+		fmt.Fprintf(w, "target release available: %s (current %s)\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+	case result.UpdateAvailable:
+		fmt.Fprintf(w, "update available: %s (current %s)\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+	case specific && normalizeReleaseTag(result.CurrentVersion) == normalizeReleaseTag(result.LatestVersion):
+		fmt.Fprintf(w, "already on requested version: %s\n", formatReleaseTag(result.LatestVersion))
+	case specific:
+		fmt.Fprintf(w, "requested version %s is not newer than current %s\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+	default:
+		fmt.Fprintf(w, "already up to date: %s\n", formatReleaseTag(result.CurrentVersion))
+	}
+}
+
+func updateTokenFromEnv() string {
+	if token := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); token != "" {
+		return token
+	}
+	return strings.TrimSpace(os.Getenv("GH_TOKEN"))
+}
+
+func normalizeReleaseTag(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.EqualFold(v, "dev") {
+		return v
+	}
+	if !strings.HasPrefix(v, "v") {
+		return "v" + v
+	}
+	return v
+}
+
+func formatReleaseTag(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "unknown"
+	}
+	if strings.EqualFold(v, "dev") {
+		return v
+	}
+	return normalizeReleaseTag(v)
 }
