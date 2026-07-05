@@ -2,24 +2,22 @@
 
 `vmflow` is a small Go L4 forwarding runtime. It can run as a standalone daemon or be embedded into a larger control plane.
 
-📖 **Documentation:** <https://vmflow.bestcheapvps.org> · [Quick start](https://vmflow.bestcheapvps.org/guide/quick-start) · [HTTP API](https://vmflow.bestcheapvps.org/api) · [Go library](https://vmflow.bestcheapvps.org/library/)
-
 [![Docs](https://img.shields.io/badge/docs-vmflow.bestcheapvps.org-14b8a6)](https://vmflow.bestcheapvps.org)
 [![CI](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml/badge.svg)](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cloudapp3/vmflow.svg)](https://pkg.go.dev/github.com/cloudapp3/vmflow)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+Documentation: [Website](https://vmflow.bestcheapvps.org) · [中文说明](https://vmflow.bestcheapvps.org/zh/) · [HTTP API](https://vmflow.bestcheapvps.org/api) · [Docs source](https://github.com/cloudapp3/vmdocs)
+
 ## What it does
 
 - TCP, UDP, and `tcp+udp` port forwarding
-- TCP/UDP NAT traversal / intranet tunnel mode via `vmflow tunnel-server` and `vmflow tunnel-client` _(当前构建暂未启用)_
 - Rule lifecycle management: start, stop, restart, and full snapshot apply
 - Config-driven daemon with hot reload
 - Local admin API for health, rules, stats, precheck, reload, and metrics
 - Bearer-token auth with viewer/admin roles
 - Structured logs in text or JSON format
 - Prometheus-compatible `/metrics`
-- Tunnel-server Admin API for clients, tunnels, stats, and metrics
 - Rule precheck for loops, duplicate ports, and unavailable listeners
 - Embeddable Go runtime for products that need in-process forwarding
 - Terminal dashboard via `vmflow tui`
@@ -124,14 +122,6 @@ vmflow version       [-json]
 
 Aliases are available: `daemon=d`, `ctl=c`, `tui=t`, and `version=v`.
 
-> NAT 隧道相关命令(`tunnel-server` / `tunnel-client` / `tunnel-ctl`)在当前构建中暂未启用。
-
-The older standalone entries (`cmd/relayd`, `cmd/relayctl`, `cmd/relaytui`) remain buildable for compatibility, but release artifacts should prefer the single `vmflow` binary.
-
-## Tunnel mode(暂未启用)
-
-> NAT 隧道能力(`tunnel-server` / `tunnel-client` / `tunnel-ctl`)在当前构建中暂未启用,相关文档与示例已移至 [`disabled/`](disabled/),源码仍保留在 [`tunnel/`](tunnel/) 以便后续重新接回。
-
 ## Admin API
 
 Documented in [`docs/API.md`](docs/API.md). Main endpoints:
@@ -188,7 +178,6 @@ The release workflow publishes cross-platform archives, `.deb` / `.rpm` packages
 - `metrics/` — Prometheus text exposition helpers
 - `precheck/` — static checks before applying rules
 - `tui/` — terminal dashboard client
-- `tunnel/` — NAT traversal tunnel server/client runtime(当前构建暂未启用,源码保留)
 - `cmd/vmflow/` — primary all-in-one binary
 - `examples/` — runnable and embeddable examples
 - `docs/` — architecture, API, embedding, roadmap, and changelog
