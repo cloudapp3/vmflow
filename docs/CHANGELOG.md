@@ -6,6 +6,7 @@ All notable user-facing changes to `vmflow` are documented here.
 
 ### Added
 
+- New comprehensive end-user guide `docs/USAGE.md` (install → configure → operate the control API → remote access via TLS/mTLS/Cloudflare → security → troubleshooting), linked from the README.
 - Unified `vmflow` binary with `daemon`, `ctl`, `tui`, and `version` subcommands.
 - TCP, UDP, and `tcp+udp` forwarding rules.
 - Rule lifecycle management with full snapshot apply and reload support.

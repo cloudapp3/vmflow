@@ -11,6 +11,8 @@ Route TCP and UDP traffic with a production-grade forwarding runtime that runs a
 
 Documentation: [Website](https://vmflow.bestcheapvps.org) · [中文说明](https://vmflow.bestcheapvps.org/zh/) · [HTTP API](https://vmflow.bestcheapvps.org/api) · [Docs source](https://github.com/cloudapp3/vmdocs)
 
+> **完整使用指南:** [`docs/USAGE.md`](docs/USAGE.md) —— 覆盖安装、配置、运维、远程访问(TLS/mTLS/Cloudflare)、安全加固与排错。English quick reference is below; the deep guide is in `docs/`.
+
 ## What it does
 
 - TCP, UDP, and `tcp+udp` port forwarding
