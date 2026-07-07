@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,7 +23,9 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "config file path")
-	adminListen := flag.String("admin-listen", "", "override admin listen addr")
+	controlListen := flag.String("control-listen", "", "override control listen addr")
+	insecureAllowRemote := flag.Bool("insecure-allow-remote-control", false,
+		"DANGEROUS: allow binding the control API on a non-loopback address without auth")
 	flag.Parse()
 
 	if strings.TrimSpace(*configPath) == "" {
@@ -36,8 +38,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
 		os.Exit(1)
 	}
-	if strings.TrimSpace(*adminListen) != "" {
-		cfg.AdminListenAddr = strings.TrimSpace(*adminListen)
+	if strings.TrimSpace(*controlListen) != "" {
+		cfg.ControlListenAddr = strings.TrimSpace(*controlListen)
 	}
 
 	logger, err := logging.New(cfg.Log)
@@ -46,7 +48,16 @@ func main() {
 		os.Exit(1)
 	}
 	slog.SetDefault(logger)
-	warnIfUnsafeAdmin(cfg, logger)
+	if err := controlapi.EnsureSafeControlBinding(cfg, *insecureAllowRemote, logger); err != nil {
+		fmt.Fprintf(os.Stderr, "control api: %v\n", err)
+		os.Exit(1)
+	}
+
+	tlsCfg, err := controlapi.BuildServerTLSConfig(cfg.ControlTLS)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "control api tls: %v\n", err)
+		os.Exit(1)
+	}
 
 	manager := engine.NewManager(engine.NewCollector())
 	metricsCollector := metrics.New(manager)
@@ -68,15 +79,21 @@ func main() {
 		Metrics:    metricsCollector,
 	}
 	server := &http.Server{
-		Addr:              cfg.AdminListenAddr,
+		Addr:              cfg.ControlListenAddr,
 		Handler:           controlapi.NewHandler(runtime),
+		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("relayd admin server listening", "component", "daemon", "event", "admin_listen", "addr", cfg.AdminListenAddr)
-		errCh <- server.ListenAndServe()
+		scheme, listen := "http", server.ListenAndServe
+		if tlsCfg != nil {
+			scheme = "https"
+			listen = func() error { return server.ListenAndServeTLS("", "") }
+		}
+		logger.Info("relayd control server listening", "component", "daemon", "event", "control_listen", "addr", cfg.ControlListenAddr, "scheme", scheme, "mtls", tlsCfg != nil && tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert)
+		errCh <- listen()
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -98,28 +115,4 @@ func main() {
 	_ = server.Shutdown(shutdownCtx)
 	manager.StopAll()
 	logger.Info("relayd stopped", "component", "daemon", "event", "stopped")
-}
-
-func warnIfUnsafeAdmin(cfg config.File, logger *slog.Logger) {
-	if logger == nil || cfg.Auth.Enabled {
-		return
-	}
-	host, _, err := net.SplitHostPort(cfg.AdminListenAddr)
-	if err != nil {
-		logger.Warn("admin api auth is disabled", "component", "daemon", "event", "auth_disabled", "admin_listen_addr", cfg.AdminListenAddr)
-		return
-	}
-	host = strings.TrimSpace(host)
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		logger.Warn("admin api is exposed without auth", "component", "daemon", "event", "auth_disabled_exposed", "admin_listen_addr", cfg.AdminListenAddr)
-		return
-	}
-	ip := net.ParseIP(host)
-	if ip != nil && ip.IsLoopback() {
-		return
-	}
-	if strings.EqualFold(host, "localhost") {
-		return
-	}
-	logger.Warn("admin api auth is disabled on non-loopback address", "component", "daemon", "event", "auth_disabled_non_loopback", "admin_listen_addr", cfg.AdminListenAddr)
 }

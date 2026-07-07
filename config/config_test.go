@@ -2,7 +2,7 @@ package config
 
 import "testing"
 
-func TestParseDefaultsAdminListenAddr(t *testing.T) {
+func TestParseDefaultsControlListenAddr(t *testing.T) {
 	cfg, err := Parse([]byte(`
 rules:
   - rule_id: r1
@@ -20,8 +20,8 @@ rules:
 	if cfg.Version != 1 {
 		t.Fatalf("expected version 1, got %d", cfg.Version)
 	}
-	if cfg.AdminListenAddr != DefaultAdminListenAddr {
-		t.Fatalf("expected default admin addr %s, got %s", DefaultAdminListenAddr, cfg.AdminListenAddr)
+	if cfg.ControlListenAddr != DefaultControlListenAddr {
+		t.Fatalf("expected default control addr %s, got %s", DefaultControlListenAddr, cfg.ControlListenAddr)
 	}
 }
 

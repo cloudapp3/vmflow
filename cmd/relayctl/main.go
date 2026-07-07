@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/cloudapp3/vmflow/controlapi"
 )
 
 func main() {
-	addr := flag.String("addr", "http://127.0.0.1:19090", "admin api base url")
-	token := flag.String("token", os.Getenv("VMFLOW_ADMIN_TOKEN"), "admin api bearer token (or VMFLOW_ADMIN_TOKEN)")
+	addr := flag.String("addr", "http://127.0.0.1:19090", "control api base url")
+	token := flag.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "control api bearer token (or VMFLOW_CONTROL_TOKEN)")
+	tlsFlags := controlapi.AddClientTLSFlags(flag.CommandLine)
+	headerFlags := controlapi.AddHeaderFlags(flag.CommandLine)
 	flag.Parse()
 	args := flag.Args()
 	if len(args) == 0 {
@@ -45,7 +49,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	status, body, err := doRequest(*addr, *token, method, path)
+	status, body, err := doRequest(*addr, *token, tlsFlags.Opts(), *headerFlags, method, path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -57,7 +61,11 @@ func main() {
 	fmt.Print(string(body))
 }
 
-func doRequest(baseURL, token, method, path string) (int, []byte, error) {
+func doRequest(baseURL, token string, tlsOpts controlapi.ClientTLSOptions, headers controlapi.HeaderFlags, method, path string) (int, []byte, error) {
+	hc, err := controlapi.NewHTTPClient(tlsOpts, 0)
+	if err != nil {
+		return 0, nil, err
+	}
 	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
 	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
@@ -66,7 +74,8 @@ func doRequest(baseURL, token, method, path string) (int, []byte, error) {
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
 	}
-	resp, err := http.DefaultClient.Do(req)
+	headers.Apply(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}

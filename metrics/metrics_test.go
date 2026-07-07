@@ -23,7 +23,7 @@ func TestWriteMetrics(t *testing.T) {
 	}}, engine.ApplySnapshotOptions{ReplaceAll: true})
 
 	collector := New(manager)
-	collector.ObserveAdminRequest("GET", "/healthz", 200, 10*time.Millisecond)
+	collector.ObserveControlRequest("GET", "/healthz", 200, 10*time.Millisecond)
 	collector.ObserveReload("ok")
 	collector.ObserveApplyResult(result)
 
@@ -35,7 +35,7 @@ func TestWriteMetrics(t *testing.T) {
 	for _, want := range []string{
 		"vmflow_uptime_seconds",
 		`vmflow_rule_connections{rule_id="disabled",protocol="unknown"} 0`,
-		`vmflow_admin_requests_total{method="GET",path="/healthz",status="200"} 1`,
+		`vmflow_control_requests_total{method="GET",path="/healthz",status="200"} 1`,
 		`vmflow_reload_total{status="ok"} 1`,
 		`vmflow_rule_apply_total{action="unchanged",status="ok"} 1`,
 	} {

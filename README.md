@@ -1,6 +1,8 @@
 # vmflow
 
-`vmflow` is a small Go L4 forwarding runtime. It can run as a standalone daemon or be embedded into a larger control plane.
+**High-performance L4 network forwarding, in pure Go.**
+
+Route TCP and UDP traffic with a production-grade forwarding runtime that runs as a standalone daemon or drops straight into your control plane. Hot-reloadable rules, live metrics, and an embeddable core.
 
 [![Docs](https://img.shields.io/badge/docs-vmflow.bestcheapvps.org-14b8a6)](https://vmflow.bestcheapvps.org)
 [![CI](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml/badge.svg)](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml)
@@ -14,7 +16,7 @@ Documentation: [Website](https://vmflow.bestcheapvps.org) · [中文说明](http
 - TCP, UDP, and `tcp+udp` port forwarding
 - Rule lifecycle management: start, stop, restart, and full snapshot apply
 - Config-driven daemon with hot reload
-- Local admin API for health, rules, stats, precheck, reload, and metrics
+- Local control API for health, rules, stats, precheck, reload, and metrics
 - Bearer-token auth with viewer/admin roles
 - Structured logs in text or JSON format
 - Prometheus-compatible `/metrics`
@@ -85,7 +87,12 @@ See [`examples/config.yaml`](examples/config.yaml):
 
 ```yaml
 version: 1
-admin_listen_addr: 127.0.0.1:19090
+control_listen_addr: 127.0.0.1:19090
+# control_tls:                       # enable TLS on the control API
+#   cert_file: /etc/vmflow/control.crt
+#   key_file: /etc/vmflow/control.key
+#   client_ca_file: clients-ca.crt   # optional: require client certs (mTLS)
+#   min_version: "1.2"               # "1.2" (default) | "1.3"
 
 log:
   level: info
@@ -109,12 +116,12 @@ rules:
     enabled: true
 ```
 
-Security note: keep the admin API on `127.0.0.1` by default. If you expose it outside localhost, enable bearer-token auth and use an admin token for mutating endpoints.
+Security note: the daemon **refuses to start** if the control API is bound to a non-loopback address without auth. Keep it on `127.0.0.1` (the default), or enable `auth` before exposing it. To bind remotely without auth anyway, pass `--insecure-allow-remote-control` (not recommended — put it behind a TLS-terminating reverse proxy instead).
 
 ## Commands
 
 ```bash
-vmflow daemon        -config ./examples/config.yaml [-admin-listen 127.0.0.1:19090]
+vmflow daemon        -config ./examples/config.yaml [-control-listen 127.0.0.1:19090] [-insecure-allow-remote-control]
 vmflow ctl           [-addr http://127.0.0.1:19090] [-token TOKEN] <health|rules|stats|metrics|precheck|reload>
 vmflow tui           [-addr http://127.0.0.1:19090] [-token TOKEN]
 vmflow version       [-json]
@@ -123,7 +130,7 @@ vmflow update        [--check] [--version tag]
 
 Aliases are available: `daemon=d`, `ctl=c`, `tui=t`, `version=v`, and `update=u`.
 
-## Admin API
+## Control API
 
 Documented in [`docs/API.md`](docs/API.md). Main endpoints:
 
@@ -133,6 +140,26 @@ Documented in [`docs/API.md`](docs/API.md). Main endpoints:
 - `GET|POST /v1/precheck`
 - `POST /v1/reload`
 - `GET /metrics`
+
+## Control API TLS
+
+The control API is plain HTTP by default. Serve it over TLS by setting `control_tls.cert_file` and `key_file`:
+
+```yaml
+control_tls:
+  cert_file: /etc/vmflow/control.crt
+  key_file: /etc/vmflow/control.key
+  client_ca_file: /etc/vmflow/clients-ca.crt   # optional → mTLS (clients must present a cert)
+  min_version: "1.2"   # "1.2" (default) | "1.3"
+```
+
+Clients then use `https://` for `-addr`. For a private/self-signed CA pass `--tls-ca-file` (or `VMFLOW_TLS_CA_FILE`); for mTLS also pass `--tls-client-cert` / `--tls-client-key` (or `VMFLOW_TLS_CLIENT_*`):
+
+```bash
+vmflow ctl -addr https://host:19090 -tls-ca-file ca.crt health
+```
+
+With `client_ca_file` (mTLS) set, the control API counts as authenticated for the non-loopback fail-closed rule, so it can be exposed without bearer auth. For public exposure, binding loopback behind a TLS-terminating reverse proxy (Caddy/Nginx + ACME) is usually simpler. To expose it with zero inbound ports (and optional SSO), see [`docs/behind-cloudflare.md`](docs/behind-cloudflare.md) for a Cloudflare Tunnel + Access runbook; the client `-H` flag carries Access service tokens.
 
 ## Embedding vmflow
 

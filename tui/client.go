@@ -48,9 +48,9 @@ type RuleInfo struct {
 }
 
 type ReloadResponse struct {
-	ConfigPath      string `json:"config_path"`
-	AdminListenAddr string `json:"admin_listen_addr"`
-	RuleCount       int    `json:"rule_count"`
+	ConfigPath        string `json:"config_path"`
+	ControlListenAddr string `json:"control_listen_addr"`
+	RuleCount         int    `json:"rule_count"`
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -58,6 +58,7 @@ type ReloadResponse struct {
 type Client struct {
 	baseURL string
 	token   string
+	headers http.Header
 	http    *http.Client
 }
 
@@ -70,6 +71,34 @@ func NewClient(baseURL string, token ...string) *Client {
 		client.token = token[0]
 	}
 	return client
+}
+
+// SetHTTPClient replaces the HTTP client used for control API requests. Pass
+// nil to keep the default; otherwise the caller controls TLS and timeouts
+// (e.g. a client configured with a private CA or mTLS certificates).
+func (c *Client) SetHTTPClient(h *http.Client) {
+	if c != nil && h != nil {
+		c.http = h
+	}
+}
+
+// SetHeaders sets extra headers (e.g. CF-Access-Client-* when behind Cloudflare
+// Access) applied to every request. nil clears them.
+func (c *Client) SetHeaders(h http.Header) {
+	if c != nil {
+		c.headers = h
+	}
+}
+
+func (c *Client) applyExtraHeaders(req *http.Request) {
+	if c == nil || len(c.headers) == 0 {
+		return
+	}
+	for name, values := range c.headers {
+		for _, v := range values {
+			req.Header.Set(name, v)
+		}
+	}
 }
 
 func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
@@ -102,6 +131,7 @@ func (c *Client) Reload(ctx context.Context) (*ReloadResponse, error) {
 		return nil, err
 	}
 	c.authorize(req)
+	c.applyExtraHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -127,6 +157,7 @@ func (c *Client) doGet(ctx context.Context, path string, result any) error {
 		return err
 	}
 	c.authorize(req)
+	c.applyExtraHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err

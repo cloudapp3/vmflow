@@ -57,16 +57,16 @@ func TestServerReloadConfigUpdatesACLAndDisconnectsInvalidSessions(t *testing.T)
 
 func TestServerPrecheckConfigWarnsForRestartOnlyFields(t *testing.T) {
 	server := NewServer(ServerConfig{
-		Version:         1,
-		AdminListenAddr: "127.0.0.1:19091",
+		Version:           1,
+		ControlListenAddr: "127.0.0.1:19091",
 		TunnelServer: TunnelServerConfig{
 			ListenAddr: "127.0.0.1:18080",
 			Clients:    []ServerClientACL{{ClientID: "home-01", Token: "secret"}},
 		},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	check := server.PrecheckConfig(ServerConfig{
-		Version:         1,
-		AdminListenAddr: "127.0.0.1:19092",
+		Version:           1,
+		ControlListenAddr: "127.0.0.1:19092",
 		TunnelServer: TunnelServerConfig{
 			ListenAddr: "127.0.0.1:18081",
 			Clients:    []ServerClientACL{{ClientID: "home-01", Token: "secret"}},
@@ -80,9 +80,9 @@ func TestServerPrecheckConfigWarnsForRestartOnlyFields(t *testing.T) {
 	}
 }
 
-func TestTunnelAdminReloadRequiresAdmin(t *testing.T) {
+func TestTunnelControlReloadRequiresAdmin(t *testing.T) {
 	path := writeTempConfig(t, []byte(`version: 1
-admin_listen_addr: 127.0.0.1:19091
+control_listen_addr: 127.0.0.1:19091
 auth:
   enabled: true
   tokens:
@@ -103,31 +103,31 @@ tunnel_server:
 		t.Fatalf("LoadServerConfig() error = %v", err)
 	}
 	server := NewServer(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	handler := NewAdminHandler(server, AdminHandlerOptions{ConfigPath: path, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	handler := NewControlHandler(server, ControlHandlerOptions{ConfigPath: path, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 
-	rec := performAdminRequest(handler, "POST", "/v1/tunnel/reload", "Bearer view-token")
+	rec := performControlRequest(handler, "POST", "/v1/tunnel/reload", "Bearer view-token")
 	if rec.Code != 403 {
 		t.Fatalf("viewer reload status = %d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
-	rec = performAdminRequest(handler, "POST", "/v1/tunnel/reload", "Bearer admin-token")
+	rec = performControlRequest(handler, "POST", "/v1/tunnel/reload", "Bearer admin-token")
 	if rec.Code != 200 {
-		t.Fatalf("admin reload status = %d, body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("control reload status = %d, body=%s", rec.Code, rec.Body.String())
 	}
 }
 
 func TestServerReloadConfigKeepsRuntimeListenAddrs(t *testing.T) {
 	server := NewServer(ServerConfig{
-		Version:         1,
-		AdminListenAddr: "127.0.0.1:19091",
-		Auth:            config.AuthConfig{},
+		Version:           1,
+		ControlListenAddr: "127.0.0.1:19091",
+		Auth:              config.AuthConfig{},
 		TunnelServer: TunnelServerConfig{
 			ListenAddr: "127.0.0.1:18080",
 			Clients:    []ServerClientACL{{ClientID: "home-01", Token: "secret"}},
 		},
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	_, err := server.ReloadConfig(ServerConfig{
-		Version:         1,
-		AdminListenAddr: "127.0.0.1:19092",
+		Version:           1,
+		ControlListenAddr: "127.0.0.1:19092",
 		TunnelServer: TunnelServerConfig{
 			ListenAddr: "127.0.0.1:18081",
 			Clients:    []ServerClientACL{{ClientID: "home-01", Token: "secret"}},
@@ -137,8 +137,8 @@ func TestServerReloadConfigKeepsRuntimeListenAddrs(t *testing.T) {
 		t.Fatalf("ReloadConfig() error = %v", err)
 	}
 	cfg := server.Config()
-	if cfg.AdminListenAddr != "127.0.0.1:19091" {
-		t.Fatalf("AdminListenAddr = %q", cfg.AdminListenAddr)
+	if cfg.ControlListenAddr != "127.0.0.1:19091" {
+		t.Fatalf("ControlListenAddr = %q", cfg.ControlListenAddr)
 	}
 	if cfg.TunnelServer.ListenAddr != "127.0.0.1:18080" {
 		t.Fatalf("TunnelServer.ListenAddr = %q", cfg.TunnelServer.ListenAddr)

@@ -153,14 +153,14 @@ func (runner *httpProxyRunner) handleConnect(clientConn net.Conn, br *bufio.Read
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(targetConn, br, runner.rule.SpeedLimit, func(n int64) {
+		_, _ = copyWithLimit(targetConn, br, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
 			runner.collector.AddUpload(runner.rule.RuleID, n)
 		})
 	}()
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(clientConn, targetConn, runner.rule.SpeedLimit, func(n int64) {
+		_, _ = copyWithLimit(clientConn, targetConn, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
 			runner.collector.AddDownload(runner.rule.RuleID, n)
 		})
 	}()
@@ -240,14 +240,14 @@ func (runner *httpProxyRunner) handleHTTP(clientConn net.Conn, br *bufio.Reader,
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(targetConn, br, runner.rule.SpeedLimit, func(n int64) {
+		_, _ = copyWithLimit(targetConn, br, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
 			runner.collector.AddUpload(runner.rule.RuleID, n)
 		})
 	}()
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(clientConn, targetConn, runner.rule.SpeedLimit, func(n int64) {
+		_, _ = copyWithLimit(clientConn, targetConn, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
 			runner.collector.AddDownload(runner.rule.RuleID, n)
 		})
 	}()

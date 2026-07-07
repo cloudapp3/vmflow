@@ -6,14 +6,14 @@
 - [x] UDP 转发
 - [x] `ApplySnapshot`
 - [x] daemon + CLI
-- [x] 本地 admin API
+- [x] 本地 control API
 - [x] YAML 配置
 
 ## v0.2
 
 - [x] Prometheus metrics
 - [x] 更好的结构化日志
-- [x] Admin API 鉴权
+- [x] Control API 鉴权
 - [ ] graceful drain
 - [x] rule precheck
 - [ ] Windows / macOS 手工验证

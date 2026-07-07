@@ -12,20 +12,20 @@ import (
 )
 
 const (
-	DefaultServerListenAddr      = "0.0.0.0:18080"
-	DefaultTunnelAdminListenAddr = "127.0.0.1:19091"
-	DefaultDialTimeout           = "10s"
-	DefaultOpenTimeout           = "10s"
-	DefaultReconnectMin          = "1s"
-	DefaultReconnectMax          = "30s"
+	DefaultServerListenAddr        = "0.0.0.0:18080"
+	DefaultTunnelControlListenAddr = "127.0.0.1:19091"
+	DefaultDialTimeout             = "10s"
+	DefaultOpenTimeout             = "10s"
+	DefaultReconnectMin            = "1s"
+	DefaultReconnectMax            = "30s"
 )
 
 type ServerConfig struct {
-	Version         int                `json:"version" yaml:"version"`
-	AdminListenAddr string             `json:"admin_listen_addr,omitempty" yaml:"admin_listen_addr,omitempty"`
-	Log             config.LogConfig   `json:"log,omitempty" yaml:"log,omitempty"`
-	Auth            config.AuthConfig  `json:"auth,omitempty" yaml:"auth,omitempty"`
-	TunnelServer    TunnelServerConfig `json:"tunnel_server" yaml:"tunnel_server"`
+	Version           int                `json:"version" yaml:"version"`
+	ControlListenAddr string             `json:"control_listen_addr,omitempty" yaml:"control_listen_addr,omitempty"`
+	Log               config.LogConfig   `json:"log,omitempty" yaml:"log,omitempty"`
+	Auth              config.AuthConfig  `json:"auth,omitempty" yaml:"auth,omitempty"`
+	TunnelServer      TunnelServerConfig `json:"tunnel_server" yaml:"tunnel_server"`
 }
 
 type TunnelServerConfig struct {
@@ -132,12 +132,12 @@ func normalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	if cfg.Version != 1 {
 		return ServerConfig{}, fmt.Errorf("unsupported config version: %d", cfg.Version)
 	}
-	cfg.AdminListenAddr = strings.TrimSpace(cfg.AdminListenAddr)
-	if cfg.AdminListenAddr == "" {
-		cfg.AdminListenAddr = DefaultTunnelAdminListenAddr
+	cfg.ControlListenAddr = strings.TrimSpace(cfg.ControlListenAddr)
+	if cfg.ControlListenAddr == "" {
+		cfg.ControlListenAddr = DefaultTunnelControlListenAddr
 	}
-	if _, _, err := net.SplitHostPort(cfg.AdminListenAddr); err != nil {
-		return ServerConfig{}, fmt.Errorf("admin_listen_addr: %w", err)
+	if _, _, err := net.SplitHostPort(cfg.ControlListenAddr); err != nil {
+		return ServerConfig{}, fmt.Errorf("control_listen_addr: %w", err)
 	}
 	var err error
 	cfg.Auth, err = normalizeTunnelAuth(cfg.Auth)

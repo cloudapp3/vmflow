@@ -1,10 +1,12 @@
-# admin API
+# control API
 
 默认监听地址：`127.0.0.1:19090`
 
 ## 鉴权
 
-Admin API 支持 Bearer Token 鉴权。配置示例：
+> **绑定安全**:daemon 默认只在回环地址(`127.0.0.1`)监听。若 `control_listen_addr` 绑到非回环地址且未开启 `auth`,daemon 会**拒绝启动**(不再仅打日志)。如需强行远端暴露,加 `--insecure-allow-remote-control`(不建议;请改用 TLS 反向代理 + 鉴权)。
+
+Control API 支持 Bearer Token 鉴权。配置示例：
 
 ```yaml
 auth:
@@ -28,7 +30,7 @@ CLI/TUI 可以使用：
 
 ```bash
 vmflow ctl -token change-me stats
-VMFLOW_ADMIN_TOKEN=change-me vmflow tui
+VMFLOW_CONTROL_TOKEN=change-me vmflow tui
 ```
 
 角色：
@@ -36,6 +38,26 @@ VMFLOW_ADMIN_TOKEN=change-me vmflow tui
 - `viewer`：可读接口，例如 health/rules/stats。
 - `admin`：包含 viewer 权限，并可执行 reload 等写操作。
 
+
+## TLS
+
+控制 API 默认明文 HTTP。要启用 TLS,设置 `control_tls`:
+
+```yaml
+control_tls:
+  cert_file: /etc/vmflow/control.crt
+  key_file:  /etc/vmflow/control.key
+  client_ca_file: /etc/vmflow/clients-ca.crt   # 可选,设了即强制 mTLS
+  min_version: "1.2"   # "1.2"(默认)| "1.3"
+```
+
+客户端把 `-addr` 改成 `https://`;私有/自签 CA 传 `--tls-ca-file`(或 `VMFLOW_TLS_CA_FILE`);mTLS 再传 `--tls-client-cert` / `--tls-client-key`(或 `VMFLOW_TLS_CLIENT_CERT` / `VMFLOW_TLS_CLIENT_KEY`)。示例:
+
+```bash
+vmflow ctl -addr https://host:19090 -tls-ca-file ca.crt health
+```
+
+配置了 `client_ca_file`(mTLS)后,控制 API 视为"已认证",满足非回环 fail-closed 规则,可不带 bearer 暴露在非回环地址。公网暴露时,通常更简单的做法是绑回环 + 前置 TLS 反向代理(Caddy/Nginx + ACME)。
 
 ## `GET /healthz`
 
@@ -145,7 +167,7 @@ relayctl precheck
 vmflow_rule_upload_bytes_total{rule_id="ssh-forward",protocol="tcp"} 1024
 vmflow_rule_download_bytes_total{rule_id="ssh-forward",protocol="tcp"} 2048
 vmflow_rule_connections{rule_id="ssh-forward",protocol="tcp"} 1
-vmflow_admin_requests_total{method="GET",path="/v1/stats",status="200"} 10
+vmflow_control_requests_total{method="GET",path="/v1/stats",status="200"} 10
 vmflow_reload_total{status="ok"} 1
 vmflow_rule_apply_total{action="started",status="ok"} 1
 ```
@@ -158,8 +180,8 @@ vmflow_rule_apply_total{action="started",status="ok"} 1
 - `vmflow_rule_connections{rule_id,protocol}`
 - `vmflow_rule_upload_bytes_total{rule_id,protocol}`
 - `vmflow_rule_download_bytes_total{rule_id,protocol}`
-- `vmflow_admin_requests_total{method,path,status}`
-- `vmflow_admin_request_duration_seconds_sum{method,path,status}`
+- `vmflow_control_requests_total{method,path,status}`
+- `vmflow_control_request_duration_seconds_sum{method,path,status}`
 - `vmflow_reload_total{status}`
 - `vmflow_rule_apply_total{action,status}`
 
@@ -172,7 +194,7 @@ vmflow_rule_apply_total{action="started",status="ok"} 1
 ```json
 {
   "config_path": "./examples/config.yaml",
-  "admin_listen_addr": "127.0.0.1:19090",
+  "control_listen_addr": "127.0.0.1:19090",
   "rule_count": 1,
   "result": {
     "applied_rules": 1,

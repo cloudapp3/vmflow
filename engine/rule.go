@@ -26,6 +26,7 @@ type Rule struct {
 	Enabled     bool     `json:"enabled" yaml:"enabled"`
 	SpeedLimit  int64    `json:"speed_limit" yaml:"speed_limit"`
 	MaxConn     int      `json:"max_conn" yaml:"max_conn"`
+	IdleTimeout int      `json:"idle_timeout,omitempty" yaml:"idle_timeout,omitempty"`
 	Domains     []string `json:"domains,omitempty" yaml:"domains,omitempty"`
 	Remark      string   `json:"remark,omitempty" yaml:"remark,omitempty"`
 	Revision    int64    `json:"revision,omitempty" yaml:"revision,omitempty"`
@@ -85,6 +86,9 @@ func (rule Rule) Validate() error {
 	if rule.MaxConn < 0 {
 		return fmt.Errorf("max_conn must be >= 0")
 	}
+	if rule.IdleTimeout < 0 {
+		return fmt.Errorf("idle_timeout must be >= 0")
+	}
 	return nil
 }
 
@@ -98,7 +102,8 @@ func (rule Rule) RuntimeEqual(other Rule) bool {
 		left.TargetPort == right.TargetPort &&
 		left.Enabled == right.Enabled &&
 		left.SpeedLimit == right.SpeedLimit &&
-		left.MaxConn == right.MaxConn
+		left.MaxConn == right.MaxConn &&
+		left.IdleTimeout == right.IdleTimeout
 }
 
 type ApplySnapshotOptions struct {

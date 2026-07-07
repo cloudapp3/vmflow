@@ -24,6 +24,7 @@
 
 - `speed_limit` —— 每连接双向速率限制(令牌桶)
 - `max_conn` —— 并发连接上限,超限直接关闭新连接
+- `idle_timeout` —— 每连接空闲超时(秒,默认 300);静默连接到期回收,且 `Stop` 会强制关闭已建立连接,避免粘连接卡死"停规则 / reload / 关停"
 - `domains` —— HTTPS 规则的域名(用于 ACME / SNI)
 - `enabled` / `remark` / `revision` / `created_time` / `updated_time`
 - 规则校验、标准化,以及 `RuntimeEqual`(只比较影响运行的字段,用于增量 diff)
@@ -42,7 +43,7 @@
 
 YAML 单文件,字段:
 
-- `version` / `admin_listen_addr`
+- `version` / `control_listen_addr`
 - `log`:`level` + `format`(text / json)
 - `auth`:`enabled` + `tokens[]`(`name` / `token` / `role`)
 - `bot_token` / `bot_chat`(Telegram)
@@ -52,7 +53,7 @@ YAML 单文件,字段:
 
 支持**热重载**:`POST /v1/reload` 重新读取配置并执行 `ApplySnapshot`。
 
-## 5. Admin API(`controlapi/`)
+## 5. Control API(`controlapi/`)
 
 本地 HTTP 控制面,端点:
 
@@ -92,7 +93,7 @@ YAML 单文件,字段:
 
 ## 9. TUI(`tui/`)
 
-终端仪表盘,通过 Admin API 拉取数据;`[tab]` 在 Dashboard → Rules → Detail 视图间切换。
+终端仪表盘,通过 Control API 拉取数据;`[tab]` 在 Dashboard → Rules → Detail 视图间切换。
 
 ## 10. 指标(`metrics/`)
 
@@ -101,7 +102,7 @@ Prometheus 文本格式,指标族:
 - `vmflow_build_info`、`vmflow_uptime_seconds`
 - `vmflow_rule_running`、`vmflow_rule_connections`
 - `vmflow_rule_upload_bytes_total`、`vmflow_rule_download_bytes_total`
-- `vmflow_admin_requests_total`、`vmflow_admin_request_duration_seconds`
+- `vmflow_control_requests_total`、`vmflow_control_request_duration_seconds`
 - `vmflow_reload_total`、`vmflow_rule_apply_total`
 
 ## 11. 预检(`precheck/`)
@@ -123,7 +124,7 @@ Prometheus 文本格式,指标族:
 
 单二进制:
 
-- `vmflow daemon [-config] [-admin-listen]`
+- `vmflow daemon [-config] [-control-listen]`
 - `vmflow ctl ... <health|rules|stats|metrics|precheck|reload|certs|certs-obtain|certs-review>`
 - `vmflow tui`、`vmflow version [-json]`
 - 别名:`d / c / t / v`

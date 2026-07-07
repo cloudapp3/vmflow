@@ -18,7 +18,7 @@ const (
 	RoleViewer = config.AuthRoleViewer
 )
 
-// AuthInfo describes the authenticated Admin API caller.
+// AuthInfo describes the authenticated Control API caller.
 type AuthInfo struct {
 	Name string `json:"name"`
 	Role string `json:"role"`
@@ -30,7 +30,7 @@ type authRule struct {
 	role  string
 }
 
-// Authenticator validates Admin API bearer tokens.
+// Authenticator validates Control API bearer tokens.
 type Authenticator struct {
 	enabled bool
 	rules   []authRule

@@ -224,7 +224,10 @@ else
 fi
 
 log "Extracting archive..."
-tar -xzf "$ARCHIVE_PATH" -C "$TMPDIR"
+# --no-same-owner: do not restore attacker-controlled uid/gid from the archive
+# when this script runs as root (e.g. curl|sudo bash). Extraction still happens
+# in a private mktemp dir and we only install the single binary by name.
+tar --no-same-owner -xzf "$ARCHIVE_PATH" -C "$TMPDIR"
 
 BINARY_PATH="${TMPDIR}/${BINARY_NAME}"
 if [ ! -f "$BINARY_PATH" ]; then

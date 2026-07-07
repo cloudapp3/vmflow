@@ -37,13 +37,13 @@ type TunnelSnapshot struct {
 	Remark           string `json:"remark,omitempty"`
 }
 
-type AdminHandlerOptions struct {
+type ControlHandlerOptions struct {
 	ConfigPath string
 	Auth       *controlapi.Authenticator
 	Logger     *slog.Logger
 }
 
-type adminHandler struct {
+type controlHandler struct {
 	server     *Server
 	configPath string
 	auth       *controlapi.Authenticator
@@ -51,12 +51,12 @@ type adminHandler struct {
 	metrics    *tunnelMetrics
 }
 
-func NewAdminHandler(server *Server, opts AdminHandlerOptions) http.Handler {
+func NewControlHandler(server *Server, opts ControlHandlerOptions) http.Handler {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	h := &adminHandler{
+	h := &controlHandler{
 		server:     server,
 		configPath: strings.TrimSpace(opts.ConfigPath),
 		auth:       opts.Auth,
@@ -74,12 +74,12 @@ func NewAdminHandler(server *Server, opts AdminHandlerOptions) http.Handler {
 	return h.withMiddleware(mux)
 }
 
-func (h *adminHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (h *controlHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]any{
+	writeControlJSON(w, http.StatusOK, map[string]any{
 		"ok":              true,
 		"running_clients": h.server.RunningClients(),
 		"running_tunnels": h.server.RunningTunnels(),
@@ -87,54 +87,54 @@ func (h *adminHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *adminHandler) handleClients(w http.ResponseWriter, r *http.Request) {
+func (h *controlHandler) handleClients(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]any{"items": h.server.Clients()})
+	writeControlJSON(w, http.StatusOK, map[string]any{"items": h.server.Clients()})
 }
 
-func (h *adminHandler) handleTunnels(w http.ResponseWriter, r *http.Request) {
+func (h *controlHandler) handleTunnels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]any{"items": h.server.Tunnels()})
+	writeControlJSON(w, http.StatusOK, map[string]any{"items": h.server.Tunnels()})
 }
 
-func (h *adminHandler) handleStats(w http.ResponseWriter, r *http.Request) {
+func (h *controlHandler) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		writeAdminJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
-	writeAdminJSON(w, http.StatusOK, map[string]any{"items": h.server.Stats()})
+	writeControlJSON(w, http.StatusOK, map[string]any{"items": h.server.Stats()})
 }
 
-func (h *adminHandler) handlePrecheck(w http.ResponseWriter, r *http.Request) {
+func (h *controlHandler) handlePrecheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		writeAdminJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
 	cfg, check, err := h.loadAndPrecheck()
 	if err != nil {
-		writeAdminJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		writeControlJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	status := http.StatusOK
 	if !check.OK {
 		status = http.StatusBadRequest
 	}
-	writeAdminJSON(w, status, map[string]any{
+	writeControlJSON(w, status, map[string]any{
 		"config_path":  h.configPath,
 		"client_count": len(cfg.TunnelServer.Clients),
 		"result":       check,
 	})
 }
 
-func (h *adminHandler) handleReload(w http.ResponseWriter, r *http.Request) {
+func (h *controlHandler) handleReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeAdminJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		return
 	}
 	if !h.authorizeWrite(w, r) {
@@ -142,26 +142,26 @@ func (h *adminHandler) handleReload(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg, _, err := h.loadAndPrecheck()
 	if err != nil {
-		writeAdminJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		writeControlJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	result, err := h.server.ReloadConfig(cfg)
 	if err != nil {
-		writeAdminJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		writeControlJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	status := http.StatusOK
 	if !result.OK {
 		status = http.StatusBadRequest
 	}
-	h.logger.Info("tunnel config reloaded", "component", "tunnel_admin", "event", "reload", "client_count", result.ClientCount, "disconnected_clients", len(result.DisconnectedClients))
-	writeAdminJSON(w, status, map[string]any{
+	h.logger.Info("tunnel config reloaded", "component", "tunnel_control", "event", "reload", "client_count", result.ClientCount, "disconnected_clients", len(result.DisconnectedClients))
+	writeControlJSON(w, status, map[string]any{
 		"config_path": h.configPath,
 		"result":      result,
 	})
 }
 
-func (h *adminHandler) loadAndPrecheck() (ServerConfig, ConfigCheckResult, error) {
+func (h *controlHandler) loadAndPrecheck() (ServerConfig, ConfigCheckResult, error) {
 	if strings.TrimSpace(h.configPath) == "" {
 		return ServerConfig{}, ConfigCheckResult{}, errMissingConfigPath()
 	}
@@ -172,16 +172,16 @@ func (h *adminHandler) loadAndPrecheck() (ServerConfig, ConfigCheckResult, error
 	return cfg, h.server.PrecheckConfig(cfg), nil
 }
 
-func (h *adminHandler) authorizeWrite(w http.ResponseWriter, r *http.Request) bool {
+func (h *controlHandler) authorizeWrite(w http.ResponseWriter, r *http.Request) bool {
 	info, _ := r.Context().Value(tunnelAuthInfoKey{}).(controlapi.AuthInfo)
 	if info.Role != controlapi.RoleAdmin {
-		writeAdminJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
+		writeControlJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
 		return false
 	}
 	return true
 }
 
-func (h *adminHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+func (h *controlHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		_, _ = w.Write([]byte("method not allowed\n"))
@@ -191,25 +191,25 @@ func (h *adminHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_ = h.metrics.Write(w)
 }
 
-func (h *adminHandler) withMiddleware(next http.Handler) http.Handler {
+func (h *controlHandler) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		statusWriter := &adminStatusWriter{ResponseWriter: w, status: http.StatusOK}
+		statusWriter := &controlStatusWriter{ResponseWriter: w, status: http.StatusOK}
 		info, ok := h.authenticator().Authenticate(r)
 		if !ok {
 			statusWriter.status = http.StatusUnauthorized
-			writeAdminJSON(statusWriter, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-			h.logger.Warn("tunnel admin authentication failed", "component", "tunnel_admin", "event", "auth_failed", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
-			h.metrics.ObserveAdminRequest(r.Method, r.URL.Path, statusWriter.status, time.Since(started))
+			writeControlJSON(statusWriter, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			h.logger.Warn("tunnel control authentication failed", "component", "tunnel_control", "event", "auth_failed", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			h.metrics.ObserveControlRequest(r.Method, r.URL.Path, statusWriter.status, time.Since(started))
 			return
 		}
 		next.ServeHTTP(statusWriter, r.WithContext(context.WithValue(r.Context(), tunnelAuthInfoKey{}, info)))
-		h.metrics.ObserveAdminRequest(r.Method, r.URL.Path, statusWriter.status, time.Since(started))
-		h.logger.Debug("tunnel admin request", "component", "tunnel_admin", "event", "request", "method", r.Method, "path", r.URL.Path, "status", statusWriter.status, "auth_name", info.Name, "auth_role", info.Role)
+		h.metrics.ObserveControlRequest(r.Method, r.URL.Path, statusWriter.status, time.Since(started))
+		h.logger.Debug("tunnel control request", "component", "tunnel_control", "event", "request", "method", r.Method, "path", r.URL.Path, "status", statusWriter.status, "auth_name", info.Name, "auth_role", info.Role)
 	})
 }
 
-func (h *adminHandler) authenticator() *controlapi.Authenticator {
+func (h *controlHandler) authenticator() *controlapi.Authenticator {
 	if h != nil && h.auth != nil {
 		return h.auth
 	}
@@ -221,17 +221,17 @@ func (h *adminHandler) authenticator() *controlapi.Authenticator {
 
 type tunnelAuthInfoKey struct{}
 
-type adminStatusWriter struct {
+type controlStatusWriter struct {
 	http.ResponseWriter
 	status int
 }
 
-func (w *adminStatusWriter) WriteHeader(status int) {
+func (w *controlStatusWriter) WriteHeader(status int) {
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
 }
 
-func writeAdminJSON(w http.ResponseWriter, status int, payload any) {
+func writeControlJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
@@ -356,34 +356,34 @@ type tunnelMetrics struct {
 	server  *Server
 	started time.Time
 	mu      sync.RWMutex
-	admin   map[tunnelAdminRequestKey]*tunnelAdminRequestStats
+	control map[tunnelControlRequestKey]*tunnelControlRequestStats
 }
 
-type tunnelAdminRequestKey struct {
+type tunnelControlRequestKey struct {
 	Method string
 	Path   string
 	Status string
 }
 
-type tunnelAdminRequestStats struct {
+type tunnelControlRequestStats struct {
 	Count       int64
 	DurationSum float64
 }
 
 func newTunnelMetrics(server *Server) *tunnelMetrics {
-	return &tunnelMetrics{server: server, started: time.Now(), admin: make(map[tunnelAdminRequestKey]*tunnelAdminRequestStats)}
+	return &tunnelMetrics{server: server, started: time.Now(), control: make(map[tunnelControlRequestKey]*tunnelControlRequestStats)}
 }
 
-func (m *tunnelMetrics) ObserveAdminRequest(method, path string, status int, duration time.Duration) {
+func (m *tunnelMetrics) ObserveControlRequest(method, path string, status int, duration time.Duration) {
 	if m == nil {
 		return
 	}
-	key := tunnelAdminRequestKey{Method: strings.ToUpper(strings.TrimSpace(method)), Path: normalizeMetricPath(path), Status: strconv.Itoa(status)}
+	key := tunnelControlRequestKey{Method: strings.ToUpper(strings.TrimSpace(method)), Path: normalizeMetricPath(path), Status: strconv.Itoa(status)}
 	m.mu.Lock()
-	stats := m.admin[key]
+	stats := m.control[key]
 	if stats == nil {
-		stats = &tunnelAdminRequestStats{}
-		m.admin[key] = stats
+		stats = &tunnelControlRequestStats{}
+		m.control[key] = stats
 	}
 	stats.Count++
 	stats.DurationSum += duration.Seconds()
@@ -397,7 +397,7 @@ func (m *tunnelMetrics) Write(w http.ResponseWriter) error {
 	clients := m.server.Clients()
 	tunnels := m.server.Tunnels()
 	stats := m.server.Stats()
-	admin := m.copyAdmin()
+	control := m.copyControl()
 
 	if _, err := w.Write([]byte("# HELP vmflow_tunnel_build_info Static build info for vmflow tunnel.\n# TYPE vmflow_tunnel_build_info gauge\nvmflow_tunnel_build_info 1\n")); err != nil {
 		return err
@@ -448,21 +448,21 @@ func (m *tunnelMetrics) Write(w http.ResponseWriter) error {
 		}
 	}
 
-	if _, err := w.Write([]byte("# HELP vmflow_tunnel_admin_requests_total Total tunnel Admin API requests.\n# TYPE vmflow_tunnel_admin_requests_total counter\n")); err != nil {
+	if _, err := w.Write([]byte("# HELP vmflow_tunnel_control_requests_total Total tunnel Control API requests.\n# TYPE vmflow_tunnel_control_requests_total counter\n")); err != nil {
 		return err
 	}
-	for _, key := range sortedTunnelAdminKeys(admin) {
-		line := "vmflow_tunnel_admin_requests_total{method=" + strconv.Quote(key.Method) + ",path=" + strconv.Quote(key.Path) + ",status=" + strconv.Quote(key.Status) + "} " + strconv.FormatInt(admin[key].Count, 10) + "\n"
+	for _, key := range sortedTunnelControlKeys(control) {
+		line := "vmflow_tunnel_control_requests_total{method=" + strconv.Quote(key.Method) + ",path=" + strconv.Quote(key.Path) + ",status=" + strconv.Quote(key.Status) + "} " + strconv.FormatInt(control[key].Count, 10) + "\n"
 		if _, err := w.Write([]byte(line)); err != nil {
 			return err
 		}
 	}
 
-	if _, err := w.Write([]byte("# HELP vmflow_tunnel_admin_request_duration_seconds_sum Total tunnel Admin API request duration in seconds.\n# TYPE vmflow_tunnel_admin_request_duration_seconds_sum counter\n")); err != nil {
+	if _, err := w.Write([]byte("# HELP vmflow_tunnel_control_request_duration_seconds_sum Total tunnel Control API request duration in seconds.\n# TYPE vmflow_tunnel_control_request_duration_seconds_sum counter\n")); err != nil {
 		return err
 	}
-	for _, key := range sortedTunnelAdminKeys(admin) {
-		line := "vmflow_tunnel_admin_request_duration_seconds_sum{method=" + strconv.Quote(key.Method) + ",path=" + strconv.Quote(key.Path) + ",status=" + strconv.Quote(key.Status) + "} " + strconv.FormatFloat(admin[key].DurationSum, 'f', 6, 64) + "\n"
+	for _, key := range sortedTunnelControlKeys(control) {
+		line := "vmflow_tunnel_control_request_duration_seconds_sum{method=" + strconv.Quote(key.Method) + ",path=" + strconv.Quote(key.Path) + ",status=" + strconv.Quote(key.Status) + "} " + strconv.FormatFloat(control[key].DurationSum, 'f', 6, 64) + "\n"
 		if _, err := w.Write([]byte(line)); err != nil {
 			return err
 		}
@@ -470,14 +470,14 @@ func (m *tunnelMetrics) Write(w http.ResponseWriter) error {
 	return nil
 }
 
-func (m *tunnelMetrics) copyAdmin() map[tunnelAdminRequestKey]tunnelAdminRequestStats {
-	out := make(map[tunnelAdminRequestKey]tunnelAdminRequestStats)
+func (m *tunnelMetrics) copyControl() map[tunnelControlRequestKey]tunnelControlRequestStats {
+	out := make(map[tunnelControlRequestKey]tunnelControlRequestStats)
 	if m == nil {
 		return out
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for key, stats := range m.admin {
+	for key, stats := range m.control {
 		if stats != nil {
 			out[key] = *stats
 		}
@@ -498,8 +498,8 @@ func tunnelLabels(t TunnelSnapshot) string {
 	return "{client_id=" + strconv.Quote(t.ClientID) + ",tunnel_id=" + strconv.Quote(t.TunnelID) + ",protocol=" + strconv.Quote(t.Protocol) + "}"
 }
 
-func sortedTunnelAdminKeys(values map[tunnelAdminRequestKey]tunnelAdminRequestStats) []tunnelAdminRequestKey {
-	keys := make([]tunnelAdminRequestKey, 0, len(values))
+func sortedTunnelControlKeys(values map[tunnelControlRequestKey]tunnelControlRequestStats) []tunnelControlRequestKey {
+	keys := make([]tunnelControlRequestKey, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)
 	}

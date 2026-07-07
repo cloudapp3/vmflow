@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+// DefaultTCPIdleTimeout bounds how long a TCP forwarding connection may stay
+// idle (no data in either direction) before being reaped. It keeps Stop/reload
+// from hanging on stuck or silent clients and caps per-connection resource
+// hold time. Overridable per rule via idle_timeout (seconds); 0 means use this
+// default.
+const DefaultTCPIdleTimeout = 5 * time.Minute
+
 type tcpRunner struct {
 	rule      Rule
 	collector *Collector
@@ -22,6 +29,8 @@ type tcpRunner struct {
 
 	activeConn atomic.Int64
 	wg         sync.WaitGroup
+	connMu     sync.Mutex
+	conns      map[net.Conn]struct{}
 }
 
 func newTCPRunner(rule Rule, collector *Collector) Runner {
@@ -31,6 +40,7 @@ func newTCPRunner(rule Rule, collector *Collector) Runner {
 		collector: collector,
 		ctx:       ctx,
 		cancel:    cancel,
+		conns:     make(map[net.Conn]struct{}),
 	}
 }
 
@@ -51,6 +61,10 @@ func (runner *tcpRunner) Stop() {
 	if runner.ln != nil {
 		_ = runner.ln.Close()
 	}
+	// Force-close every established client connection so blocked copy loops
+	// unblock and handleConn returns; otherwise wg.Wait could hang on a silent
+	// client forever. (DialContext below also cancels any in-flight dial.)
+	runner.closeAllConns()
 	runner.wg.Wait()
 	runner.collector.SetConns(runner.rule.RuleID, 0)
 }
@@ -82,41 +96,78 @@ func (runner *tcpRunner) acceptLoop() {
 func (runner *tcpRunner) handleConn(clientConn net.Conn) {
 	defer runner.wg.Done()
 
+	runner.trackConn(clientConn)
 	runner.activeConn.Add(1)
 	runner.collector.IncConns(runner.rule.RuleID)
 	defer func() {
+		runner.untrackConn(clientConn)
 		_ = clientConn.Close()
 		runner.activeConn.Add(-1)
 		runner.collector.DecConns(runner.rule.RuleID)
 	}()
 
 	targetAddr := net.JoinHostPort(strings.TrimSpace(runner.rule.TargetAddr), strconv.Itoa(runner.rule.TargetPort))
-	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	dialer := net.Dialer{Timeout: 10 * time.Second}
+	targetConn, err := dialer.DialContext(runner.ctx, "tcp", targetAddr)
 	if err != nil {
 		return
 	}
+	runner.trackConn(targetConn)
 	defer func() {
+		runner.untrackConn(targetConn)
 		_ = targetConn.Close()
 	}()
 
+	idle := runner.effectiveIdleTimeout()
 	var copyWG sync.WaitGroup
 	copyWG.Add(2)
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(targetConn, clientConn, runner.rule.SpeedLimit, func(n int64) {
+		_, _ = copyWithLimit(targetConn, clientConn, runner.rule.SpeedLimit, idle, func(n int64) {
 			runner.collector.AddUpload(runner.rule.RuleID, n)
 		})
 	}()
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(clientConn, targetConn, runner.rule.SpeedLimit, func(n int64) {
+		_, _ = copyWithLimit(clientConn, targetConn, runner.rule.SpeedLimit, idle, func(n int64) {
 			runner.collector.AddDownload(runner.rule.RuleID, n)
 		})
 	}()
 
 	copyWG.Wait()
+}
+
+func (runner *tcpRunner) trackConn(c net.Conn) {
+	runner.connMu.Lock()
+	runner.conns[c] = struct{}{}
+	runner.connMu.Unlock()
+}
+
+func (runner *tcpRunner) untrackConn(c net.Conn) {
+	runner.connMu.Lock()
+	delete(runner.conns, c)
+	runner.connMu.Unlock()
+}
+
+func (runner *tcpRunner) closeAllConns() {
+	runner.connMu.Lock()
+	dup := make([]net.Conn, 0, len(runner.conns))
+	for c := range runner.conns {
+		dup = append(dup, c)
+	}
+	runner.connMu.Unlock()
+	for _, c := range dup {
+		_ = c.Close()
+	}
+}
+
+func (runner *tcpRunner) effectiveIdleTimeout() time.Duration {
+	if runner.rule.IdleTimeout > 0 {
+		return time.Duration(runner.rule.IdleTimeout) * time.Second
+	}
+	return DefaultTCPIdleTimeout
 }
 
 type rateLimiter struct {
@@ -154,11 +205,14 @@ func (limiter *rateLimiter) wait(n int) {
 	limiter.last = time.Now()
 }
 
-func copyWithLimit(dst io.Writer, src io.Reader, speedLimit int64, onBytes func(int64)) (int64, error) {
+func copyWithLimit(dst io.Writer, src io.Reader, speedLimit int64, idle time.Duration, onBytes func(int64)) (int64, error) {
 	buf := make([]byte, 32*1024)
 	limiter := newRateLimiter(speedLimit)
 	var total int64
 	for {
+		if idle > 0 {
+			setReadDeadline(src, time.Now().Add(idle))
+		}
 		nr, readErr := src.Read(buf)
 		if nr > 0 {
 			limiter.wait(nr)
@@ -182,5 +236,14 @@ func copyWithLimit(dst io.Writer, src io.Reader, speedLimit int64, onBytes func(
 			}
 			return total, fmt.Errorf("copy failed: %w", readErr)
 		}
+	}
+}
+
+// setReadDeadline sets a read deadline on src if it is a connection that
+// supports deadlines (net.Conn). Used to bound idle time on forwarded conns so
+// silent peers cannot hold a connection (and thus a Stop/reload) open forever.
+func setReadDeadline(src io.Reader, t time.Time) {
+	if d, ok := src.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = d.SetReadDeadline(t)
 	}
 }

@@ -368,10 +368,10 @@ func (b *Bot) handleCallback(ctx context.Context, c *ext.Context) error {
 
 func (b *Bot) doReload() string {
 	// Reload is done through re-applying config. For now we just stop all.
-	// The actual reload needs the config path - handled via admin API reload.
+	// The actual reload needs the config path - handled via control API reload.
 	// This is a simplified version that stops all rules.
 	b.manager.StopAll()
-	return "✅ All rules stopped. Use admin API /v1/reload for full config reload."
+	return "✅ All rules stopped. Use control API /v1/reload for full config reload."
 }
 
 func (b *Bot) doStopRule(ruleID string) string {
@@ -384,7 +384,7 @@ func (b *Bot) doStartRule(ruleID string) string {
 	// Since we can only start rules that were previously loaded from config,
 	// this is limited without the config. Show a hint.
 	_ = ruleID
-	return "ℹ️ Use admin API /v1/reload to re-apply configuration."
+	return "ℹ️ Use control API /v1/reload to re-apply configuration."
 }
 
 // ── Format Helpers ─────────────────────────────────────────────────

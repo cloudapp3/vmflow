@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,9 +28,13 @@ type Runtime struct {
 	PrecheckOptions *precheck.Options
 	CertStore       *certstore.Store
 	CertReviewer    *certreview.Reviewer
+	limiterInst     *ipLimiter
 }
 
 func NewHandler(runtime *Runtime) http.Handler {
+	if runtime.limiterInst == nil {
+		runtime.limiterInst = newIPLimiter()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -68,8 +74,8 @@ func NewHandler(runtime *Runtime) http.Handler {
 			runtime.log(r).Error("precheck failed to load config", "component", "controlapi", "event", "precheck_load_failed", "error", err)
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"ok":     false,
-				"error":  err.Error(),
-				"result": precheckResultFromError(err),
+				"error":  "configuration could not be loaded",
+				"result": precheckResultFromError(),
 			})
 			return
 		}
@@ -79,7 +85,7 @@ func NewHandler(runtime *Runtime) http.Handler {
 		}
 		runtime.log(r).Info("precheck completed", "component", "controlapi", "event", "precheck", "ok", result.OK, "rule_count", len(cfg.Rules), "error_count", result.ErrorCount, "warning_count", result.WarningCount)
 		writeJSON(w, status, map[string]any{
-			"config_path": strings.TrimSpace(runtime.ConfigPath),
+			"config_path": filepath.Base(strings.TrimSpace(runtime.ConfigPath)),
 			"rule_count":  len(cfg.Rules),
 			"result":      result,
 		})
@@ -98,12 +104,12 @@ func NewHandler(runtime *Runtime) http.Handler {
 			runtime.metrics().ObserveReload("failed")
 			var precheckErr *precheck.Error
 			if errors.As(err, &precheckErr) {
-				runtime.log(r).Warn("admin reload blocked by precheck", "component", "controlapi", "event", "reload_precheck_failed", "error_count", precheckErr.Result.ErrorCount, "warning_count", precheckErr.Result.WarningCount)
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "precheck": precheckErr.Result})
+				runtime.log(r).Warn("control reload blocked by precheck", "component", "controlapi", "event", "reload_precheck_failed", "error_count", precheckErr.Result.ErrorCount, "warning_count", precheckErr.Result.WarningCount)
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "reload blocked by precheck", "precheck": precheckErr.Result})
 				return
 			}
-			runtime.log(r).Error("admin reload failed", "component", "controlapi", "event", "reload_failed", "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			runtime.log(r).Error("control reload failed", "component", "controlapi", "event", "reload_failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "reload failed; see daemon logs"})
 			return
 		}
 		reloadStatus := "ok"
@@ -112,12 +118,12 @@ func NewHandler(runtime *Runtime) http.Handler {
 		}
 		runtime.metrics().ObserveReload(reloadStatus)
 		runtime.metrics().ObserveApplyResult(result)
-		runtime.log(r).Info("admin reload completed", "component", "controlapi", "event", "reload", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules, "failed_rules", result.FailedRules)
+		runtime.log(r).Info("control reload completed", "component", "controlapi", "event", "reload", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules, "failed_rules", result.FailedRules)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"config_path":       strings.TrimSpace(runtime.ConfigPath),
-			"admin_listen_addr": cfg.AdminListenAddr,
-			"rule_count":        len(cfg.Rules),
-			"result":            result,
+			"config_path":         filepath.Base(strings.TrimSpace(runtime.ConfigPath)),
+			"control_listen_addr": cfg.ControlListenAddr,
+			"rule_count":          len(cfg.Rules),
+			"result":              result,
 		})
 	})
 	return runtime.withMiddleware(mux)
@@ -197,29 +203,67 @@ func (runtime *Runtime) withMiddleware(next http.Handler) http.Handler {
 		started := time.Now()
 		statusWriter := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 
+		ip := clientIP(r)
+		if runtime.limiter().locked(ip) {
+			statusWriter.status = http.StatusTooManyRequests
+			writeJSON(statusWriter, http.StatusTooManyRequests, map[string]any{"error": "too many failed auth attempts; try again later"})
+			runtime.log(nil).Warn("control auth rate limited", "component", "controlapi", "event", "auth_rate_limited", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			duration := time.Since(started)
+			runtime.metrics().ObserveControlRequest(r.Method, r.URL.Path, statusWriter.status, duration)
+			runtime.logRequest(r, statusWriter.status, duration, AuthInfo{})
+			return
+		}
+
 		info, ok := runtime.authenticator().Authenticate(r)
+		runtime.limiter().note(ip, ok)
 		if !ok {
 			statusWriter.status = http.StatusUnauthorized
 			writeJSON(statusWriter, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-			runtime.log(nil).Warn("admin authentication failed", "component", "controlapi", "event", "auth_failed", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			runtime.log(nil).Warn("control authentication failed", "component", "controlapi", "event", "auth_failed", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 			duration := time.Since(started)
-			runtime.metrics().ObserveAdminRequest(r.Method, r.URL.Path, statusWriter.status, duration)
+			runtime.metrics().ObserveControlRequest(r.Method, r.URL.Path, statusWriter.status, duration)
 			runtime.logRequest(r, statusWriter.status, duration, AuthInfo{})
 			return
 		}
 
 		next.ServeHTTP(statusWriter, r.WithContext(withAuthInfo(r.Context(), info)))
 		duration := time.Since(started)
-		runtime.metrics().ObserveAdminRequest(r.Method, r.URL.Path, statusWriter.status, duration)
+		runtime.metrics().ObserveControlRequest(r.Method, r.URL.Path, statusWriter.status, duration)
 		runtime.logRequest(r, statusWriter.status, duration, info)
 	})
+}
+
+// clientIP returns the request's peer address (without port). It deliberately
+// ignores X-Forwarded-For (we do not trust client-provided headers), so behind
+// a proxy this is the proxy's address.
+func clientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// limiter returns the per-runtime failed-auth throttle, initializing it on
+// first use.
+func (runtime *Runtime) limiter() *ipLimiter {
+	if runtime == nil {
+		return nil
+	}
+	if runtime.limiterInst == nil {
+		runtime.limiterInst = newIPLimiter()
+	}
+	return runtime.limiterInst
 }
 
 func (runtime *Runtime) authorizeWrite(w http.ResponseWriter, r *http.Request) bool {
 	info, ok := AuthInfoFromContext(r.Context())
 	if !ok || !info.canWrite() {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
-		runtime.log(r).Warn("admin authorization denied", "component", "controlapi", "event", "auth_denied", "method", r.Method, "path", r.URL.Path)
+		runtime.log(r).Warn("control authorization denied", "component", "controlapi", "event", "auth_denied", "method", r.Method, "path", r.URL.Path)
 		return false
 	}
 	return true
@@ -263,14 +307,14 @@ func (runtime *Runtime) logRequest(r *http.Request, status int, duration time.Du
 		attrs = append(attrs, "actor", info.Name, "role", info.Role)
 	}
 	if status >= 500 {
-		logger.Error("admin request", attrs...)
+		logger.Error("control request", attrs...)
 		return
 	}
 	if status >= 400 {
-		logger.Warn("admin request", attrs...)
+		logger.Warn("control request", attrs...)
 		return
 	}
-	logger.Debug("admin request", attrs...)
+	logger.Debug("control request", attrs...)
 }
 
 type statusResponseWriter struct {
@@ -278,7 +322,7 @@ type statusResponseWriter struct {
 	status int
 }
 
-func precheckResultFromError(err error) precheck.Result {
+func precheckResultFromError() precheck.Result {
 	result := precheck.Result{
 		OK:           false,
 		ErrorCount:   1,
@@ -286,7 +330,7 @@ func precheckResultFromError(err error) precheck.Result {
 		Items: []precheck.Item{{
 			Severity: precheck.SeverityError,
 			Check:    "config_load",
-			Message:  err.Error(),
+			Message:  "configuration could not be loaded",
 		}},
 	}
 	return result

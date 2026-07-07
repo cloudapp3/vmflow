@@ -21,7 +21,7 @@ The project is currently a practical v0.1-style MVP: the forwarding path, rule l
 - `max_conn` limiting
 - Simple per-session speed limiting
 - YAML config loading and validation
-- Local admin API:
+- Local control API:
   - `GET /healthz`
   - `GET /v1/rules`
   - `GET /v1/stats`

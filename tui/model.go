@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -136,8 +137,10 @@ type Model struct {
 
 // ── Public Entry ───────────────────────────────────────────────────
 
-func Run(ctx context.Context, stdout io.Writer, addr string, token ...string) error {
-	m := newModel(ctx, addr, token...)
+func Run(ctx context.Context, stdout io.Writer, addr, token string, httpClient *http.Client, headers http.Header) error {
+	m := newModel(ctx, addr, token)
+	m.client.SetHTTPClient(httpClient)
+	m.client.SetHeaders(headers)
 	p := tea.NewProgram(m,
 		tea.WithOutput(stdout),
 		tea.WithAltScreen(),

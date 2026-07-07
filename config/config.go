@@ -9,7 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultAdminListenAddr = "127.0.0.1:19090"
+const DefaultControlListenAddr = "127.0.0.1:19090"
 const DefaultLogLevel = "info"
 const DefaultLogFormat = "text"
 
@@ -19,19 +19,20 @@ const (
 )
 
 type File struct {
-	Version         int              `json:"version" yaml:"version"`
-	AdminListenAddr string           `json:"admin_listen_addr" yaml:"admin_listen_addr"`
-	Log             LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
-	Auth            AuthConfig       `json:"auth,omitempty" yaml:"auth,omitempty"`
-	BotToken        string           `json:"bot_token,omitempty" yaml:"bot_token,omitempty"`
-	BotChat         int64            `json:"bot_chat,omitempty" yaml:"bot_chat,omitempty"`
-	AcmeChallenge   string           `json:"acme_challenge,omitempty" yaml:"acme_challenge,omitempty"`
-	AcmeHTTP01Addr  string           `json:"acme_http01_addr,omitempty" yaml:"acme_http01_addr,omitempty"`
-	AcmeCacheDir    string           `json:"acme_cache_dir,omitempty" yaml:"acme_cache_dir,omitempty"`
-	AcmeDNS01       DNS01Config      `json:"acme_dns01,omitempty" yaml:"acme_dns01,omitempty"`
-	CertCacheDir    string           `json:"cert_cache_dir,omitempty" yaml:"cert_cache_dir,omitempty"`
-	CertReview      CertReviewConfig `json:"cert_review,omitempty" yaml:"cert_review,omitempty"`
-	Rules           []engine.Rule    `json:"rules" yaml:"rules"`
+	Version           int              `json:"version" yaml:"version"`
+	ControlListenAddr string           `json:"control_listen_addr" yaml:"control_listen_addr"`
+	ControlTLS        ControlTLSConfig `json:"control_tls,omitempty" yaml:"control_tls,omitempty"`
+	Log               LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
+	Auth              AuthConfig       `json:"auth,omitempty" yaml:"auth,omitempty"`
+	BotToken          string           `json:"bot_token,omitempty" yaml:"bot_token,omitempty"`
+	BotChat           int64            `json:"bot_chat,omitempty" yaml:"bot_chat,omitempty"`
+	AcmeChallenge     string           `json:"acme_challenge,omitempty" yaml:"acme_challenge,omitempty"`
+	AcmeHTTP01Addr    string           `json:"acme_http01_addr,omitempty" yaml:"acme_http01_addr,omitempty"`
+	AcmeCacheDir      string           `json:"acme_cache_dir,omitempty" yaml:"acme_cache_dir,omitempty"`
+	AcmeDNS01         DNS01Config      `json:"acme_dns01,omitempty" yaml:"acme_dns01,omitempty"`
+	CertCacheDir      string           `json:"cert_cache_dir,omitempty" yaml:"cert_cache_dir,omitempty"`
+	CertReview        CertReviewConfig `json:"cert_review,omitempty" yaml:"cert_review,omitempty"`
+	Rules             []engine.Rule    `json:"rules" yaml:"rules"`
 }
 
 // CertReviewConfig controls certificate review thresholds.
@@ -54,19 +55,30 @@ type DNS01Config struct {
 	ExecPath             string `json:"exec_path,omitempty" yaml:"exec_path,omitempty"`
 }
 
+// ControlTLSConfig enables TLS (and optionally mTLS) on the control API.
+// TLS is active when both CertFile and KeyFile are set. Setting ClientCAFile
+// turns on mutual TLS, requiring every client to present a certificate signed
+// by that CA.
+type ControlTLSConfig struct {
+	CertFile     string `json:"cert_file,omitempty" yaml:"cert_file,omitempty"`
+	KeyFile      string `json:"key_file,omitempty" yaml:"key_file,omitempty"`
+	ClientCAFile string `json:"client_ca_file,omitempty" yaml:"client_ca_file,omitempty"`
+	MinVersion   string `json:"min_version,omitempty" yaml:"min_version,omitempty"`
+}
+
 // LogConfig controls structured logging for daemon mode.
 type LogConfig struct {
 	Level  string `json:"level,omitempty" yaml:"level,omitempty"`
 	Format string `json:"format,omitempty" yaml:"format,omitempty"`
 }
 
-// AuthConfig controls Admin API bearer-token authentication.
+// AuthConfig controls Control API bearer-token authentication.
 type AuthConfig struct {
 	Enabled bool        `json:"enabled" yaml:"enabled"`
 	Tokens  []AuthToken `json:"tokens,omitempty" yaml:"tokens,omitempty"`
 }
 
-// AuthToken is one Admin API bearer token. Token values are secrets and must
+// AuthToken is one Control API bearer token. Token values are secrets and must
 // not be logged.
 type AuthToken struct {
 	Name  string `json:"name,omitempty" yaml:"name,omitempty"`
@@ -100,11 +112,14 @@ func Parse(raw []byte) (File, error) {
 	if cfg.Version != 1 {
 		return File{}, fmt.Errorf("unsupported config version: %d", cfg.Version)
 	}
-	cfg.AdminListenAddr = strings.TrimSpace(cfg.AdminListenAddr)
-	if cfg.AdminListenAddr == "" {
-		cfg.AdminListenAddr = DefaultAdminListenAddr
+	cfg.ControlListenAddr = strings.TrimSpace(cfg.ControlListenAddr)
+	if cfg.ControlListenAddr == "" {
+		cfg.ControlListenAddr = DefaultControlListenAddr
 	}
 	cfg.Log = normalizeLog(cfg.Log)
+	if err := validateControlTLS(cfg.ControlTLS); err != nil {
+		return File{}, err
+	}
 	var err error
 	cfg.Auth, err = normalizeAuth(cfg.Auth)
 	if err != nil {
@@ -123,6 +138,18 @@ func Parse(raw []byte) (File, error) {
 		cfg.Rules[index] = rule
 	}
 	return cfg, nil
+}
+
+func validateControlTLS(t ControlTLSConfig) error {
+	if (t.CertFile == "") != (t.KeyFile == "") {
+		return fmt.Errorf("control_tls: cert_file and key_file must both be set or both omitted")
+	}
+	switch t.MinVersion {
+	case "", "1.2", "1.3":
+	default:
+		return fmt.Errorf("control_tls: min_version must be \"1.2\" or \"1.3\", got %q", t.MinVersion)
+	}
+	return nil
 }
 
 func normalizeLog(logCfg LogConfig) LogConfig {

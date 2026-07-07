@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -36,7 +36,8 @@ var (
 const usageText = `vmflow - L4 port forwarding engine
 
 Usage:
-  vmflow daemon        [-config path] [-admin-listen addr]              Start forwarding daemon
+  vmflow daemon        [-config path] [-control-listen addr]              Start forwarding daemon
+                       [-insecure-allow-remote-control]                  Allow non-loopback control API without auth (dangerous)
   vmflow ctl           [-addr url] [-token token] <health|rules|stats|metrics|precheck|reload>    Query running daemon
   vmflow tui           [-addr url] [-token token]                      Terminal UI dashboard
   vmflow version       [-json]                                         Show version info
@@ -78,7 +79,9 @@ func main() {
 func runDaemon(args []string) {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	configPath := fs.String("config", "", "config file path")
-	adminListen := fs.String("admin-listen", "", "override admin listen addr")
+	controlListen := fs.String("control-listen", "", "override control listen addr")
+	insecureAllowRemote := fs.Bool("insecure-allow-remote-control", false,
+		"DANGEROUS: allow binding the control API on a non-loopback address without auth")
 	fs.Parse(args)
 
 	if strings.TrimSpace(*configPath) == "" {
@@ -91,8 +94,8 @@ func runDaemon(args []string) {
 		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
 		os.Exit(1)
 	}
-	if strings.TrimSpace(*adminListen) != "" {
-		cfg.AdminListenAddr = strings.TrimSpace(*adminListen)
+	if strings.TrimSpace(*controlListen) != "" {
+		cfg.ControlListenAddr = strings.TrimSpace(*controlListen)
 	}
 
 	logger, err := logging.New(cfg.Log)
@@ -101,7 +104,16 @@ func runDaemon(args []string) {
 		os.Exit(1)
 	}
 	slog.SetDefault(logger)
-	warnIfUnsafeAdmin(cfg, logger)
+	if err := controlapi.EnsureSafeControlBinding(cfg, *insecureAllowRemote, logger); err != nil {
+		fmt.Fprintf(os.Stderr, "control api: %v\n", err)
+		os.Exit(1)
+	}
+
+	tlsCfg, err := controlapi.BuildServerTLSConfig(cfg.ControlTLS)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "control api tls: %v\n", err)
+		os.Exit(1)
+	}
 
 	collector := engine.NewCollector()
 	manager := engine.NewManager(collector)
@@ -125,15 +137,21 @@ func runDaemon(args []string) {
 		Metrics:    metricsCollector,
 	}
 	server := &http.Server{
-		Addr:              cfg.AdminListenAddr,
+		Addr:              cfg.ControlListenAddr,
 		Handler:           controlapi.NewHandler(runtime),
+		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("vmflow admin server listening", "component", "daemon", "event", "admin_listen", "addr", cfg.AdminListenAddr)
-		errCh <- server.ListenAndServe()
+		scheme, listen := "http", server.ListenAndServe
+		if tlsCfg != nil {
+			scheme = "https"
+			listen = func() error { return server.ListenAndServeTLS("", "") }
+		}
+		logger.Info("vmflow control server listening", "component", "daemon", "event", "control_listen", "addr", cfg.ControlListenAddr, "scheme", scheme, "mtls", tlsCfg != nil && tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert)
+		errCh <- listen()
 	}()
 
 	var botCancel context.CancelFunc
@@ -180,36 +198,14 @@ func runDaemon(args []string) {
 	logger.Info("vmflow stopped", "component", "daemon", "event", "stopped")
 }
 
-func warnIfUnsafeAdmin(cfg config.File, logger *slog.Logger) {
-	if logger == nil || cfg.Auth.Enabled {
-		return
-	}
-	host, _, err := net.SplitHostPort(cfg.AdminListenAddr)
-	if err != nil {
-		logger.Warn("admin api auth is disabled", "component", "daemon", "event", "auth_disabled", "admin_listen_addr", cfg.AdminListenAddr)
-		return
-	}
-	host = strings.TrimSpace(host)
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		logger.Warn("admin api is exposed without auth", "component", "daemon", "event", "auth_disabled_exposed", "admin_listen_addr", cfg.AdminListenAddr)
-		return
-	}
-	ip := net.ParseIP(host)
-	if ip != nil && ip.IsLoopback() {
-		return
-	}
-	if strings.EqualFold(host, "localhost") {
-		return
-	}
-	logger.Warn("admin api auth is disabled on non-loopback address", "component", "daemon", "event", "auth_disabled_non_loopback", "admin_listen_addr", cfg.AdminListenAddr)
-}
-
 // ── ctl ─────────────────────────────────────────────────────────────
 
 func runCtl(args []string) {
 	fs := flag.NewFlagSet("ctl", flag.ExitOnError)
-	addr := fs.String("addr", "http://127.0.0.1:19090", "admin api base url")
-	token := fs.String("token", os.Getenv("VMFLOW_ADMIN_TOKEN"), "admin api bearer token (or VMFLOW_ADMIN_TOKEN)")
+	addr := fs.String("addr", "http://127.0.0.1:19090", "control api base url")
+	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "control api bearer token (or VMFLOW_CONTROL_TOKEN)")
+	tlsFlags := controlapi.AddClientTLSFlags(fs)
+	headerFlags := controlapi.AddHeaderFlags(fs)
 	fs.Parse(args)
 
 	cmdArgs := fs.Args()
@@ -245,7 +241,7 @@ func runCtl(args []string) {
 		os.Exit(1)
 	}
 
-	status, body, err := doRequest(*addr, *token, method, path, reqBody)
+	status, body, err := doRequest(*addr, *token, tlsFlags.Opts(), *headerFlags, method, path, reqBody)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -257,7 +253,11 @@ func runCtl(args []string) {
 	fmt.Print(string(body))
 }
 
-func doRequest(baseURL, token, method, path, body string) (int, []byte, error) {
+func doRequest(baseURL, token string, tlsOpts controlapi.ClientTLSOptions, headers controlapi.HeaderFlags, method, path, body string) (int, []byte, error) {
+	hc, err := controlapi.NewHTTPClient(tlsOpts, 0)
+	if err != nil {
+		return 0, nil, err
+	}
 	url := strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
 	var bodyReader io.Reader
 	if body != "" {
@@ -273,7 +273,8 @@ func doRequest(baseURL, token, method, path, body string) (int, []byte, error) {
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	headers.Apply(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -289,14 +290,26 @@ func doRequest(baseURL, token, method, path, body string) (int, []byte, error) {
 
 func runTUI(args []string) {
 	fs := flag.NewFlagSet("tui", flag.ExitOnError)
-	addr := fs.String("addr", "http://127.0.0.1:19090", "relayd admin API address")
-	token := fs.String("token", os.Getenv("VMFLOW_ADMIN_TOKEN"), "admin api bearer token (or VMFLOW_ADMIN_TOKEN)")
+	addr := fs.String("addr", "http://127.0.0.1:19090", "relayd control API address")
+	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "control api bearer token (or VMFLOW_CONTROL_TOKEN)")
+	tlsFlags := controlapi.AddClientTLSFlags(fs)
+	headerFlags := controlapi.AddHeaderFlags(fs)
 	fs.Parse(args)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := tui.Run(ctx, os.Stdout, *addr, *token); err != nil {
+	var httpClient *http.Client
+	if tlsFlags.Opts().Any() {
+		hc, err := controlapi.NewHTTPClient(tlsFlags.Opts(), 5*time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tls: %v\n", err)
+			os.Exit(1)
+		}
+		httpClient = hc
+	}
+
+	if err := tui.Run(ctx, os.Stdout, *addr, *token, httpClient, headerFlags.HTTPHeader()); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}

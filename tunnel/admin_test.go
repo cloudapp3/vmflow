@@ -13,9 +13,9 @@ import (
 	"github.com/cloudapp3/vmflow/controlapi"
 )
 
-func TestTunnelAdminHandlerHealthAndMetrics(t *testing.T) {
+func TestTunnelControlHandlerHealthAndMetrics(t *testing.T) {
 	server := NewServer(ServerConfig{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	handler := NewAdminHandler(server, AdminHandlerOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	handler := NewControlHandler(server, ControlHandlerOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -42,10 +42,10 @@ func TestTunnelAdminHandlerHealthAndMetrics(t *testing.T) {
 	}
 }
 
-func TestTunnelAdminHandlerAuth(t *testing.T) {
+func TestTunnelControlHandlerAuth(t *testing.T) {
 	server := NewServer(ServerConfig{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	auth := controlapi.NewAuthenticator(config.AuthConfig{Enabled: true, Tokens: []config.AuthToken{{Name: "viewer", Token: "secret", Role: config.AuthRoleViewer}}})
-	handler := NewAdminHandler(server, AdminHandlerOptions{Auth: auth, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	handler := NewControlHandler(server, ControlHandlerOptions{Auth: auth, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/tunnel/clients", nil)
 	rec := httptest.NewRecorder()
@@ -63,7 +63,7 @@ func TestTunnelAdminHandlerAuth(t *testing.T) {
 	}
 }
 
-func performAdminRequest(handler http.Handler, method string, path string, auth string) *httptest.ResponseRecorder {
+func performControlRequest(handler http.Handler, method string, path string, auth string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, nil)
 	if auth != "" {
 		req.Header.Set("Authorization", auth)

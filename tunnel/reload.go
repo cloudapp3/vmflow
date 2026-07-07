@@ -38,8 +38,8 @@ func (server *Server) PrecheckConfig(next ServerConfig) ConfigCheckResult {
 	}
 	current := server.Config()
 	result := ConfigCheckResult{OK: true}
-	if strings.TrimSpace(current.AdminListenAddr) != "" && current.AdminListenAddr != next.AdminListenAddr {
-		result.addWarning("admin_listen_addr", "admin listener address changes require restart and are not applied by reload")
+	if strings.TrimSpace(current.ControlListenAddr) != "" && current.ControlListenAddr != next.ControlListenAddr {
+		result.addWarning("control_listen_addr", "control listener address changes require restart and are not applied by reload")
 	}
 	if strings.TrimSpace(current.TunnelServer.ListenAddr) != "" && current.TunnelServer.ListenAddr != next.TunnelServer.ListenAddr {
 		result.addWarning("tunnel_server.listen_addr", "tunnel server listen address changes require restart and are not applied by reload")
@@ -70,8 +70,8 @@ func (server *Server) ReloadConfig(next ServerConfig) (ReloadResult, error) {
 	}
 	current := server.Config()
 	runtimeCfg := next
-	if strings.TrimSpace(current.AdminListenAddr) != "" {
-		runtimeCfg.AdminListenAddr = current.AdminListenAddr
+	if strings.TrimSpace(current.ControlListenAddr) != "" {
+		runtimeCfg.ControlListenAddr = current.ControlListenAddr
 	}
 	if strings.TrimSpace(current.TunnelServer.ListenAddr) != "" {
 		runtimeCfg.TunnelServer.ListenAddr = current.TunnelServer.ListenAddr
