@@ -6,25 +6,29 @@ BINARY_NAME="vmflow"
 INSTALL_DIR="${VMFLOW_INSTALL_DIR:-}"
 VERSION=""
 SKIP_VERIFY=0
+UNINSTALL=0
 
 usage() {
   cat <<'EOF'
 Install vmflow from GitHub Releases.
 
 Usage:
-  install.sh [--version vX.Y.Z] [--dir PATH] [--skip-verify]
+  install.sh [--version vX.Y.Z] [--dir PATH] [--skip-verify] [--uninstall]
 
 Options:
   --version <tag>   Install a specific release tag. Defaults to the latest release.
   --dir <path>      Install directory. Auto-detected in order: /usr/local/bin,
                     ~/.local/bin, ~/bin. Override with VMFLOW_INSTALL_DIR env var.
   --skip-verify     Skip SHA-256 checksum verification.
+  --uninstall       Uninstall vmflow instead of installing. Stops the service
+                    and removes the binary, config, logs, and cache.
   -h, --help        Show this help message.
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --dir /usr/local/bin
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash -s -- --version v0.1.0
+  curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --uninstall
 EOF
 }
 
@@ -84,6 +88,93 @@ print_path_hint() {
   log "  export PATH=\"${install_dir}:\$PATH\""
 }
 
+# stop_service best-effort stops and removes the native service (systemd on
+# Linux, launchd on macOS). Windows is not supported by install.sh.
+stop_service() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop "$BINARY_NAME" 2>/dev/null || true
+    systemctl disable "$BINARY_NAME" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${BINARY_NAME}.service" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+  elif command -v launchctl >/dev/null 2>&1; then
+    launchctl bootout "system/io.cloudapp.${BINARY_NAME}" 2>/dev/null || true
+    rm -f "/Library/LaunchDaemons/io.cloudapp.${BINARY_NAME}.plist" 2>/dev/null || true
+  fi
+}
+
+# do_uninstall removes vmflow. It delegates to `vmflow uninstall` when the
+# installed binary supports it (full cleanup incl. certificates); otherwise it
+# falls back to a shell-level removal of service/binary/config/logs/cache.
+do_uninstall() {
+  # Locate the installed binary: explicit --dir, then PATH, then common spots.
+  TARGET=""
+  if [ -n "$INSTALL_DIR" ]; then
+    TARGET="${INSTALL_DIR}/${BINARY_NAME}"
+  elif command -v "$BINARY_NAME" >/dev/null 2>&1; then
+    TARGET="$(command -v "$BINARY_NAME")"
+  else
+    for d in /usr/local/bin /usr/bin "$HOME/.local/bin" "$HOME/bin"; do
+      if [ -x "$d/$BINARY_NAME" ]; then TARGET="$d/$BINARY_NAME"; break; fi
+    done
+  fi
+
+  # Delegate to the binary's own uninstall when available (richest cleanup).
+  if [ -n "$TARGET" ] && [ -x "$TARGET" ] && "$TARGET" uninstall --help >/dev/null 2>&1; then
+    log "Delegating to: $TARGET uninstall"
+    # Read confirmation from the user's tty: under `curl | bash`, stdin is the
+    # download pipe and cannot serve the [y/N] prompt.
+    exec "$TARGET" uninstall </dev/tty
+  fi
+
+  log "vmflow binary not found (or too old for self-uninstall) at ${TARGET:-<none>}; cleaning up via shell."
+
+  case "$(uname -s)" in
+    Linux)  CFG="/etc/vmflow/config.yaml" ;;
+    Darwin) CFG="/usr/local/etc/vmflow/config.yaml" ;;
+    *)      CFG="" ;;
+  esac
+  CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/vmflow"
+
+  # Build the removal plan (only entries that exist).
+  PLAN=""
+  if [ -n "$TARGET" ] && [ -x "$TARGET" ]; then PLAN="$PLAN $TARGET"; fi
+  if [ -n "$CFG" ] && [ -e "$CFG" ]; then PLAN="$PLAN $CFG"; fi
+  if [ -d /var/log/vmflow ]; then PLAN="$PLAN /var/log/vmflow"; fi
+  if [ -d "$CACHE_DIR" ]; then PLAN="$PLAN $CACHE_DIR"; fi
+
+  if [ -z "$PLAN" ]; then
+    stop_service
+    log "Nothing left to remove."
+    exit 0
+  fi
+
+  log "The following will be removed:"
+  for t in $PLAN; do log "  - $t"; done
+
+  # Confirm only when stdin is a terminal; skip under `curl | bash` pipes.
+  if [ -t 0 ]; then
+    printf 'Proceed with uninstall? [y/N] ' >&2
+    read -r ans
+    case "$ans" in
+      y|Y|yes|YES) ;;
+      *) log "aborted"; exit 0 ;;
+    esac
+  fi
+
+  stop_service
+
+  for t in $PLAN; do
+    if rm -rf -- "$t" 2>/dev/null; then
+      log "removed $t"
+    else
+      log "warning: could not remove $t (try running with sudo)"
+    fi
+  done
+
+  log "vmflow uninstalled."
+  log "Note: TLS/ACME certificate files referenced by the config are not purged by this shell path; install the binary and run \`vmflow uninstall\` to remove them too."
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --version)
@@ -105,6 +196,9 @@ while [ "$#" -gt 0 ]; do
     --skip-verify)
       SKIP_VERIFY=1
       ;;
+    --uninstall)
+      UNINSTALL=1
+      ;;
     -h|--help)
       usage
       exit 0
@@ -115,6 +209,11 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  do_uninstall
+  exit 0
+fi
 
 require_cmd curl
 require_cmd tar

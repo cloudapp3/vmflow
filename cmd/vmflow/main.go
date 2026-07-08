@@ -46,8 +46,10 @@ Usage:
   vmflow update        [--check] [--version tag]                       Self-update vmflow binary
   vmflow service       (install|uninstall|status) [--config path]      Register as a native OS service
                        [--user name] [--log-file path] [--binary path] (systemd / launchd / Windows Service)
+  vmflow uninstall     [--dry-run]                                    Uninstall vmflow: remove service, binary,
+                                                                       config, logs, certs, and update cache
 
-Aliases: daemon=d, ctl=c, tui=t, version=v, update=u, service=svc
+Aliases: daemon=d, ctl=c, tui=t, version=v, update=u, service=svc, uninstall=remove,rm
 `
 
 func main() {
@@ -73,6 +75,8 @@ func main() {
 		runUpdate(args[1:])
 	case "service", "svc":
 		runService(args[1:])
+	case "uninstall", "remove", "rm":
+		runUninstall(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		flag.Usage()

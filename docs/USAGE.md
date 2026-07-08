@@ -163,6 +163,25 @@ vmflow service status           # 查看服务状态
 
 > deb/rpm 包自带 systemd unit,`apt install vmflow` 会自动 enable;放好 `/etc/vmflow/config.yaml` 后即开机自启。
 
+### 4.2 卸载 vmflow(一键全清)
+
+```bash
+sudo vmflow uninstall            # 列清单 → 确认 → 全清
+vmflow uninstall --dry-run       # 只预览,不删除
+```
+
+`vmflow uninstall`(别名 `remove`/`rm`)按顺序删除:原生服务 → vmflow 二进制 → 配置(`/etc/vmflow/config.yaml` 等) → 日志目录(`/var/log/vmflow`) → 控制面/ACME 证书(从配置解析) → 自更新缓存(`~/.cache/vmflow`)。运行中的二进制最后删(Linux/macOS 直接 unlink,Windows 由后台任务延迟删除)。
+
+**安全**:执行前打印完整清单并要求 `[y/N]` 确认;`--dry-run` 只预览;删除前校验路径,拒绝删系统根目录(`/`、`/etc`、`C:\` 等)与家目录本身;命令幂等,不存在的路径不报错。
+
+| 安装方式 | 卸载 |
+|---|---|
+| `install.sh` / 二进制 | `sudo vmflow uninstall` |
+| `curl \| bash` 用户 | `curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \| sudo bash -s -- --uninstall` |
+| deb / rpm | 优先 `apt remove vmflow` / `yum remove vmflow`(`uninstall` 检测到包管理器安装会提示) |
+
+> 区别:`vmflow service uninstall` 只停止 + 注销服务(**保留**配置/日志/证书);`vmflow uninstall` 是**完整卸载**并清理全部产物。
+
 ---
 
 ## 5. 用 `vmflow ctl` 管控
