@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/cloudapp3/vmflow/controlapi"
 	"github.com/cloudapp3/vmflow/engine"
 	"github.com/cloudapp3/vmflow/internal/logging"
+	"github.com/cloudapp3/vmflow/internal/service"
 	"github.com/cloudapp3/vmflow/internal/updater"
 	"github.com/cloudapp3/vmflow/metrics"
 	"github.com/cloudapp3/vmflow/tui"
@@ -42,8 +44,10 @@ Usage:
   vmflow tui           [-addr url] [-token token]                      Terminal UI dashboard
   vmflow version       [-json]                                         Show version info
   vmflow update        [--check] [--version tag]                       Self-update vmflow binary
+  vmflow service       (install|uninstall|status) [--config path]      Register as a native OS service
+                       [--user name] [--log-file path] [--binary path] (systemd / launchd / Windows Service)
 
-Aliases: daemon=d, ctl=c, tui=t, version=v, update=u
+Aliases: daemon=d, ctl=c, tui=t, version=v, update=u, service=svc
 `
 
 func main() {
@@ -67,6 +71,8 @@ func main() {
 		runVersion(args[1:])
 	case "update", "u":
 		runUpdate(args[1:])
+	case "service", "svc":
+		runService(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		flag.Usage()
@@ -82,6 +88,7 @@ func runDaemon(args []string) {
 	controlListen := fs.String("control-listen", "", "override control listen addr")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote-control", false,
 		"DANGEROUS: allow binding the control API on a non-loopback address without auth")
+	logFile := fs.String("log-file", "", "write logs to this file instead of stdout (useful under a service manager)")
 	fs.Parse(args)
 
 	if strings.TrimSpace(*configPath) == "" {
@@ -98,21 +105,40 @@ func runDaemon(args []string) {
 		cfg.ControlListenAddr = strings.TrimSpace(*controlListen)
 	}
 
-	logger, err := logging.New(cfg.Log)
+	logger, err := newLogger(cfg.Log, *logFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init logger failed: %v\n", err)
 		os.Exit(1)
 	}
 	slog.SetDefault(logger)
-	if err := controlapi.EnsureSafeControlBinding(cfg, *insecureAllowRemote, logger); err != nil {
-		fmt.Fprintf(os.Stderr, "control api: %v\n", err)
+
+	// On Windows, when launched by the Service Control Manager, hand off to a
+	// native service runner instead of the foreground loop. No-op elsewhere.
+	if maybeRunAsService(cfg, *configPath, logger, *insecureAllowRemote) {
+		return
+	}
+
+	// systemd and launchd both stop services with SIGTERM; honor it alongside SIGINT.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := runForwarding(ctx, cfg, *configPath, logger, *insecureAllowRemote); err != nil {
 		os.Exit(1)
+	}
+}
+
+// runForwarding loads the forwarding engine, control API, and optional bot from
+// an already-parsed config, then blocks until ctx is cancelled (SIGINT/SIGTERM,
+// or an SCM stop) or the control server fails. It performs graceful shutdown
+// before returning. Shared by the foreground daemon and the Windows SCM runner.
+func runForwarding(ctx context.Context, cfg config.File, configPath string, logger *slog.Logger, insecureAllowRemote bool) error {
+	if err := controlapi.EnsureSafeControlBinding(cfg, insecureAllowRemote, logger); err != nil {
+		return fmt.Errorf("control api: %w", err)
 	}
 
 	tlsCfg, err := controlapi.BuildServerTLSConfig(cfg.ControlTLS)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "control api tls: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("control api tls: %w", err)
 	}
 
 	collector := engine.NewCollector()
@@ -125,12 +151,12 @@ func runDaemon(args []string) {
 		payload, _ := json.MarshalIndent(result, "", "  ")
 		logger.Error("initial apply failed", "component", "engine", "event", "initial_apply_failed", "result", string(payload))
 		manager.StopAll()
-		os.Exit(1)
+		return fmt.Errorf("initial apply failed: %d rule(s)", result.FailedRules)
 	}
 	logger.Info("initial snapshot applied", "component", "engine", "event", "initial_apply", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules)
 
 	runtime := &controlapi.Runtime{
-		ConfigPath: *configPath,
+		ConfigPath: configPath,
 		Manager:    manager,
 		Logger:     logger,
 		Auth:       controlapi.NewAuthenticator(cfg.Auth),
@@ -171,20 +197,15 @@ func runDaemon(args []string) {
 		}
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
+	// Block until shutdown is requested (ctx) or the server exits on its own.
+	var serverErr error
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received", "component", "daemon", "event", "shutdown_signal")
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr = err
 			logger.Error("server failed", "component", "daemon", "event", "server_failed", "error", err)
-			if botCancel != nil {
-				botCancel()
-			}
-			manager.StopAll()
-			os.Exit(1)
 		}
 	}
 
@@ -196,6 +217,26 @@ func runDaemon(args []string) {
 	_ = server.Shutdown(shutdownCtx)
 	manager.StopAll()
 	logger.Info("vmflow stopped", "component", "daemon", "event", "stopped")
+	return serverErr
+}
+
+// newLogger builds the structured logger. When logFile is empty it logs to
+// stdout (captured by journald on Linux or launchd's StandardOutPath on macOS);
+// otherwise it appends to the file, which is required under the Windows SCM
+// where the process has no stdout.
+func newLogger(logCfg config.LogConfig, logFile string) (*slog.Logger, error) {
+	logFile = strings.TrimSpace(logFile)
+	if logFile == "" {
+		return logging.New(logCfg)
+	}
+	if err := os.MkdirAll(filepath.Dir(logFile), 0o755); err != nil {
+		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open log file: %w", err)
+	}
+	return logging.NewWithWriter(logCfg, f)
 }
 
 // ── ctl ─────────────────────────────────────────────────────────────
@@ -488,4 +529,65 @@ func formatReleaseTag(v string) string {
 		return v
 	}
 	return normalizeReleaseTag(v)
+}
+
+// ── service ─────────────────────────────────────────────────────────
+
+func runService(args []string) {
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage:\n  vmflow service (install|uninstall|status) [flags]\n\n")
+		fmt.Fprintf(fs.Output(), "Registers vmflow as a native service that starts at boot and restarts on crash:\n")
+		fmt.Fprintf(fs.Output(), "  Linux:   systemd unit (/etc/systemd/system/<name>.service)\n")
+		fmt.Fprintf(fs.Output(), "  macOS:   launchd daemon (/Library/LaunchDaemons/io.cloudapp.<name>.plist)\n")
+		fmt.Fprintf(fs.Output(), "  Windows: Windows Service (manage via services.msc)\n\nOptions:\n")
+		fs.PrintDefaults()
+	}
+	configPath := fs.String("config", "", "config file path the service runs with (default: platform system path)")
+	user := fs.String("user", "", "[systemd] run as this user; created if missing (default: root)")
+	logFile := fs.String("log-file", "", "redirect daemon logs here (required on Windows)")
+	extraArgs := fs.String("extra-args", "", "extra flags appended to the daemon command line, e.g. \"-control-listen 0.0.0.0:19090\"")
+	binaryPath := fs.String("binary", "", "path to the vmflow binary (default: this executable; install requires a trusted root/admin-owned absolute path)")
+
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: vmflow service (install|uninstall|status) [flags]")
+		os.Exit(1)
+	}
+	// The action is the first positional; flags follow it. The flag package
+	// stops parsing at the first non-flag, so peel the action off before Parse.
+	action := args[0]
+	if strings.HasPrefix(action, "-") {
+		fmt.Fprintln(os.Stderr, "usage: vmflow service (install|uninstall|status) [flags]")
+		os.Exit(1)
+	}
+	fs.Parse(args[1:])
+	if extra := fs.Args(); len(extra) != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument(s): %v\n", extra)
+		os.Exit(1)
+	}
+
+	cfg := service.Config{
+		BinaryPath: *binaryPath,
+		ConfigPath: *configPath,
+		User:       *user,
+		LogFile:    *logFile,
+		ExtraArgs:  *extraArgs,
+	}
+
+	var err error
+	switch action {
+	case "install":
+		err = service.Install(cfg, os.Stdout)
+	case "uninstall":
+		err = service.Uninstall(cfg, os.Stdout)
+	case "status":
+		err = service.Status(cfg, os.Stdout)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown service action: %s (expected install|uninstall|status)\n", action)
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "service %s failed: %v\n", action, err)
+		os.Exit(1)
+	}
 }

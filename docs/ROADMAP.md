@@ -23,4 +23,5 @@
 - [ ] per-rule 共享带宽桶
 - [ ] 事件订阅接口
 - [ ] 配置热更新策略增强
-- [ ] Docker / systemd 官方示例
+- [x] systemd / launchd / Windows Service 开机自启(`vmflow service install`,deb/rpm 带 unit)
+- [ ] Docker 官方示例

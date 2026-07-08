@@ -131,7 +131,37 @@ vmflow daemon -config ./examples/config.yaml [-control-listen 127.0.0.1:19090] [
 
 **fail-closed 启动检查**:控制面绑到非回环地址(`0.0.0.0`/`::`/非回环 IP/`:port`)**且**既没开 `auth` 也没配 mTLS(`control_tls.client_ca_file`)时,daemon **拒绝启动**。三种"安全暴露"方式:① 回环;② 开 `auth`(任意地址);③ mTLS(`client_ca_file`,任意地址)。确要裸奔暴露才用 `-insecure-allow-remote-control`。
 
-长期运行建议用 systemd(参考 [`docs/behind-cloudflare.md`](behind-cloudflare.md) 里的 unit 模板)。
+长期运行请用第 4.1 节的 `vmflow service install` 注册为系统服务(开机自启 + 崩溃自动重启)。
+
+### 4.1 作为系统服务运行(开机自启)
+
+```bash
+sudo vmflow service install --config /etc/vmflow/config.yaml
+```
+
+**安全要求**:`service install` 会先解析 `--binary`/当前可执行文件的符号链接,并拒绝注册相对路径、普通用户可写的二进制,或父目录可被普通用户写入的路径。不要直接从 `/tmp`、`/home`、Downloads 等位置注册 root/SYSTEM 服务;先把 `vmflow` 安装到受保护路径,例如 `/usr/local/bin/vmflow`、`/opt/vmflow/vmflow` 或 `C:\Program Files\vmflow\vmflow.exe`,必要时用 `--binary` 指向该安装路径。
+
+三平台一条命令注册为原生服务(开机自启 + 崩溃自动重启):
+
+| 平台 | 注册方式 | 日志 | 自动重启 |
+|---|---|---|---|
+| Linux | systemd unit(`/etc/systemd/system/vmflow.service`) | journald:`journalctl -u vmflow` | `Restart=on-failure RestartSec=5` |
+| macOS | launchd daemon(`/Library/LaunchDaemons/io.cloudapp.vmflow.plist`) | `/var/log/vmflow/`(可用 `--log-file` 覆盖) | `KeepAlive=true` |
+| Windows | Windows Service(services.msc 可见) | **需 `--log-file`**(SCM 无 stdout) | `sc failure ... actions= restart/5000` |
+
+**Linux 说明**:unit 默认以 root 跑 + `CAP_NET_BIND_SERVICE`(可绑 <1024 特权端口)+ `NoNewPrivileges`。加 `--user vmflow` 改用专用账号(不存在则自动 `useradd --system` 创建)。特权端口转发(到 22/80/443)在 root 下开箱即用。
+
+**Windows 说明**:SCM 启动时无 stdout,务必带 `--log-file C:\ProgramData\vmflow\logs\vmflow.log`。daemon 检测到由 SCM 启动时自动走原生服务模式(报状态、响应 Stop/Shutdown),否则前台运行。
+
+其它命令:
+```bash
+sudo vmflow service uninstall   # 停止 + 注销 + 删 unit/plist(配置和日志保留,需手动删)
+vmflow service status           # 查看服务状态
+```
+
+`--extra-args` 可追加 daemon 标志,如 `--extra-args "-control-listen 0.0.0.0:19090"`(注意:暴露控制面仍需开 auth 或走反代/CF Tunnel,见第 8 节)。
+
+> deb/rpm 包自带 systemd unit,`apt install vmflow` 会自动 enable;放好 `/etc/vmflow/config.yaml` 后即开机自启。
 
 ---
 

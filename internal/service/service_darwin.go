@@ -1,0 +1,80 @@
+//go:build darwin
+
+package service
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+const (
+	darwinPlistDir   = "/Library/LaunchDaemons"
+	darwinDefaultCfg = "/usr/local/etc/vmflow/config.yaml"
+	darwinLogDir     = "/var/log/vmflow"
+)
+
+func defaultConfigPath() string { return darwinDefaultCfg }
+
+func plistPath(cfg Config) string {
+	return filepath.Join(darwinPlistDir, launchdLabel(cfg)+".plist")
+}
+
+func platformInstall(cfg Config, w io.Writer) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("installing a launchd daemon requires root (try sudo)")
+	}
+	if err := os.MkdirAll(darwinLogDir, 0o755); err != nil {
+		return fmt.Errorf("create log dir: %w", err)
+	}
+
+	path := plistPath(cfg)
+	if err := writeFileAtomic(path, []byte(launchdPlist(cfg)), 0o644); err != nil {
+		return fmt.Errorf("write plist: %w", err)
+	}
+	fmt.Fprintf(w, "installed %s\n", path)
+
+	label := launchdLabel(cfg)
+	// If a previous generation is still loaded, unload it first so bootstrap
+	// picks up the new plist cleanly.
+	_, _ = runCombined([]string{"launchctl", "bootout", "system/" + label})
+
+	out, err := runCombined([]string{"launchctl", "bootstrap", "system", path})
+	if err != nil {
+		return fmt.Errorf("launchctl bootstrap: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	fmt.Fprintf(w, "daemon %s loaded and started\n", label)
+	fmt.Fprintf(w, "logs: %s , %s   |   status: vmflow service status\n", logStdout(cfg), logStderr(cfg))
+	return nil
+}
+
+func platformUninstall(cfg Config, w io.Writer) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("removing a launchd daemon requires root (try sudo)")
+	}
+	label := launchdLabel(cfg)
+	if out, err := runCombined([]string{"launchctl", "bootout", "system/" + label}); err != nil {
+		fmt.Fprintf(w, "note: launchctl bootout: %s\n", strings.TrimSpace(string(out)))
+	}
+	path := plistPath(cfg)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove plist: %w", err)
+	}
+	fmt.Fprintf(w, "daemon %s stopped and removed\n", label)
+	fmt.Fprintln(w, "config and log files were left in place; remove them manually if desired")
+	return nil
+}
+
+func platformStatus(cfg Config, w io.Writer) error {
+	cmd := exec.Command("launchctl", "print", "system/"+launchdLabel(cfg))
+	cmd.Stdout = w
+	cmd.Stderr = w
+	_ = cmd.Run()
+	return nil
+}
+
+func logStdout(cfg Config) string { s, _ := launchdLogPaths(cfg); return s }
+func logStderr(cfg Config) string { _, s := launchdLogPaths(cfg); return s }

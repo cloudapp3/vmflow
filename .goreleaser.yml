@@ -86,3 +86,9 @@ nfpms:
         dst: /usr/share/doc/vmflow/LICENSE
       - src: ./README.md
         dst: /usr/share/doc/vmflow/README.md
+      - src: ./packaging/vmflow.service
+        dst: /usr/lib/systemd/system/vmflow.service
+        type: config
+    scripts:
+      postinstall: ./packaging/postinstall
+      preremove: ./packaging/preremove

@@ -1,0 +1,17 @@
+[Unit]
+Description=vmflow L4 forwarding daemon
+Documentation=https://github.com/cloudapp3/vmflow
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vmflow daemon -config /etc/vmflow/config.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

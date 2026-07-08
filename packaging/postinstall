@@ -1,0 +1,16 @@
+#!/bin/sh
+# nfpm postinstall (maps to deb postinst / rpm %post).
+# Reload systemd, enable vmflow on boot, and (re)start it only when a config is
+# already present — the package ships no default config, so we never start a
+# service that would just crash-loop.
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+  systemctl enable vmflow 2>/dev/null || true
+  if [ -f /etc/vmflow/config.yaml ]; then
+    systemctl restart vmflow || true
+  else
+    echo "vmflow: /etc/vmflow/config.yaml not found; create it then run: systemctl start vmflow" >&2
+  fi
+fi

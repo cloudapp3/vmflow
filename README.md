@@ -128,9 +128,31 @@ vmflow ctl           [-addr http://127.0.0.1:19090] [-token TOKEN] <health|rules
 vmflow tui           [-addr http://127.0.0.1:19090] [-token TOKEN]
 vmflow version       [-json]
 vmflow update        [--check] [--version tag]
+vmflow service       (install|uninstall|status) [--config path] [--binary path] [--user name] [--log-file path]
 ```
 
-Aliases are available: `daemon=d`, `ctl=c`, `tui=t`, `version=v`, and `update=u`.
+Aliases are available: `daemon=d`, `ctl=c`, `tui=t`, `version=v`, `update=u`, and `service=svc`.
+
+## Run as a service (boot startup)
+
+Register vmflow as a native OS service so it starts at boot and restarts on crash — one command on every platform:
+
+```bash
+sudo vmflow service install --config /etc/vmflow/config.yaml
+```
+
+For safety, `service install` refuses to register a service that points at a
+relative path, a user-writable binary, or a binary under user-writable parent
+directories (symlinks are resolved first). Install `vmflow` into a protected
+root/admin-owned path such as `/usr/local/bin/vmflow`, `/opt/vmflow/vmflow`, or
+`C:\Program Files\vmflow\vmflow.exe`; pass `--binary` if you need to point at
+that installed path explicitly.
+
+- **Linux**: writes a systemd unit, then `enable --now`. Logs go to journald (`journalctl -u vmflow`). The unit runs as root by default with `CAP_NET_BIND_SERVICE` (so it can bind privileged ports) and `Restart=on-failure`. Pass `--user vmflow` to run under a dedicated account (created if missing).
+- **macOS**: writes a launchd daemon (`KeepAlive` restarts on crash) and bootstraps it. Logs land under `/var/log/vmflow/` (override with `--log-file`).
+- **Windows**: registers a Windows Service (`start=auto`, restart-on-failure) visible in `services.msc`. Pass `--log-file C:\ProgramData\vmflow\logs\vmflow.log` — the SCM provides no stdout.
+
+Uninstall with `sudo vmflow service uninstall` (config and logs are left in place). Inspect with `vmflow service status`. The `.deb`/`.rpm` packages also ship a systemd unit, so `apt install vmflow` enables the service automatically (create `/etc/vmflow/config.yaml` to start it).
 
 ## Control API
 
