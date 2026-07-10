@@ -11,7 +11,7 @@ Route TCP and UDP traffic with a production-grade forwarding runtime that runs a
 
 Documentation: [Website](https://vmflow.bestcheapvps.org) · [中文说明](https://vmflow.bestcheapvps.org/zh/) · [HTTP API](https://vmflow.bestcheapvps.org/api) · [Docs source](https://github.com/cloudapp3/vmdocs)
 
-> **完整使用指南:** [`docs/USAGE.md`](docs/USAGE.md) —— 覆盖安装、配置、运维、远程访问(TLS/mTLS/Cloudflare)、安全加固与排错。English quick reference is below; the deep guide is in `docs/`.
+> **完整使用指南:** [vmflow.bestcheapvps.org](https://vmflow.bestcheapvps.org) —— 覆盖安装、配置、运维、远程访问(TLS/mTLS/Cloudflare)、安全加固与排错。English quick reference is below; the deep guide is on the [docs site](https://vmflow.bestcheapvps.org).
 
 ## What it does
 
@@ -156,7 +156,7 @@ Uninstall with `sudo vmflow service uninstall` (config and logs are left in plac
 
 ## Control API
 
-Documented in [`docs/API.md`](docs/API.md). Main endpoints:
+Documented at [vmflow.bestcheapvps.org/api](https://vmflow.bestcheapvps.org/api). Main endpoints:
 
 - `GET /healthz`
 - `GET /v1/rules`
@@ -183,7 +183,7 @@ Clients then use `https://` for `-addr`. For a private/self-signed CA pass `--tl
 vmflow ctl -addr https://host:19090 -tls-ca-file ca.crt health
 ```
 
-With `client_ca_file` (mTLS) set, the control API counts as authenticated for the non-loopback fail-closed rule, so it can be exposed without bearer auth. For public exposure, binding loopback behind a TLS-terminating reverse proxy (Caddy/Nginx + ACME) is usually simpler. To expose it with zero inbound ports (and optional SSO), see [`docs/behind-cloudflare.md`](docs/behind-cloudflare.md) for a Cloudflare Tunnel + Access runbook; the client `-H` flag carries Access service tokens.
+With `client_ca_file` (mTLS) set, the control API counts as authenticated for the non-loopback fail-closed rule, so it can be exposed without bearer auth. For public exposure, binding loopback behind a TLS-terminating reverse proxy (Caddy/Nginx + ACME) is usually simpler. To expose it with zero inbound ports (and optional SSO), see the [Cloudflare Tunnel + Access runbook](https://vmflow.bestcheapvps.org) for details; the client `-H` flag carries Access service tokens.
 
 ## Embedding vmflow
 
@@ -197,7 +197,7 @@ result := rt.Apply(rules) // []engine.Rule
 stats := rt.SnapshotAll()
 ```
 
-The embedding application owns persistence, auth, UI, audit logs, and business rules. `vmflow` owns only in-process forwarding, rule lifecycle, and real-time counters. See [`docs/EMBEDDING.md`](docs/EMBEDDING.md).
+The embedding application owns persistence, auth, UI, audit logs, and business rules. `vmflow` owns only in-process forwarding, rule lifecycle, and real-time counters. See the [embedding guide](https://vmflow.bestcheapvps.org).
 
 ## Development
 
@@ -232,7 +232,7 @@ The release workflow publishes cross-platform archives, `.deb` / `.rpm` packages
 - `tui/` — terminal dashboard client
 - `cmd/vmflow/` — primary all-in-one binary
 - `examples/` — runnable and embeddable examples
-- `docs/` — architecture, API, embedding, roadmap, and changelog
+- Documentation — [vmflow.bestcheapvps.org](https://vmflow.bestcheapvps.org) (architecture, API, embedding, roadmap, changelog; not kept in this repo)
 
 ## License
 
