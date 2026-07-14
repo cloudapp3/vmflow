@@ -1,8 +1,11 @@
-# vmflow
+# vmflow - Go TCP/UDP Port Forwarding
 
-**Bounded-resource L4 network forwarding, in pure Go.**
+**A bounded-resource Layer 4 (L4) proxy and embeddable Go networking runtime.**
 
-Route TCP and UDP traffic with explicit connection and session limits. vmflow runs as a standalone foreground process or an embeddable runtime, with hot-reloadable rules and live metrics.
+vmflow is a self-hosted, cross-platform TCP/UDP port forwarding tool written in
+pure Go. Run it as a single-binary network proxy or embed the forwarding runtime
+in your own Go control plane, with explicit resource limits, hot-reloadable
+rules, a terminal UI, and Prometheus metrics.
 
 [![Docs](https://img.shields.io/badge/docs-source-14b8a6)](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs)
 [![CI](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml/badge.svg)](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml)
@@ -13,7 +16,7 @@ Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmf
 
 > **完整使用指南:** [中文文档源码](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs/zh) —— 覆盖安装、配置、运维、远程访问(TLS/mTLS/Cloudflare)、安全加固与排错。English quick reference is below; the deep guide is in the [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs).
 
-## What it does
+## TCP/UDP port forwarding features
 
 - TCP, UDP, and `tcp+udp` port forwarding
 - Configurable TCP connection limits and bounded UDP sessions, with rejection/drop counters
@@ -27,6 +30,13 @@ Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmf
 - Rule precheck for loops, duplicate ports, and unavailable listeners
 - Embeddable Go runtime for products that need in-process forwarding
 - Terminal dashboard and rule management via `vmflow tui`
+
+## Common use cases
+
+- Forward TCP services such as SSH, databases, and internal APIs between hosts.
+- Relay UDP services with bounded sessions, queues, idle cleanup, and drop metrics.
+- Run a self-hosted Layer 4 proxy on Linux, macOS, or Windows as a native service.
+- Embed TCP/UDP forwarding into a Go application, VPS panel, or network control plane.
 
 ## Quick start
 
