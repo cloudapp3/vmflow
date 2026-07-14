@@ -24,6 +24,8 @@ coverage-*.out
 # Logs and local config
 *.log
 *.local.json
+stats.json
+.vmflow-stats-*
 
 # IDE / editor
 .idea/

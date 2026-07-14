@@ -252,12 +252,22 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 
 	var statsStore *statsstore.Store
 	if cfg.Stats.Persist {
-		statsStore = statsstore.New(statsFilePath(cfg, configPath))
+		statsPath := statsFilePath(cfg, configPath)
+		samePath, err := statsstore.SameFilePath(statsPath, configPath)
+		if err != nil {
+			return fmt.Errorf("stats persistence path: %w", err)
+		}
+		if samePath {
+			return fmt.Errorf("stats persistence path must differ from config path: %s", statsPath)
+		}
+		statsStore = statsstore.New(statsPath)
 		if snapshots, err := statsStore.Load(); err != nil {
 			logger.Warn("stats load failed; starting from zero", "component", "stats", "error", err)
-		} else if len(snapshots) > 0 {
-			collector.Restore(snapshots)
-			logger.Info("restored traffic stats", "component", "stats", "rules", len(snapshots))
+		} else if restored, ignored := configuredStats(snapshots, cfg.Rules); len(restored) > 0 {
+			collector.Restore(restored)
+			logger.Info("restored traffic stats", "component", "stats", "rules", len(restored), "ignored_rules", ignored)
+		} else if ignored > 0 {
+			logger.Info("ignored traffic stats for unconfigured rules", "component", "stats", "ignored_rules", ignored)
 		}
 	}
 
@@ -271,6 +281,12 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 		return fmt.Errorf("initial apply failed: %d rule(s)", result.FailedRules)
 	}
 	logger.Info("initial snapshot applied", "component", "engine", "event", "initial_apply", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules)
+	if statsStore != nil {
+		if err := statsStore.Save(manager.SnapshotAll()); err != nil {
+			manager.StopAll()
+			return fmt.Errorf("initialize stats persistence: %w", err)
+		}
+	}
 
 	runtime := &controlapi.Runtime{
 		ConfigPath:    configPath,
@@ -308,8 +324,9 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 	if err := botMgr.Apply(controlapi.BotSettings{Token: cfg.BotToken, ChatID: cfg.BotChat, ControlToken: cfg.BotControlToken}); err != nil {
 		logger.Error("bot start failed", "component", "bot", "event", "init_failed", "error", err)
 	}
+	var statsFlush *statsFlusher
 	if statsStore != nil {
-		go flushStats(ctx, statsStore, manager, statsFlushInterval(cfg, logger), logger)
+		statsFlush = startStatsFlusher(ctx, statsStore, manager, statsFlushInterval(cfg, logger), logger)
 	}
 	reportReady(nil)
 
@@ -325,27 +342,58 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 		}
 	}
 
+	if statsFlush != nil {
+		statsFlush.Stop()
+	}
+	botMgr.Stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("control server shutdown failed", "component", "daemon", "error", err)
+		_ = server.Close()
+	}
+	manager.StopAll()
 	if statsStore != nil {
 		if err := statsStore.Save(manager.SnapshotAll()); err != nil {
 			logger.Warn("stats shutdown flush failed", "component", "stats", "error", err)
 		}
 	}
-	botMgr.Stop()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
-	manager.StopAll()
 	logger.Info("vmflow stopped", "component", "daemon", "event", "stopped")
 	return serverErr
 }
 
-// statsFilePath resolves the persistence path: explicit config value, else
-// stats.json beside the config file.
+// statsFilePath resolves the persistence path: explicit config value, systemd
+// state directory, then stats.json beside the config file.
 func statsFilePath(cfg config.File, configPath string) string {
-	if p := strings.TrimSpace(cfg.Stats.Path); p != "" {
-		return p
+	return statsstore.ResolvePath(configPath, cfg.Stats.Path, statsStateDirectory())
+}
+
+func statsStateDirectory() string {
+	for _, path := range filepath.SplitList(strings.TrimSpace(os.Getenv("STATE_DIRECTORY"))) {
+		if path = strings.TrimSpace(path); filepath.IsAbs(path) {
+			return path
+		}
 	}
-	return filepath.Join(filepath.Dir(configPath), "stats.json")
+	return ""
+}
+
+func configuredStats(snapshots []engine.TrafficSnapshot, rules []engine.Rule) ([]engine.TrafficSnapshot, int) {
+	configured := make(map[string]struct{}, len(rules))
+	for _, rule := range rules {
+		if ruleID := strings.TrimSpace(rule.RuleID); ruleID != "" {
+			configured[ruleID] = struct{}{}
+		}
+	}
+	restored := make([]engine.TrafficSnapshot, 0, len(snapshots))
+	ignored := 0
+	for _, snapshot := range snapshots {
+		if _, ok := configured[strings.TrimSpace(snapshot.RuleID)]; !ok {
+			ignored++
+			continue
+		}
+		restored = append(restored, snapshot)
+	}
+	return restored, ignored
 }
 
 // statsFlushInterval parses stats.flush_interval (default 60s, minimum 1s).
@@ -361,9 +409,30 @@ func statsFlushInterval(cfg config.File, logger *slog.Logger) time.Duration {
 	return 60 * time.Second
 }
 
+type statsFlusher struct {
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
+
+func startStatsFlusher(parent context.Context, store *statsstore.Store, manager *engine.Manager, interval time.Duration, logger *slog.Logger) *statsFlusher {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		flushStats(ctx, store, manager, interval, logger)
+	}()
+	return &statsFlusher{cancel: cancel, done: done}
+}
+
+func (flusher *statsFlusher) Stop() {
+	if flusher == nil {
+		return
+	}
+	flusher.cancel()
+	<-flusher.done
+}
+
 // flushStats periodically persists cumulative counters until ctx is cancelled.
-// The final flush on shutdown is performed synchronously by the caller so it
-// runs before rules are stopped and their counters torn down.
 func flushStats(ctx context.Context, store *statsstore.Store, manager *engine.Manager, interval time.Duration, logger *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -371,7 +440,9 @@ func flushStats(ctx context.Context, store *statsstore.Store, manager *engine.Ma
 		select {
 		case <-ticker.C:
 			if err := store.Save(manager.SnapshotAll()); err != nil {
-				logger.Warn("stats flush failed", "component", "stats", "error", err)
+				if logger != nil {
+					logger.Warn("stats flush failed", "component", "stats", "error", err)
+				}
 			}
 		case <-ctx.Done():
 			return

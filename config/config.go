@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/cloudapp3/vmflow/engine"
 	"gopkg.in/yaml.v3"
@@ -134,11 +135,15 @@ func Parse(raw []byte) (File, error) {
 		return File{}, fmt.Errorf("udp_max_sessions must be 0 (default) or between 1 and %d", engine.MaxUDPGlobalMaxSessions)
 	}
 	cfg.Log = normalizeLog(cfg.Log)
+	normalizedStats, err := normalizeStats(cfg.Stats)
+	if err != nil {
+		return File{}, err
+	}
+	cfg.Stats = normalizedStats
 	cfg.ControlTLS = normalizeControlTLS(cfg.ControlTLS)
 	if err := validateControlTLS(cfg.ControlTLS); err != nil {
 		return File{}, err
 	}
-	var err error
 	cfg.Auth, err = normalizeAuth(cfg.Auth)
 	if err != nil {
 		return File{}, err
@@ -156,6 +161,19 @@ func Parse(raw []byte) (File, error) {
 		cfg.Rules[index] = rule
 	}
 	return cfg, nil
+}
+
+func normalizeStats(stats StatsConfig) (StatsConfig, error) {
+	stats.Path = strings.TrimSpace(stats.Path)
+	stats.FlushInterval = strings.TrimSpace(stats.FlushInterval)
+	if stats.FlushInterval == "" {
+		return stats, nil
+	}
+	interval, err := time.ParseDuration(stats.FlushInterval)
+	if err != nil || interval < time.Second {
+		return StatsConfig{}, fmt.Errorf("stats.flush_interval must be a duration of at least 1s")
+	}
+	return stats, nil
 }
 
 func normalizeControlTLS(t ControlTLSConfig) ControlTLSConfig {

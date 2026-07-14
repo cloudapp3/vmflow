@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cloudapp3/vmflow/internal/statsstore"
 )
 
 func TestCleanupPathsFromConfig(t *testing.T) {
@@ -130,6 +132,56 @@ func TestAppendConfigPlanPreservesExternalTLSFiles(t *testing.T) {
 	joined := strings.Join(warnings, "\n")
 	if !strings.Contains(joined, certPath) || !strings.Contains(joined, keyPath) {
 		t.Fatalf("preservation warnings do not name both external TLS files: %v", warnings)
+	}
+}
+
+func TestAppendConfigPlanIncludesConfiguredStatsFile(t *testing.T) {
+	dir := t.TempDir()
+	statsPath := filepath.Join(dir, "traffic.json")
+	if err := statsstore.New(statsPath).Save(nil); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("version: 1\nstats:\n  persist: true\n  path: traffic.json\nrules: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	items, warnings := appendConfigPlan(nil, nil, configPath, kindFile)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	found := false
+	for _, item := range items {
+		if item.Kind == kindStatsFile && item.Path == statsPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("configured stats file missing from plan: %+v", items)
+	}
+}
+
+func TestExecuteStatsFileRevalidatesBeforeRemoval(t *testing.T) {
+	dir := t.TempDir()
+	statsPath := filepath.Join(dir, "stats.json")
+	if err := statsstore.New(statsPath).Save(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := Execute(io.Discard, []Item{{Kind: kindStatsFile, Path: statsPath}}); err != nil {
+		t.Fatalf("remove valid stats file: %v", err)
+	}
+	if pathLexists(statsPath) {
+		t.Fatal("valid stats file was not removed")
+	}
+
+	if err := os.WriteFile(statsPath, []byte("not vmflow stats"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Execute(io.Discard, []Item{{Kind: kindStatsFile, Path: statsPath}}); err == nil {
+		t.Fatal("changed stats file should not be removed")
+	}
+	if !pathLexists(statsPath) {
+		t.Fatal("changed stats file was removed")
 	}
 }
 

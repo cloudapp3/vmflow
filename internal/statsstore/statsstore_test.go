@@ -3,6 +3,7 @@ package statsstore
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cloudapp3/vmflow/engine"
@@ -30,6 +31,69 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if got.Conns != 0 {
 		t.Fatalf("conns must not be persisted: %d", got.Conns)
+	}
+	if err := store.Save([]engine.TrafficSnapshot{{RuleID: "r1", UploadBytes: 300}}); err != nil {
+		t.Fatalf("replace existing stats: %v", err)
+	}
+	replaced, err := store.Load()
+	if err != nil {
+		t.Fatalf("load replacement: %v", err)
+	}
+	if len(replaced) != 1 || replaced[0].UploadBytes != 300 {
+		t.Fatalf("replacement mismatch: %+v", replaced)
+	}
+}
+
+func TestSaveRenameFailureCleansTemporaryFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "stats-target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(target).Save(nil); err == nil {
+		t.Fatal("saving over a directory should fail")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".vmflow-stats-") {
+			t.Fatalf("failed save left temporary file %s", entry.Name())
+		}
+	}
+}
+
+func TestResolvePath(t *testing.T) {
+	configPath := filepath.Join("opt", "vmflow", "config.yaml")
+	if got, want := ResolvePath(configPath, "state/traffic.json", ""), filepath.Join("opt", "vmflow", "state", "traffic.json"); got != want {
+		t.Fatalf("relative configured path = %q, want %q", got, want)
+	}
+	stateDir := filepath.Join(string(filepath.Separator), "var", "lib", "vmflow")
+	if got, want := ResolvePath(configPath, "", stateDir), filepath.Join(stateDir, DefaultFilename); got != want {
+		t.Fatalf("state directory path = %q, want %q", got, want)
+	}
+	if got, want := ResolvePath(configPath, "", ""), filepath.Join("opt", "vmflow", DefaultFilename); got != want {
+		t.Fatalf("config-adjacent path = %q, want %q", got, want)
+	}
+}
+
+func TestSameFilePathResolvesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(target, []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "stats.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	same, err := SameFilePath(link, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !same {
+		t.Fatal("symlink and target were not recognized as the same file")
 	}
 }
 

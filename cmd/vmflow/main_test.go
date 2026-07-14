@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/cloudapp3/vmflow/config"
+	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/statsstore"
 )
 
 func TestRouteCLI(t *testing.T) {
@@ -116,6 +118,102 @@ func TestConfigPathBesideExecutableResolvesSymlink(t *testing.T) {
 	}
 	if _, err := configPathBesideExecutable(filepath.Join(dir, "missing-vmflow")); err == nil {
 		t.Fatal("missing executable should fail closed")
+	}
+}
+
+func TestStatsFilePathUsesServiceStateDirectoryAndExplicitOverride(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	stateDir := filepath.Join(dir, "state")
+	t.Setenv("STATE_DIRECTORY", stateDir)
+	if got, want := statsFilePath(config.File{}, configPath), filepath.Join(stateDir, statsstore.DefaultFilename); got != want {
+		t.Fatalf("service stats path = %q, want %q", got, want)
+	}
+	cfg := config.File{Stats: config.StatsConfig{Path: "custom/traffic.json"}}
+	if got, want := statsFilePath(cfg, configPath), filepath.Join(dir, "custom", "traffic.json"); got != want {
+		t.Fatalf("explicit stats path = %q, want %q", got, want)
+	}
+}
+
+func TestConfiguredStatsDropsUnconfiguredRules(t *testing.T) {
+	restored, ignored := configuredStats([]engine.TrafficSnapshot{
+		{RuleID: "current", UploadBytes: 10},
+		{RuleID: "removed", UploadBytes: 20},
+		{RuleID: " ", UploadBytes: 30},
+	}, []engine.Rule{{RuleID: "current"}})
+	if ignored != 2 || len(restored) != 1 || restored[0].RuleID != "current" {
+		t.Fatalf("configured stats = %+v, ignored = %d", restored, ignored)
+	}
+}
+
+func TestRunForwardingRejectsStatsConfigPathCollision(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := config.File{
+		ControlListenAddr: "127.0.0.1:0",
+		Stats:             config.StatsConfig{Persist: true, Path: configPath},
+	}
+	ready := make(chan error, 1)
+	err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), false, ready)
+	if err == nil || !strings.Contains(err.Error(), "must differ from config path") {
+		t.Fatalf("run error = %v, want stats/config collision", err)
+	}
+	if readyErr := <-ready; readyErr == nil || !strings.Contains(readyErr.Error(), "must differ from config path") {
+		t.Fatalf("ready error = %v, want stats/config collision", readyErr)
+	}
+}
+
+func TestRunForwardingFailsBeforeReadyWhenStatsCannotBeSaved(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "stats-target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := config.File{
+		ControlListenAddr: "127.0.0.1:0",
+		Stats:             config.StatsConfig{Persist: true, Path: target},
+	}
+	ready := make(chan error, 1)
+	err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), false, ready)
+	if err == nil || !strings.Contains(err.Error(), "initialize stats persistence") {
+		t.Fatalf("run error = %v, want stats initialization failure", err)
+	}
+	if readyErr := <-ready; readyErr == nil || !strings.Contains(readyErr.Error(), "initialize stats persistence") {
+		t.Fatalf("ready error = %v, want stats initialization failure", readyErr)
+	}
+}
+
+func TestStatsFlusherStopsBeforeFinalSave(t *testing.T) {
+	collector := engine.NewCollector()
+	manager := engine.NewManager(collector)
+	collector.AddUpload("r1", 10)
+	store := statsstore.New(filepath.Join(t.TempDir(), "stats.json"))
+	flusher := startStatsFlusher(context.Background(), store, manager, 2*time.Millisecond, testLogger())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		snapshots, err := store.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshots) == 1 && snapshots[0].UploadBytes == 10 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("periodic stats flush did not complete")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	flusher.Stop()
+	collector.AddUpload("r1", 5)
+	time.Sleep(10 * time.Millisecond)
+	snapshots, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 1 || snapshots[0].UploadBytes != 10 {
+		t.Fatalf("flusher wrote after Stop: %+v", snapshots)
 	}
 }
 

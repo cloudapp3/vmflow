@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudapp3/vmflow/engine"
@@ -17,9 +19,13 @@ import (
 
 const documentVersion = 1
 
+// DefaultFilename is the state filename used when no explicit path is set.
+const DefaultFilename = "stats.json"
+
 // Store reads and writes cumulative traffic counters at path.
 type Store struct {
 	path string
+	mu   sync.Mutex
 }
 
 // New returns a store backed by path. An empty path makes Save/Load no-ops.
@@ -29,6 +35,69 @@ func New(path string) *Store {
 		return &Store{path: ""}
 	}
 	return &Store{path: filepath.Clean(path)}
+}
+
+// ResolvePath returns the stats file path. Explicit relative paths are resolved
+// beside the config file; otherwise a service state directory takes precedence
+// over the config directory.
+func ResolvePath(configPath, configuredPath, stateDirectory string) string {
+	if configuredPath = strings.TrimSpace(configuredPath); configuredPath != "" {
+		if filepath.IsAbs(configuredPath) {
+			return filepath.Clean(configuredPath)
+		}
+		return filepath.Clean(filepath.Join(filepath.Dir(configPath), configuredPath))
+	}
+	if stateDirectory = strings.TrimSpace(stateDirectory); stateDirectory != "" && filepath.IsAbs(stateDirectory) {
+		return filepath.Join(filepath.Clean(stateDirectory), DefaultFilename)
+	}
+	return filepath.Join(filepath.Dir(configPath), DefaultFilename)
+}
+
+// SameFilePath reports whether two paths identify the same destination. It
+// handles existing hard links and symlinks, plus not-yet-created files whose
+// parent directory can be resolved.
+func SameFilePath(left, right string) (bool, error) {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false, fmt.Errorf("compare paths: path is empty")
+	}
+	leftPath, err := canonicalPath(left)
+	if err != nil {
+		return false, fmt.Errorf("compare path %s: %w", left, err)
+	}
+	rightPath, err := canonicalPath(right)
+	if err != nil {
+		return false, fmt.Errorf("compare path %s: %w", right, err)
+	}
+	if pathsEqual(leftPath, rightPath) {
+		return true, nil
+	}
+	leftInfo, leftErr := os.Stat(leftPath)
+	rightInfo, rightErr := os.Stat(rightPath)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo), nil
+}
+
+func canonicalPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err == nil {
+		return filepath.Join(parent, filepath.Base(absolute)), nil
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func pathsEqual(left, right string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 // Path returns the configured file path.
@@ -86,6 +155,9 @@ func (s *Store) Save(snapshots []engine.TrafficSnapshot) error {
 	if s == nil || s.path == "" {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	doc := document{Version: documentVersion, UpdatedAt: time.Now().Unix(), Rules: toRecords(snapshots)}
 	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -113,13 +185,12 @@ func (s *Store) Save(snapshots []engine.TrafficSnapshot) error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("close stats: %w", err)
 	}
-	if err := os.Rename(tmpName, s.path); err != nil {
+	if err := replaceStatsFile(tmpName, s.path); err != nil {
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("replace stats file: %w", err)
 	}
-	// Best-effort directory sync so the rename survives a crash.
-	if f, err := os.Open(dir); err == nil {
-		_ = f.Sync()
-		_ = f.Close()
+	if err := syncStatsDirectory(dir); err != nil {
+		return fmt.Errorf("sync stats directory: %w", err)
 	}
 	return nil
 }
@@ -131,6 +202,9 @@ func (s *Store) Load() ([]engine.TrafficSnapshot, error) {
 	if s == nil || s.path == "" {
 		return nil, nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {

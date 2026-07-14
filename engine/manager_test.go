@@ -56,6 +56,27 @@ func transactionRule(ruleID, name string, targetPort int) Rule {
 	}
 }
 
+func TestStopAllPreservesCumulativeCounters(t *testing.T) {
+	collector := NewCollector()
+	manager := newScriptedManager(collector, &scriptedRunnerFactory{startErrors: make(map[string][]error)})
+	rule := transactionRule("persisted", "persisted", 21000)
+	if err := manager.StartRule(rule); err != nil {
+		t.Fatal(err)
+	}
+	collector.AddUpload(rule.RuleID, 100)
+	collector.AddDownload(rule.RuleID, 200)
+	collector.SetConns(rule.RuleID, 3)
+
+	manager.StopAll()
+	snapshot := manager.Snapshot(rule.RuleID)
+	if snapshot.UploadBytes != 100 || snapshot.DownloadBytes != 200 {
+		t.Fatalf("StopAll discarded cumulative counters: %+v", snapshot)
+	}
+	if snapshot.Conns != 0 {
+		t.Fatalf("StopAll left live connections: %+v", snapshot)
+	}
+}
+
 func TestApplySnapshotTransactionalPrevalidatesEntireBatch(t *testing.T) {
 	collector := NewCollector()
 	script := &scriptedRunnerFactory{startErrors: make(map[string][]error)}

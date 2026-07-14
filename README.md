@@ -23,6 +23,7 @@ Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmf
 - Bearer-token auth with viewer/admin roles
 - Structured logs in text or JSON format
 - Prometheus-compatible `/metrics`
+- Optional durable per-rule cumulative traffic and drop counters
 - Rule precheck for loops, duplicate ports, and unavailable listeners
 - Embeddable Go runtime for products that need in-process forwarding
 - Terminal dashboard and rule management via `vmflow tui`
@@ -99,6 +100,11 @@ log:
   level: info
   format: text
 
+stats:
+  persist: false                    # opt in to cumulative counter persistence
+  # path: /var/lib/vmflow/stats.json # optional; relative paths use the config dir
+  flush_interval: 60s               # minimum 1s; requires restart when changed
+
 auth:
   enabled: false
   tokens:
@@ -128,10 +134,19 @@ connections and UDP sessions; UDP sessions also consume the process-wide limit.
 Each UDP session owns a socket, a receive goroutine, and a 64 KiB receive
 buffer. Check available memory and open-file limits before raising either cap.
 
+Set `stats.persist: true` to preserve per-rule upload/download byte totals and
+UDP rejection/drop counters across restarts. Active connection counts and rates
+remain process-local. The foreground default is `stats.json` beside the loaded
+config. The installed Linux systemd unit uses its managed state directory
+(`/var/lib/vmflow/stats.json`), including when running with `--user vmflow`.
+An explicit relative `stats.path` is resolved beside the config file. vmflow
+refuses to start if the stats path aliases the config file or cannot be written.
+
 Hot reload applies only `rules` and `udp_max_sessions`. Changes to the control
 listen address, auth, TLS, logging, bot, ACME, certificate cache, or certificate
-review settings return HTTP `409` and require a vmflow process restart; they are
-never reported as successfully applied while the old runtime settings remain active.
+review or stats persistence settings return HTTP `409` and require a vmflow
+process restart; they are never reported as successfully applied while the old
+runtime settings remain active.
 
 Security note: vmflow **refuses to start** if the control API is bound to a non-loopback address without auth. Keep it on `127.0.0.1` (the default), or enable `auth` before exposing it. To bind remotely without auth anyway, pass `--insecure-allow-remote-control` (not recommended — put it behind a TLS-terminating reverse proxy instead).
 
@@ -190,7 +205,7 @@ The config is parsed before the OS service definition is changed. Running
 `service install` again updates the existing definition and restarts the
 service with the new settings.
 
-- **Linux**: writes and reloads a systemd unit, enables it, restarts the service, and verifies it is active. Logs go to journald (`journalctl -u vmflow`). The unit runs as root by default with `CAP_NET_BIND_SERVICE` (so it can bind privileged ports) and `Restart=on-failure`. Pass `--user vmflow` to run under a dedicated account (created if missing).
+- **Linux**: writes and reloads a systemd unit, enables it, restarts the service, and verifies it is active. Logs go to journald (`journalctl -u vmflow`). The unit runs as root by default with `CAP_NET_BIND_SERVICE` (so it can bind privileged ports), `Restart=on-failure`, and a writable `/var/lib/vmflow` state directory. Pass `--user vmflow` to run under a dedicated account (created if missing).
 - **macOS**: writes a launchd daemon (`KeepAlive` restarts on crash) and bootstraps it. Logs land under `/var/log/vmflow/` (override with `--log-file`).
 - **Windows**: registers a Windows Service (`start=auto`, restart-on-failure) visible in `services.msc`. Because the SCM provides no stdout, logs default to `C:\ProgramData\vmflow\logs\vmflow.log`; override with `--log-file` if needed.
 
@@ -198,12 +213,14 @@ Uninstall with `sudo vmflow service uninstall` (config and logs are left in plac
 
 For a complete removal, run `sudo vmflow uninstall`. It prints the full plan
 and requires confirmation before removing the service, binary, platform-default
-config, installer-owned colocated config, logs, update cache, and vmflow-owned
-certificate caches. An unowned colocated `config.yaml` is preserved. External
-TLS certificate and key files are never removed because they may be shared with
-other services. Custom certificate cache directories are left in place unless
-the directory is exclusively owned by vmflow and contains a `.vmflow-owned`
-marker; use `--dry-run` to inspect the plan without changing the system.
+config, installer-owned colocated config, persistent traffic statistics, logs,
+update cache, and vmflow-owned certificate caches. Stats files are parsed and
+revalidated immediately before removal; changed or unrecognized files are kept.
+An unowned colocated `config.yaml` is preserved. External TLS certificate and key
+files are never removed because they may be shared with other services. Custom
+certificate cache directories are left in place unless the directory is
+exclusively owned by vmflow and contains a `.vmflow-owned` marker; use
+`--dry-run` to inspect the plan without changing the system.
 
 ## Control API
 

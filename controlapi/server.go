@@ -268,6 +268,9 @@ func (runtime *Runtime) restartRequiredFields(next config.File) []string {
 	if !reflect.DeepEqual(current.CertReview, next.CertReview) {
 		fields = append(fields, "cert_review")
 	}
+	if !reflect.DeepEqual(current.Stats, next.Stats) {
+		fields = append(fields, "stats")
+	}
 	return fields
 }
 

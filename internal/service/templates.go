@@ -61,6 +61,8 @@ RestartSec=5
 NoNewPrivileges=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+StateDirectory=vmflow
+StateDirectoryMode=0750
 %s[Install]
 WantedBy=multi-user.target
 `, systemdExecStart(cfg), userLine)

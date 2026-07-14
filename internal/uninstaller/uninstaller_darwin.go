@@ -18,6 +18,10 @@ func defaultConfigPath() string { return darwinDefaultCfg }
 
 func defaultLogPaths() []string { return []string{darwinLogDir} }
 
+func defaultStatePaths() []string { return nil }
+
+func defaultStatsPaths() []string { return []string{"/usr/local/etc/vmflow/stats.json"} }
+
 func serviceInstalled() bool {
 	// launchdLabel in internal/service renders "io.cloudapp." + lowercased name.
 	label := "io.cloudapp." + service.DefaultServiceName

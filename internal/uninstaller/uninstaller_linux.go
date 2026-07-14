@@ -18,6 +18,10 @@ func defaultConfigPath() string { return linuxDefaultCfg }
 
 func defaultLogPaths() []string { return []string{"/var/log/vmflow"} }
 
+func defaultStatePaths() []string { return []string{"/var/lib/vmflow"} }
+
+func defaultStatsPaths() []string { return nil }
+
 func serviceInstalled() bool {
 	if err := exec.Command("systemctl", "cat", linuxUnitName).Run(); err == nil {
 		return true

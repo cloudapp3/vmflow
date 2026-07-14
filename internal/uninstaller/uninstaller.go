@@ -24,6 +24,7 @@ import (
 
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/internal/service"
+	"github.com/cloudapp3/vmflow/internal/statsstore"
 	"github.com/cloudapp3/vmflow/internal/updater"
 )
 
@@ -33,6 +34,7 @@ const (
 	kindFile                  = "file"
 	kindDir                   = "dir"
 	kindOwnedConfig           = "owned-config"
+	kindStatsFile             = "stats-file"
 	colocatedConfigName       = "config.yaml"
 	colocatedConfigMarkerName = ".vmflow-config-owned"
 )
@@ -40,7 +42,7 @@ const (
 // Item describes one artifact the uninstall removes.
 type Item struct {
 	Path string // filesystem path; empty for the service item
-	Kind string // kindService | kindBinary | kindFile | kindDir | kindOwnedConfig
+	Kind string // service, binary, file, directory, owned config, or stats file
 	Note string // human-readable description shown in the plan
 	Self bool   // marks the running binary; removed last
 }
@@ -69,6 +71,14 @@ func Plan() (items []Item, warnings []string) {
 		items = append(items, Item{Kind: kindFile, Path: markerPath, Note: "colocated config ownership marker"})
 	} else if pathLexists(cfgPath) && !samePath(cfgPath, defaultConfigPath()) {
 		warnings = append(warnings, fmt.Sprintf("leaving colocated config %s in place (missing %s ownership marker)", cfgPath, colocatedConfigMarkerName))
+	}
+	for _, path := range defaultStatsPaths() {
+		items, warnings = appendStatsPlan(items, warnings, path)
+	}
+	for _, path := range defaultStatePaths() {
+		if pathExists(path) {
+			items = append(items, Item{Kind: kindDir, Path: path, Note: "runtime state directory"})
+		}
 	}
 
 	for _, p := range defaultLogPaths() {
@@ -103,6 +113,10 @@ func appendConfigPlan(items []Item, warnings []string, cfgPath, configKind strin
 	if !pathExists(cfgPath) {
 		return items, warnings
 	}
+	items, warnings = appendStatsPlan(items, warnings, filepath.Join(filepath.Dir(cfgPath), statsstore.DefaultFilename))
+	if statsPath := configuredStatsPath(cfgPath); statsPath != "" {
+		items, warnings = appendStatsPlan(items, warnings, statsPath)
+	}
 
 	certPaths, cacheDirs := cleanupPathsFromConfig(cfgPath)
 	for _, p := range certPaths {
@@ -136,6 +150,50 @@ func appendConfigPlan(items []Item, warnings []string, cfgPath, configKind strin
 		items = append(items, Item{Kind: kindDir, Path: p, Note: "vmflow-owned certificate cache"})
 	}
 	return items, warnings
+}
+
+func configuredStatsPath(cfgPath string) string {
+	cfg, err := config.Load(cfgPath)
+	if err != nil || strings.TrimSpace(cfg.Stats.Path) == "" {
+		return ""
+	}
+	return statsstore.ResolvePath(cfgPath, cfg.Stats.Path, "")
+}
+
+func appendStatsPlan(items []Item, warnings []string, path string) ([]Item, []string) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "." || !pathLexists(path) || planContainsPath(items, path) {
+		return items, warnings
+	}
+	if err := validateStatsFile(path); err != nil {
+		warnings = append(warnings, fmt.Sprintf("leaving stats path %s in place: %v", path, err))
+		return items, warnings
+	}
+	items = append(items, Item{Kind: kindStatsFile, Path: path, Note: "persistent traffic statistics"})
+	return items, warnings
+}
+
+func planContainsPath(items []Item, path string) bool {
+	for _, item := range items {
+		if item.Path != "" && samePath(filepath.Clean(item.Path), path) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateStatsFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular vmflow stats file")
+	}
+	if _, err := statsstore.New(path).Load(); err != nil {
+		return fmt.Errorf("not a valid vmflow stats file: %w", err)
+	}
+	return nil
 }
 
 func colocatedConfig(binaryPath string) (configPath, markerPath string, owned bool) {
@@ -198,6 +256,22 @@ func Execute(w io.Writer, items []Item) error {
 			if err := service.Uninstall(service.Config{ServiceName: service.DefaultServiceName}, w); err != nil {
 				problems = append(problems, fmt.Sprintf("service: %v", err))
 			}
+		case kindStatsFile:
+			if isProtected(it.Path) {
+				problems = append(problems, fmt.Sprintf("refusing to remove protected path: %s", it.Path))
+				continue
+			}
+			if err := validateStatsFile(it.Path); os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				problems = append(problems, fmt.Sprintf("refusing to remove changed stats file %s: %v", it.Path, err))
+				continue
+			}
+			if err := os.Remove(it.Path); err != nil && !os.IsNotExist(err) {
+				problems = append(problems, fmt.Sprintf("%s: %v", it.Path, err))
+				continue
+			}
+			fmt.Fprintf(w, "removed %s\n", it.Path)
 		case kindFile:
 			if isProtected(it.Path) {
 				problems = append(problems, fmt.Sprintf("refusing to remove protected path: %s", it.Path))
@@ -334,6 +408,11 @@ const ownedDirMarker = ".vmflow-owned"
 func canRemoveVMFlowDir(path string) bool {
 	clean := filepath.Clean(path)
 	for _, known := range defaultLogPaths() {
+		if samePath(clean, filepath.Clean(known)) {
+			return true
+		}
+	}
+	for _, known := range defaultStatePaths() {
 		if samePath(clean, filepath.Clean(known)) {
 			return true
 		}

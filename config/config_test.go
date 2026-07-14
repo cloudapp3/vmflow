@@ -165,8 +165,8 @@ func TestParseStatsConfig(t *testing.T) {
 version: 1
 stats:
   persist: true
-  path: /var/lib/vmflow/stats.json
-  flush_interval: 30s
+  path: " /var/lib/vmflow/stats.json "
+  flush_interval: " 30s "
 rules: []
 `))
 	if err != nil {
@@ -174,5 +174,16 @@ rules: []
 	}
 	if !cfg.Stats.Persist || cfg.Stats.Path != "/var/lib/vmflow/stats.json" || cfg.Stats.FlushInterval != "30s" {
 		t.Fatalf("stats config = %+v", cfg.Stats)
+	}
+}
+
+func TestParseRejectsInvalidStatsFlushInterval(t *testing.T) {
+	for _, interval := range []string{"invalid", "500ms", "0s", "-1s"} {
+		t.Run(interval, func(t *testing.T) {
+			_, err := Parse([]byte("version: 1\nstats:\n  flush_interval: " + interval + "\nrules: []\n"))
+			if err == nil {
+				t.Fatalf("flush interval %q should fail", interval)
+			}
+		})
 	}
 }

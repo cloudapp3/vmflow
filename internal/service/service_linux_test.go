@@ -28,6 +28,8 @@ func TestSystemdUnitContainsRequiredDirectives(t *testing.T) {
 		"NoNewPrivileges=true",
 		"AmbientCapabilities=CAP_NET_BIND_SERVICE",
 		"CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+		"StateDirectory=vmflow",
+		"StateDirectoryMode=0750",
 		"WantedBy=multi-user.target",
 	} {
 		if !strings.Contains(unit, want) {

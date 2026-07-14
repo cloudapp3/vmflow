@@ -11,6 +11,15 @@ log:
   level: info
   format: text # text or json
 
+# Optional persistence for cumulative per-rule traffic/drop counters. Live
+# connection counts and rates are never restored. Under the installed systemd
+# service the default is /var/lib/vmflow/stats.json; otherwise it is stats.json
+# beside this config. Relative path values are resolved beside this config.
+stats:
+  persist: false
+  # path: /var/lib/vmflow/stats.json
+  flush_interval: 60s # minimum 1s; changing stats settings requires restart
+
 # vmflow refuses to start if control_listen_addr is non-loopback without auth.
 # Bind 127.0.0.1 (default) or enable auth below before exposing it remotely.
 # relayctl/vmflow ctl can pass the token with -token or VMFLOW_CONTROL_TOKEN.

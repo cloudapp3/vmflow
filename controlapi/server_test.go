@@ -215,6 +215,31 @@ rules: []
 	}
 }
 
+func TestReloadRejectsStatsConfigChanges(t *testing.T) {
+	startup, err := config.Parse([]byte("version: 1\nrules: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(configPath, []byte("version: 1\nstats:\n  persist: true\n  flush_interval: 30s\nrules: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.StartupConfig = &startup
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+
+	_, _, err = runtime.Reload()
+	var restartErr *RestartRequiredError
+	if !errors.As(err, &restartErr) {
+		t.Fatalf("reload error = %v, want RestartRequiredError", err)
+	}
+	if len(restartErr.Fields) != 1 || restartErr.Fields[0] != "stats" {
+		t.Fatalf("restart-required fields = %v, want [stats]", restartErr.Fields)
+	}
+}
+
 func TestReloadEndpointReturnsConflictForRestartOnlyChanges(t *testing.T) {
 	startup, err := config.Parse([]byte("version: 1\nrules: []\n"))
 	if err != nil {

@@ -18,6 +18,10 @@ func defaultConfigPath() string { return windowsDefaultCfg }
 
 func defaultLogPaths() []string { return []string{`C:\ProgramData\vmflow\logs`} }
 
+func defaultStatePaths() []string { return nil }
+
+func defaultStatsPaths() []string { return []string{`C:\ProgramData\vmflow\stats.json`} }
+
 func serviceInstalled() bool {
 	return exec.Command("sc.exe", "query", service.DefaultServiceName).Run() == nil
 }
