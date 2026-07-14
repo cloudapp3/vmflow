@@ -209,6 +209,7 @@ func runForeground(args []string) {
 	defer stop()
 
 	if err := runForwarding(ctx, cfg, startupConfig, opts.configPath, logger, opts.insecureAllowRemote); err != nil {
+		fmt.Fprintf(os.Stderr, "vmflow failed: %v\n", err)
 		os.Exit(1)
 	}
 }

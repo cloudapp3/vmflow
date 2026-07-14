@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -86,6 +87,33 @@ func TestParseForegroundOptionsUsesDefaultAndRejectsPositionals(t *testing.T) {
 		return "/opt/vmflow/config.yaml", nil
 	}, io.Discard); err != flag.ErrHelp {
 		t.Fatalf("help error = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestForegroundReportsRuntimeFailure(t *testing.T) {
+	const helperEnv = "VMFLOW_TEST_FOREGROUND_FAILURE"
+	if os.Getenv(helperEnv) == "1" {
+		runForeground([]string{"-config", os.Getenv("VMFLOW_TEST_CONFIG")})
+		return
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configData := []byte("version: 1\ncontrol_listen_addr: 0.0.0.0:19090\nauth:\n  enabled: false\nrules: []\n")
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestForegroundReportsRuntimeFailure$")
+	cmd.Env = append(os.Environ(), helperEnv+"=1", "VMFLOW_TEST_CONFIG="+configPath)
+	output, err := cmd.CombinedOutput()
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("foreground exit error = %v, output = %s", err, output)
+	}
+	for _, want := range []string{"vmflow failed: control api:", "without authentication"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("foreground output missing %q: %s", want, output)
+		}
 	}
 }
 

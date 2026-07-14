@@ -43,15 +43,17 @@ auth:
 # bot_chat: 123456789
 # bot_control_token: "change-me"  # must match an admin auth.tokens entry
 
+# The bundled example is loopback-only and disabled so a first launch never
+# exposes a new network port. Review the addresses and firewall before enabling.
 rules:
   - rule_id: ssh-forward
     name: ssh-forward
     protocol: tcp
-    listen_addr: 0.0.0.0
+    listen_addr: 127.0.0.1
     listen_port: 2201
     target_addr: 127.0.0.1
     target_port: 22
-    enabled: true
+    enabled: false
     speed_limit: 0
     max_conn: 0        # TCP: unlimited; UDP: default 256 sessions
     idle_timeout: 300  # seconds; 0 = default 5 min. Reaps silent connections.

@@ -29,9 +29,9 @@ archives.
 | github.com/muesli/termenv | v0.16.0 | MIT |
 | github.com/rivo/uniseg | v0.4.7 | MIT |
 | github.com/xo/terminfo | v0.0.0-20220910002029-abceb7e1c41e | MIT |
-| golang.org/x/crypto | v0.50.0 | BSD-3-Clause |
-| golang.org/x/sys | v0.43.0 | BSD-3-Clause |
-| golang.org/x/text | v0.36.0 | BSD-3-Clause |
+| golang.org/x/crypto | v0.54.0 | BSD-3-Clause |
+| golang.org/x/sys | v0.47.0 | BSD-3-Clause |
+| golang.org/x/text | v0.40.0 | BSD-3-Clause |
 | gopkg.in/yaml.v3 | v3.0.1 | MIT and Apache-2.0 |
 
 This inventory reflects the dependency graph used by `./cmd/vmflow`. Update it

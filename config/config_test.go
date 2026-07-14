@@ -1,10 +1,29 @@
 package config
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/cloudapp3/vmflow/engine"
 )
+
+func TestBundledConfigStartsWithoutForwarding(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "examples", "config.yaml"))
+	if err != nil {
+		t.Fatalf("load bundled config: %v", err)
+	}
+	if len(cfg.Rules) == 0 {
+		t.Fatal("bundled config should retain a discoverable example rule")
+	}
+	for _, rule := range cfg.Rules {
+		if rule.Enabled {
+			t.Fatalf("bundled rule %q is enabled", rule.RuleID)
+		}
+		if rule.ListenAddr != "127.0.0.1" {
+			t.Fatalf("bundled rule %q listens on %q, want loopback", rule.RuleID, rule.ListenAddr)
+		}
+	}
+}
 
 func TestParseDefaultsControlListenAddr(t *testing.T) {
 	cfg, err := Parse([]byte(`

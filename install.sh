@@ -100,6 +100,10 @@ print_path_hint() {
   fi
 
   log ""
+  log "Review forwarding rules before starting or restarting vmflow:"
+  log "  ${config_path}"
+  log "Upgrades preserve existing rules, including enabled public listeners."
+  log ""
   log "Start vmflow (loads ${config_path} by default):"
   log "  \"${target_path}\""
 }

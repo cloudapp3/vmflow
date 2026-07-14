@@ -52,6 +52,11 @@ or upgrading replaces only the binary and preserves the existing config. Running
 `vmflow` uses the `config.yaml` beside the resolved binary by default; `-config`
 overrides that path.
 
+The bundled SSH forwarding example is disabled and listens on loopback only.
+Review its listen address, target, and firewall exposure before setting
+`enabled: true`; a first launch starts the control plane without exposing a new
+forwarding port.
+
 Start vmflow in one terminal:
 
 ```bash
@@ -126,11 +131,11 @@ rules:
   - rule_id: ssh-forward
     name: ssh-forward
     protocol: tcp
-    listen_addr: 0.0.0.0
+    listen_addr: 127.0.0.1
     listen_port: 2201
     target_addr: 127.0.0.1
     target_port: 22
-    enabled: true
+    enabled: false
     max_conn: 0                     # TCP: unlimited; UDP: default of 256
 ```
 

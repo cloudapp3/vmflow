@@ -39,6 +39,10 @@ func TestInstallScriptCreatesAndPreservesColocatedConfig(t *testing.T) {
 	if strings.Contains(out, " daemon ") || strings.Contains(out, "daemon -config") {
 		t.Fatalf("installer output still exposes removed daemon command:\n%s", out)
 	}
+	const reviewHint = "Review forwarding rules before starting or restarting vmflow"
+	if !strings.Contains(out, reviewHint) || !strings.Contains(out, "enabled public listeners") {
+		t.Fatalf("installer output does not prompt config review:\n%s", out)
+	}
 
 	custom := "version: 1\n# operator config\nrules: []\n"
 	if err := os.WriteFile(configPath, []byte(custom), 0o640); err != nil {
@@ -47,9 +51,12 @@ func TestInstallScriptCreatesAndPreservesColocatedConfig(t *testing.T) {
 	if err := os.Chmod(configPath, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	runInstallScript(t, fixture, installDir, true)
+	upgradeOut := runInstallScript(t, fixture, installDir, true)
 	assertFileContent(t, configPath, custom)
 	assertFileMode(t, configPath, 0o640)
+	if !strings.Contains(upgradeOut, "Preserved existing config") || !strings.Contains(upgradeOut, reviewHint) {
+		t.Fatalf("upgrade output does not warn about preserved rules:\n%s", upgradeOut)
+	}
 }
 
 func TestInstallScriptDoesNotClaimPreexistingConfig(t *testing.T) {
