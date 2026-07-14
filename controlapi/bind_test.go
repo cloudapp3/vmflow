@@ -17,6 +17,8 @@ func TestEnsureSafeControlBinding(t *testing.T) {
 		addr        string
 		authEnabled bool
 		allowRemote bool
+		certFile    string
+		keyFile     string
 		clientCA    string
 		wantErr     bool
 	}{
@@ -33,14 +35,19 @@ func TestEnsureSafeControlBinding(t *testing.T) {
 		{name: "non-loopback allowed via flag", addr: "10.0.0.5:19090", allowRemote: true},
 		{name: "malformed addr no auth rejected", addr: "not-a-host-port", wantErr: true},
 		{name: "malformed addr with auth ok", addr: "not-a-host-port", authEnabled: true},
-		{name: "non-loopback allowed with mTLS", addr: "10.0.0.5:19090", clientCA: "ca.pem"},
+		{name: "non-loopback rejects incomplete mTLS", addr: "10.0.0.5:19090", clientCA: "ca.pem", wantErr: true},
+		{name: "non-loopback allowed with mTLS", addr: "10.0.0.5:19090", certFile: "server.crt", keyFile: "server.key", clientCA: "ca.pem"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := config.File{
 				ControlListenAddr: tt.addr,
 				Auth:              config.AuthConfig{Enabled: tt.authEnabled},
-				ControlTLS:        config.ControlTLSConfig{ClientCAFile: tt.clientCA},
+				ControlTLS: config.ControlTLSConfig{
+					CertFile:     tt.certFile,
+					KeyFile:      tt.keyFile,
+					ClientCAFile: tt.clientCA,
+				},
 			}
 			err := EnsureSafeControlBinding(cfg, tt.allowRemote, logger)
 			switch {

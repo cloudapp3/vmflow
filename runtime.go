@@ -32,9 +32,14 @@ type Options struct {
 	// the vmflow in-memory traffic counters. If nil, a new collector is created.
 	Collector *engine.Collector
 
-	// CertProvider enables HTTPS rules. Leave nil when the embedded application
-	// only uses TCP, UDP, tcp+udp, or HTTP proxy rules.
+	// CertProvider is reserved for a future HTTPS rule implementation. Current
+	// builds accept only TCP, UDP, and tcp+udp rules.
 	CertProvider CertProvider
+
+	// UDPMaxSessions caps active UDP sessions across all rules in this runtime.
+	// Non-positive values use engine.DefaultUDPGlobalMaxSessions; larger values
+	// are clamped to engine.MaxUDPGlobalMaxSessions.
+	UDPMaxSessions int
 }
 
 // NewRuntime creates a new embeddable forwarding runtime.
@@ -44,11 +49,12 @@ func NewRuntime(opts Options) *Runtime {
 		collector = engine.NewCollector()
 	}
 
+	managerOpts := engine.ManagerOptions{UDPMaxSessions: opts.UDPMaxSessions}
 	var manager *engine.Manager
 	if opts.CertProvider != nil {
-		manager = engine.NewManagerWithCert(collector, opts.CertProvider)
+		manager = engine.NewManagerWithCertOptions(collector, opts.CertProvider, managerOpts)
 	} else {
-		manager = engine.NewManager(collector)
+		manager = engine.NewManagerWithOptions(collector, managerOpts)
 	}
 
 	return &Runtime{manager: manager, collector: collector}

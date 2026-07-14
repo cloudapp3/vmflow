@@ -10,14 +10,14 @@ import (
 
 // runUninstall implements `vmflow uninstall`: it probes the system, prints the
 // removal plan, asks for confirmation, and removes the native service, the
-// binary, and all config/log/cert/cache artifacts. `--dry-run` prints the plan
-// without removing anything.
+// binary, and owned config/log/cache artifacts. External TLS files are kept.
+// `--dry-run` prints the plan without removing anything.
 func runUninstall(args []string) {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage:\n  vmflow uninstall [--dry-run]\n\n")
 		fmt.Fprintf(fs.Output(), "Removes the native service, the vmflow binary, and purges config, logs,\n")
-		fmt.Fprintf(fs.Output(), "TLS/ACME certificates, and the self-update cache.\n\nOptions:\n")
+		fmt.Fprintf(fs.Output(), "vmflow-owned cache artifacts, and the self-update cache. External TLS files are preserved.\n\nOptions:\n")
 		fs.PrintDefaults()
 	}
 	var dryRun bool

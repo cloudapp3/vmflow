@@ -1,13 +1,17 @@
 package controlapi
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/engine"
@@ -22,7 +26,7 @@ func TestAuthRequired(t *testing.T) {
 	server := httptest.NewServer(NewHandler(runtime))
 	defer server.Close()
 
-	resp, err := http.Get(server.URL + "/healthz")
+	resp, err := http.Get(server.URL + "/v1/rules")
 	if err != nil {
 		t.Fatalf("get health: %v", err)
 	}
@@ -63,7 +67,7 @@ func TestAdminTokenCanRead(t *testing.T) {
 	server := httptest.NewServer(NewHandler(runtime))
 	defer server.Close()
 
-	req, err := http.NewRequest(http.MethodGet, server.URL+"/healthz", nil)
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v1/rules", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,5 +138,258 @@ rules:
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestReloadAppliesUDPMaxSessions(t *testing.T) {
+	tmp := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(tmp, []byte(`
+version: 1
+udp_max_sessions: 1234
+rules: []
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := testRuntime(config.AuthConfig{})
+	startup, err := config.Parse([]byte("version: 1\nrules: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.StartupConfig = &startup
+	runtime.ConfigPath = tmp
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+	defer runtime.Manager.StopAll()
+
+	if _, _, err := runtime.Reload(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	limit, active := runtime.Manager.UDPMaxSessions()
+	if limit != 1234 || active != 0 {
+		t.Fatalf("UDPMaxSessions() = (%d, %d), want (1234, 0)", limit, active)
+	}
+}
+
+func TestReloadRejectsRestartOnlyConfigChanges(t *testing.T) {
+	startup, err := config.Parse([]byte(`
+version: 1
+auth:
+  enabled: true
+  tokens:
+    - name: admin
+      token: old-secret
+      role: admin
+rules: []
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(configPath, []byte(`
+version: 1
+auth:
+  enabled: true
+  tokens:
+    - name: admin
+      token: new-secret
+      role: admin
+rules: []
+`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.StartupConfig = &startup
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+
+	_, _, err = runtime.Reload()
+	var restartErr *RestartRequiredError
+	if !errors.As(err, &restartErr) {
+		t.Fatalf("reload error = %v, want RestartRequiredError", err)
+	}
+	if len(restartErr.Fields) != 1 || restartErr.Fields[0] != "auth" {
+		t.Fatalf("restart-required fields = %v, want [auth]", restartErr.Fields)
+	}
+}
+
+func TestReloadEndpointReturnsConflictForRestartOnlyChanges(t *testing.T) {
+	startup, err := config.Parse([]byte("version: 1\nrules: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(configPath, []byte("version: 1\nlog:\n  format: json\nrules: []\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.StartupConfig = &startup
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/reload", nil)
+	NewHandler(runtime).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("reload status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"fields": [`) || !strings.Contains(recorder.Body.String(), `"log"`) {
+		t.Fatalf("reload response omitted restart-required field: %s", recorder.Body.String())
+	}
+}
+
+func TestReloadTightensUDPMaxSessions(t *testing.T) {
+	configPath := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(configPath, []byte("version: 1\nudp_max_sessions: 64\nrules: []\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+
+	if _, _, err := runtime.Reload(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	limit, active := runtime.Manager.UDPMaxSessions()
+	if limit != 64 || active != 0 {
+		t.Fatalf("UDPMaxSessions() = (%d, %d), want (64, 0)", limit, active)
+	}
+}
+
+func TestReloadSerializesTransactions(t *testing.T) {
+	configPath := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(configPath, []byte("version: 1\nrules: []\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+
+	runtime.reloadMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			runtime.reloadMu.Unlock()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := runtime.Reload()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("reload bypassed transaction lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	runtime.reloadMu.Unlock()
+	locked = false
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("reload after unlock: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reload did not resume after transaction lock was released")
+	}
+}
+
+func TestReloadRuleFailureReturnsErrorAndDoesNotRelaxUDPMaxSessions(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	port := occupied.Addr().(*net.TCPAddr).Port
+	configPath := t.TempDir() + "/config.yaml"
+	raw := fmt.Sprintf(`
+version: 1
+udp_max_sessions: 1234
+rules:
+  - rule_id: blocked
+    name: blocked
+    protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: %d
+    target_addr: 127.0.0.1
+    target_port: 9
+    enabled: true
+`, port)
+	if err := os.WriteFile(configPath, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.Manager.SetUDPMaxSessions(64)
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+	defer runtime.Manager.StopAll()
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/reload", nil)
+	NewHandler(runtime).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("reload status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"failed_rules": 1`) {
+		t.Fatalf("reload response omitted apply result: %s", recorder.Body.String())
+	}
+	limit, active := runtime.Manager.UDPMaxSessions()
+	if limit != 64 || active != 0 {
+		t.Fatalf("UDPMaxSessions() = (%d, %d), want unchanged (64, 0)", limit, active)
+	}
+}
+
+func TestReloadRuleFailureRestoresTightenedUDPMaxSessions(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	port := occupied.Addr().(*net.TCPAddr).Port
+	configPath := t.TempDir() + "/config.yaml"
+	raw := fmt.Sprintf(`
+version: 1
+udp_max_sessions: 32
+rules:
+  - rule_id: blocked
+    name: blocked
+    protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: %d
+    target_addr: 127.0.0.1
+    target_port: 9
+    enabled: true
+`, port)
+	if err := os.WriteFile(configPath, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.Manager.SetUDPMaxSessions(64)
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+	defer runtime.Manager.StopAll()
+
+	_, _, err = runtime.Reload()
+	if err == nil {
+		t.Fatal("expected reload failure")
+	}
+	if degraded, reason := runtime.degradedState(); !degraded || !strings.Contains(reason, "not applied") {
+		t.Fatalf("failed reload degraded state = (%v, %q), want configuration drift", degraded, reason)
+	}
+	limit, active := runtime.Manager.UDPMaxSessions()
+	if limit != 64 || active != 0 {
+		t.Fatalf("UDPMaxSessions() = (%d, %d), want restored (64, 0)", limit, active)
 	}
 }

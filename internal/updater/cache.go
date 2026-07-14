@@ -37,6 +37,13 @@ func cacheFilePath(dir string) string {
 	return filepath.Join(dir, cacheFileName)
 }
 
+// CacheFilePath returns the path to vmflow's default update-check cache file.
+// Cleanup callers should remove this file rather than recursively deleting the
+// parent cache directory, which may be shared with other applications.
+func CacheFilePath() string {
+	return cacheFilePath("")
+}
+
 // ReadCache reads the cache file from disk. Returns zero-value CacheFile if not found.
 func ReadCache() (CacheFile, error) {
 	return ReadCacheAt("")

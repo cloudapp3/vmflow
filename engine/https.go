@@ -135,14 +135,14 @@ func (runner *httpsRunner) handleConn(clientConn net.Conn) {
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(targetConn, br, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
+		_, _ = copyWithLimit(runner.ctx, targetConn, br, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
 			runner.collector.AddUpload(runner.rule.RuleID, n)
 		})
 	}()
 
 	go func() {
 		defer copyWG.Done()
-		_, _ = copyWithLimit(clientConn, targetConn, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
+		_, _ = copyWithLimit(runner.ctx, clientConn, targetConn, runner.rule.SpeedLimit, time.Duration(runner.rule.IdleTimeout)*time.Second, func(n int64) {
 			runner.collector.AddDownload(runner.rule.RuleID, n)
 		})
 	}()

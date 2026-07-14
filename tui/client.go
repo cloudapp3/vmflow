@@ -1,180 +1,53 @@
 package tui
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"time"
+	"github.com/cloudapp3/vmflow/controlapi"
+	"github.com/cloudapp3/vmflow/engine"
 )
 
-// ── API Response Types ─────────────────────────────────────────────
+// Client and API types alias controlapi so the TUI, vmflow ctl, and the
+// Telegram bot share one client implementation.
 
-type HealthResponse struct {
-	OK           bool  `json:"ok"`
-	RunningRules int   `json:"running_rules"`
-	Time         int64 `json:"time"`
-}
+type (
+	Client              = controlapi.Client
+	StatsResponse       = controlapi.StatsResponse
+	TrafficSnapshot     = controlapi.TrafficSnapshot
+	RulesResponse       = controlapi.RulesResponse
+	ReloadResponse      = controlapi.ReloadResponse
+	SessionCapabilities = controlapi.SessionCapabilities
+	SessionResponse     = controlapi.SessionResponse
+	ConfigRulesResponse = controlapi.ConfigRulesResponse
+	ConfigRulesRequest  = controlapi.ConfigRulesRequest
+	ConfigRuleDiff      = controlapi.ConfigRuleDiff
+	PrecheckResponse    = controlapi.PrecheckResponse
+	ApplyResponse       = controlapi.ApplyResponse
+	BotConfigResponse   = controlapi.BotConfigResponse
+	BotConfigRequest    = controlapi.BotConfigRequest
+	APIError            = controlapi.APIError
+)
 
-type StatsResponse struct {
-	Items []TrafficSnapshot `json:"items"`
-}
+// RuleInfo is engine.Rule, kept for TUI-internal readability.
+type RuleInfo = engine.Rule
 
-type TrafficSnapshot struct {
-	RuleID        string `json:"rule_id"`
-	UploadBytes   int64  `json:"upload_bytes"`
-	DownloadBytes int64  `json:"download_bytes"`
-	Conns         int64  `json:"conns"`
-	UpdatedTime   int64  `json:"updated_time"`
-}
-
-type RulesResponse struct {
-	Items []RuleInfo `json:"items"`
-}
-
-type RuleInfo struct {
-	RuleID     string `json:"rule_id"`
-	Name       string `json:"name"`
-	Protocol   string `json:"protocol"`
-	ListenAddr string `json:"listen_addr"`
-	ListenPort int    `json:"listen_port"`
-	TargetAddr string `json:"target_addr"`
-	TargetPort int    `json:"target_port"`
-	Enabled    bool   `json:"enabled"`
-	SpeedLimit int64  `json:"speed_limit"`
-	MaxConn    int    `json:"max_conn"`
-	Remark     string `json:"remark,omitempty"`
-}
-
-type ReloadResponse struct {
-	ConfigPath        string `json:"config_path"`
-	ControlListenAddr string `json:"control_listen_addr"`
-	RuleCount         int    `json:"rule_count"`
-}
-
-// ── Client ─────────────────────────────────────────────────────────
-
-type Client struct {
-	baseURL string
-	token   string
-	headers http.Header
-	http    *http.Client
-}
-
+// NewClient wraps controlapi.NewClient for the TUI's variadic token signature.
 func NewClient(baseURL string, token ...string) *Client {
-	client := &Client{
-		baseURL: baseURL,
-		http:    &http.Client{Timeout: 5 * time.Second},
-	}
 	if len(token) > 0 {
-		client.token = token[0]
+		return controlapi.NewClient(baseURL, token[0])
 	}
-	return client
+	return controlapi.NewClient(baseURL, "")
 }
 
-// SetHTTPClient replaces the HTTP client used for control API requests. Pass
-// nil to keep the default; otherwise the caller controls TLS and timeouts
-// (e.g. a client configured with a private CA or mTLS certificates).
-func (c *Client) SetHTTPClient(h *http.Client) {
-	if c != nil && h != nil {
-		c.http = h
-	}
+// apiStatus wraps controlapi.APIStatus.
+func apiStatus(err error) int {
+	return controlapi.APIStatus(err)
 }
 
-// SetHeaders sets extra headers (e.g. CF-Access-Client-* when behind Cloudflare
-// Access) applied to every request. nil clears them.
-func (c *Client) SetHeaders(h http.Header) {
-	if c != nil {
-		c.headers = h
-	}
+// cloneRules wraps controlapi.CloneRules.
+func cloneRules(rules []RuleInfo) []RuleInfo {
+	return controlapi.CloneRules(rules)
 }
 
-func (c *Client) applyExtraHeaders(req *http.Request) {
-	if c == nil || len(c.headers) == 0 {
-		return
-	}
-	for name, values := range c.headers {
-		for _, v := range values {
-			req.Header.Set(name, v)
-		}
-	}
-}
-
-func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
-	resp := new(HealthResponse)
-	if err := c.doGet(ctx, "/healthz", resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (c *Client) Stats(ctx context.Context) (*StatsResponse, error) {
-	resp := new(StatsResponse)
-	if err := c.doGet(ctx, "/v1/stats", resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (c *Client) Rules(ctx context.Context) (*RulesResponse, error) {
-	resp := new(RulesResponse)
-	if err := c.doGet(ctx, "/v1/rules", resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (c *Client) Reload(ctx context.Context) (*ReloadResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/reload", nil)
-	if err != nil {
-		return nil, err
-	}
-	c.authorize(req)
-	c.applyExtraHeaders(req)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("reload failed: %s", body)
-	}
-	result := new(ReloadResponse)
-	if err := json.Unmarshal(body, result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func (c *Client) doGet(ctx context.Context, path string, result any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
-		return err
-	}
-	c.authorize(req)
-	c.applyExtraHeaders(req)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: %s", path, body)
-	}
-	return json.Unmarshal(body, result)
-}
-
-func (c *Client) authorize(req *http.Request) {
-	if c != nil && c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+// normalizeETag wraps controlapi.NormalizeETag.
+func normalizeETag(value string) string {
+	return controlapi.NormalizeETag(value)
 }

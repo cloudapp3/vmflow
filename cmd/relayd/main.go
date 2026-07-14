@@ -38,6 +38,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
 		os.Exit(1)
 	}
+	startupConfig := cfg
 	if strings.TrimSpace(*controlListen) != "" {
 		cfg.ControlListenAddr = strings.TrimSpace(*controlListen)
 	}
@@ -59,7 +60,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	manager := engine.NewManager(engine.NewCollector())
+	manager := engine.NewManagerWithOptions(engine.NewCollector(), engine.ManagerOptions{UDPMaxSessions: cfg.UDPMaxSessions})
 	metricsCollector := metrics.New(manager)
 	result := manager.ApplySnapshot(cfg.Rules, engine.ApplySnapshotOptions{ReplaceAll: true})
 	metricsCollector.ObserveApplyResult(result)
@@ -72,11 +73,12 @@ func main() {
 	logger.Info("initial snapshot applied", "component", "engine", "event", "initial_apply", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules)
 
 	runtime := &controlapi.Runtime{
-		ConfigPath: *configPath,
-		Manager:    manager,
-		Logger:     logger,
-		Auth:       controlapi.NewAuthenticator(cfg.Auth),
-		Metrics:    metricsCollector,
+		ConfigPath:    *configPath,
+		Manager:       manager,
+		Logger:        logger,
+		Auth:          controlapi.NewAuthenticator(cfg.Auth),
+		Metrics:       metricsCollector,
+		StartupConfig: &startupConfig,
 	}
 	server := &http.Server{
 		Addr:              cfg.ControlListenAddr,

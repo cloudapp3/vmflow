@@ -3,13 +3,13 @@
 //
 //   - Linux:   systemd unit  (/etc/systemd/system/<name>.service)
 //   - macOS:   launchd daemon (/Library/LaunchDaemons/io.cloudapp.<name>.plist)
-//   - Windows: Windows Service (managed via services.msc / sc.exe)
+//   - Windows: Windows Service (managed via services.msc / SCM APIs)
 //
 // The package only performs install/uninstall/status: it generates the unit or
 // plist file and invokes the platform's service manager (systemctl / launchctl /
-// sc.exe). The daemon itself does not need this package to run — on Linux and
-// macOS the service manager just execs `vmflow daemon` and supervises it via
-// signals; on Windows the daemon detects the SCM at startup (see
+// Windows SCM). The runtime itself does not need this package to run: Linux and
+// macOS execute vmflow in the foreground and supervise it via signals; on
+// Windows vmflow detects the SCM at startup (see
 // cmd/vmflow/daemon_windows.go) and reports state itself.
 //
 // Style follows internal/updater: error-return (no logger in the package),
@@ -24,6 +24,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	vmconfig "github.com/cloudapp3/vmflow/config"
 )
 
 // DefaultServiceName is the service/unit/registry name used when Config.Name is
@@ -44,12 +46,18 @@ type Config struct {
 	// When set and the account is missing, install creates it as a system user.
 	User string
 	// LogFile redirects daemon logs. On Linux/Windows it is passed to the daemon
-	// via -log-file; on macOS it sets the launchd capture paths. Optional on
-	// Linux/macOS, effectively required on Windows (the SCM provides no stdout).
+	// via -log-file; on macOS it sets the launchd capture paths. Windows defaults
+	// to a durable path under ProgramData because the SCM provides no stdout.
 	LogFile string
-	// ExtraArgs are extra flags appended verbatim to the daemon command line,
-	// e.g. "-control-listen 0.0.0.0:19090".
-	ExtraArgs string
+	// ControlListen overrides the daemon control API listen address.
+	ControlListen string
+	// InsecureAllowRemoteControl permits an unauthenticated non-loopback control
+	// API. Callers should prefer configuring authentication instead.
+	InsecureAllowRemoteControl bool
+	// ExtraArgs are individual extra arguments appended to the daemon command
+	// line for future daemon flags. Existing daemon flags have dedicated Config
+	// fields and are rejected here to prevent overriding validated paths.
+	ExtraArgs []string
 }
 
 // normalize fills in platform-agnostic defaults (service name, binary path,
@@ -74,18 +82,54 @@ func normalize(cfg Config) Config {
 }
 
 // validateInstall checks install preconditions shared across platforms: the
-// binary must be an absolute path in a trusted install location, and the config
-// must already exist (a service with no working config only crash-loops).
+// binary and config must resolve to trusted absolute paths, and the config must
+// parse successfully before any OS service state changes.
 func validateInstall(cfg Config) (Config, error) {
+	if err := validateServiceExtraArgs(cfg.ExtraArgs); err != nil {
+		return cfg, err
+	}
 	binaryPath, err := trustedServiceBinaryPath(cfg.BinaryPath)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.BinaryPath = binaryPath
-	if _, err := os.Stat(cfg.ConfigPath); err != nil {
-		return cfg, fmt.Errorf("config not found at %s: create it or pass --config <path>", cfg.ConfigPath)
+	configPath, err := trustedServiceConfigPath(cfg.ConfigPath)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ConfigPath = configPath
+	if err := validateServiceConfig(cfg.ConfigPath); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
+}
+
+func validateServiceExtraArgs(args []string) error {
+	for _, raw := range args {
+		arg := strings.TrimSpace(raw)
+		if arg == "" {
+			continue
+		}
+		if arg == "--" || !strings.HasPrefix(arg, "-") || arg == "-" {
+			return fmt.Errorf("invalid service extra argument %q: positional arguments and -- are not allowed", raw)
+		}
+		name := strings.TrimLeft(arg, "-")
+		if before, _, ok := strings.Cut(name, "="); ok {
+			name = before
+		}
+		switch name {
+		case "config", "log-file", "control-listen", "insecure-allow-remote-control", "service-name":
+			return fmt.Errorf("service extra argument %q overrides reserved daemon flag -%s; use the dedicated service option", raw, name)
+		}
+	}
+	return nil
+}
+
+func validateServiceConfig(path string) error {
+	if _, err := vmconfig.Load(path); err != nil {
+		return fmt.Errorf("invalid service config %s: %w", path, err)
+	}
+	return nil
 }
 
 // trustedServiceBinaryPath resolves binaryPath to the exact executable path the
@@ -119,6 +163,41 @@ func trustedServiceBinaryPath(binaryPath string) (string, error) {
 		return "", fmt.Errorf("binary path %s is not a regular file", resolved)
 	}
 	if err := validateTrustedServiceBinary(resolved, info); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+// trustedServiceConfigPath resolves configPath to the exact file the service
+// will load and rejects files that a less-privileged user could replace or
+// modify after installation.
+func trustedServiceConfigPath(configPath string) (string, error) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return "", fmt.Errorf("could not determine vmflow config path; pass --config")
+	}
+	if !filepath.IsAbs(configPath) {
+		return "", fmt.Errorf("config path must be absolute: %s", configPath)
+	}
+
+	resolved, err := filepath.EvalSymlinks(configPath)
+	if err != nil {
+		return "", fmt.Errorf("config not found at %s: %w", configPath, err)
+	}
+	if !filepath.IsAbs(resolved) {
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return "", fmt.Errorf("resolve config path %s: %w", configPath, err)
+		}
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("config not found at %s: %w", resolved, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("config path %s is not a regular file", resolved)
+	}
+	if err := validateTrustedServiceConfig(resolved, info); err != nil {
 		return "", err
 	}
 	return resolved, nil

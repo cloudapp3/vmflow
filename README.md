@@ -1,86 +1,84 @@
 # vmflow
 
-**High-performance L4 network forwarding, in pure Go.**
+**Bounded-resource L4 network forwarding, in pure Go.**
 
-Route TCP and UDP traffic with a production-grade forwarding runtime that runs as a standalone daemon or drops straight into your control plane. Hot-reloadable rules, live metrics, and an embeddable core.
+Route TCP and UDP traffic with explicit connection and session limits. vmflow runs as a standalone foreground process or an embeddable runtime, with hot-reloadable rules and live metrics.
 
-[![Docs](https://img.shields.io/badge/docs-vmflow.bestcheapvps.org-14b8a6)](https://vmflow.bestcheapvps.org)
+[![Docs](https://img.shields.io/badge/docs-source-14b8a6)](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs)
 [![CI](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml/badge.svg)](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cloudapp3/vmflow.svg)](https://pkg.go.dev/github.com/cloudapp3/vmflow)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Documentation: [Website](https://vmflow.bestcheapvps.org) · [中文说明](https://vmflow.bestcheapvps.org/zh/) · [HTTP API](https://vmflow.bestcheapvps.org/api) · [Docs source](https://github.com/cloudapp3/vmdocs)
+Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/index.md) · [中文说明](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/zh/index.md) · [HTTP API](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/api.md) · [Docs source](https://github.com/cloudapp3/vmdocs)
 
-> **完整使用指南:** [vmflow.bestcheapvps.org](https://vmflow.bestcheapvps.org) —— 覆盖安装、配置、运维、远程访问(TLS/mTLS/Cloudflare)、安全加固与排错。English quick reference is below; the deep guide is on the [docs site](https://vmflow.bestcheapvps.org).
+> **完整使用指南:** [中文文档源码](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs/zh) —— 覆盖安装、配置、运维、远程访问(TLS/mTLS/Cloudflare)、安全加固与排错。English quick reference is below; the deep guide is in the [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs).
 
 ## What it does
 
 - TCP, UDP, and `tcp+udp` port forwarding
+- Configurable TCP connection limits and bounded UDP sessions, with rejection/drop counters
 - Rule lifecycle management: start, stop, restart, and full snapshot apply
-- Config-driven daemon with hot reload
-- Local control API for health, rules, stats, precheck, reload, and metrics
+- Config-driven foreground process with hot reload
+- Local control API for rules, stats, precheck, reload, and metrics
 - Bearer-token auth with viewer/admin roles
 - Structured logs in text or JSON format
 - Prometheus-compatible `/metrics`
 - Rule precheck for loops, duplicate ports, and unavailable listeners
 - Embeddable Go runtime for products that need in-process forwarding
-- Terminal dashboard via `vmflow tui`
+- Terminal dashboard and rule management via `vmflow tui`
 
 ## Quick start
 
-Install the latest prebuilt binary (Linux/macOS):
+Install the latest prebuilt binary and a colocated config (Linux/macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
+  | bash -s -- --dir "$HOME/.local/bin"
 ```
 
-Install globally to `/usr/local/bin`:
+The first install creates `~/.local/bin/config.yaml` with mode `0600`. Reinstalling
+or upgrading replaces only the binary and preserves the existing config. Running
+`vmflow` uses the `config.yaml` beside the resolved binary by default; `-config`
+overrides that path.
+
+Start vmflow in one terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --dir /usr/local/bin
-```
-
-Install a specific release tag:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash -s -- --version v0.1.0
-```
-
-The installer downloads GitHub Release archives, verifies `checksums.txt` with SHA-256 by default, and auto-detects an install directory (`/usr/local/bin` → `~/.local/bin` → `~/bin`) when `--dir` is omitted. You can override the install directory with `--dir PATH` or `VMFLOW_INSTALL_DIR`, and skip checksum verification with `--skip-verify` if needed. For private releases or higher GitHub API limits, set `GITHUB_TOKEN` or `GH_TOKEN`.
-
-Or build from source:
-
-```bash
-go build -trimpath -o vmflow ./cmd/vmflow
-```
-
-Start the daemon in one terminal:
-
-```bash
-./vmflow daemon -config ./examples/config.yaml
+"$HOME/.local/bin/vmflow"
 ```
 
 Query it from another terminal:
 
 ```bash
-./vmflow ctl health
-./vmflow ctl rules
-./vmflow ctl stats
-./vmflow ctl metrics
-./vmflow ctl precheck
+"$HOME/.local/bin/vmflow" ctl rules
+"$HOME/.local/bin/vmflow" ctl stats
+"$HOME/.local/bin/vmflow" ctl metrics
+"$HOME/.local/bin/vmflow" ctl precheck
 ```
 
-Open the terminal UI:
+Open the terminal UI or show build metadata:
 
 ```bash
-./vmflow tui
+"$HOME/.local/bin/vmflow" tui
+"$HOME/.local/bin/vmflow" version -json
 ```
 
-Show build metadata:
+For a root-owned system installation, put both files in `/usr/local/bin`:
 
 ```bash
-./vmflow version
-./vmflow version -json
+curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --dir /usr/local/bin
+```
+
+The installer downloads GitHub Release archives, verifies `checksums.txt` with SHA-256 by default, and auto-detects an install directory (`/usr/local/bin` → `~/.local/bin` → `~/bin`) when `--dir` is omitted. It installs `vmflow` and, only when absent, `config.yaml` in that directory. You can override the directory with `--dir PATH` or `VMFLOW_INSTALL_DIR`, and skip checksum verification with `--skip-verify` if needed. For private releases or higher GitHub API limits, set `GITHUB_TOKEN` or `GH_TOKEN`.
+
+Or build from source:
+
+```bash
+git clone https://github.com/cloudapp3/vmflow.git
+cd vmflow
+go build -trimpath -o vmflow ./cmd/vmflow
+cp -n examples/config.yaml config.yaml
+./vmflow
 ```
 
 ## Configuration
@@ -90,6 +88,7 @@ See [`examples/config.yaml`](examples/config.yaml):
 ```yaml
 version: 1
 control_listen_addr: 127.0.0.1:19090
+udp_max_sessions: 256              # all UDP sessions in this process
 # control_tls:                       # enable TLS on the control API
 #   cert_file: /etc/vmflow/control.crt
 #   key_file: /etc/vmflow/control.key
@@ -116,54 +115,116 @@ rules:
     target_addr: 127.0.0.1
     target_port: 22
     enabled: true
+    max_conn: 0                     # TCP: unlimited; UDP: default of 256
 ```
 
-Security note: the daemon **refuses to start** if the control API is bound to a non-loopback address without auth. Keep it on `127.0.0.1` (the default), or enable `auth` before exposing it. To bind remotely without auth anyway, pass `--insecure-allow-remote-control` (not recommended — put it behind a TLS-terminating reverse proxy instead).
+`udp_max_sessions` limits active UDP sessions across every rule owned by the
+process (default `256`, maximum `4096`) and can be changed by config reload.
+Lowering it below current usage does not terminate established sessions; it
+rejects new UDP sessions until usage falls below the new limit. For each UDP
+rule, `max_conn: 0` uses the default of `256`; for TCP, `max_conn: 0` remains
+unlimited. On a `tcp+udp` rule, `max_conn` is enforced independently for TCP
+connections and UDP sessions; UDP sessions also consume the process-wide limit.
+Each UDP session owns a socket, a receive goroutine, and a 64 KiB receive
+buffer. Check available memory and open-file limits before raising either cap.
+
+Hot reload applies only `rules` and `udp_max_sessions`. Changes to the control
+listen address, auth, TLS, logging, bot, ACME, certificate cache, or certificate
+review settings return HTTP `409` and require a vmflow process restart; they are
+never reported as successfully applied while the old runtime settings remain active.
+
+Security note: vmflow **refuses to start** if the control API is bound to a non-loopback address without auth. Keep it on `127.0.0.1` (the default), or enable `auth` before exposing it. To bind remotely without auth anyway, pass `--insecure-allow-remote-control` (not recommended — put it behind a TLS-terminating reverse proxy instead).
+
+### TUI rule management
+
+`vmflow tui -token ADMIN_TOKEN` can manage `rules` and `udp_max_sessions` when
+auth is enabled and the token has the `admin` role. Viewer tokens and sessions
+with auth disabled are read-only. In the Rules view use `n`/`e`/`c` to create,
+edit, or copy, `space` to toggle, `d` to delete, `g` for the global UDP limit,
+`P` to precheck, `A` to apply, and `u` to discard the draft.
+
+Apply writes the validated draft to the config loaded by the running process,
+which is the `config.yaml` beside the resolved vmflow binary by default (or the
+explicit `-config` path). Auth, TLS, logging, and other process settings still
+require editing YAML and restarting vmflow.
 
 ## Commands
 
 ```bash
-vmflow daemon        -config ./examples/config.yaml [-control-listen 127.0.0.1:19090] [-insecure-allow-remote-control]
-vmflow ctl           [-addr http://127.0.0.1:19090] [-token TOKEN] <health|rules|stats|metrics|precheck|reload>
+vmflow               [-config path] [-control-listen 127.0.0.1:19090] [-insecure-allow-remote-control]
+vmflow ctl           [-addr http://127.0.0.1:19090] [-token TOKEN] <rules|stats|metrics|precheck|reload>
 vmflow tui           [-addr http://127.0.0.1:19090] [-token TOKEN]
 vmflow version       [-json]
 vmflow update        [--check] [--version tag]
 vmflow service       (install|uninstall|status) [--config path] [--binary path] [--user name] [--log-file path]
+                     [--control-listen addr] [--insecure-allow-remote-control] [--extra-arg value]...
+vmflow uninstall     [--dry-run]
 ```
 
-Aliases are available: `daemon=d`, `ctl=c`, `tui=t`, `version=v`, `update=u`, and `service=svc`.
+Self-update is supported on Linux and macOS. On Windows, download and install
+the release ZIP manually.
+
+Aliases are available: `ctl=c`, `tui=t`, `version=v`, `update=u`, and `service=svc`.
 
 ## Run as a service (boot startup)
 
 Register vmflow as a native OS service so it starts at boot and restarts on crash — one command on every platform:
 
 ```bash
-sudo vmflow service install --config /etc/vmflow/config.yaml
+sudo vmflow service install --config /usr/local/bin/config.yaml
 ```
 
 For safety, `service install` refuses to register a service that points at a
-relative path, a user-writable binary, or a binary under user-writable parent
-directories (symlinks are resolved first). Install `vmflow` into a protected
-root/admin-owned path such as `/usr/local/bin/vmflow`, `/opt/vmflow/vmflow`, or
-`C:\Program Files\vmflow\vmflow.exe`; pass `--binary` if you need to point at
-that installed path explicitly.
+relative path, a user-writable binary or config file, or either file under
+user-writable parent directories (symlinks are resolved first). Install
+`vmflow` into a protected root/admin-owned path such as
+`/usr/local/bin/vmflow`, `/opt/vmflow/vmflow`, or
+`C:\Program Files\vmflow\vmflow.exe`, and keep the service config in a protected
+root/admin-owned location such as `/usr/local/bin/config.yaml` or
+`/etc/vmflow/config.yaml`; pass `--binary` if you need to point at the installed
+binary explicitly. A service running as a dedicated user needs explicit read
+access to the root-owned config (for example, owner `root`, group `vmflow`, mode
+`0640`).
 
-- **Linux**: writes a systemd unit, then `enable --now`. Logs go to journald (`journalctl -u vmflow`). The unit runs as root by default with `CAP_NET_BIND_SERVICE` (so it can bind privileged ports) and `Restart=on-failure`. Pass `--user vmflow` to run under a dedicated account (created if missing).
+The config is parsed before the OS service definition is changed. Running
+`service install` again updates the existing definition and restarts the
+service with the new settings.
+
+- **Linux**: writes and reloads a systemd unit, enables it, restarts the service, and verifies it is active. Logs go to journald (`journalctl -u vmflow`). The unit runs as root by default with `CAP_NET_BIND_SERVICE` (so it can bind privileged ports) and `Restart=on-failure`. Pass `--user vmflow` to run under a dedicated account (created if missing).
 - **macOS**: writes a launchd daemon (`KeepAlive` restarts on crash) and bootstraps it. Logs land under `/var/log/vmflow/` (override with `--log-file`).
-- **Windows**: registers a Windows Service (`start=auto`, restart-on-failure) visible in `services.msc`. Pass `--log-file C:\ProgramData\vmflow\logs\vmflow.log` — the SCM provides no stdout.
+- **Windows**: registers a Windows Service (`start=auto`, restart-on-failure) visible in `services.msc`. Because the SCM provides no stdout, logs default to `C:\ProgramData\vmflow\logs\vmflow.log`; override with `--log-file` if needed.
 
-Uninstall with `sudo vmflow service uninstall` (config and logs are left in place). Inspect with `vmflow service status`. The `.deb`/`.rpm` packages also ship a systemd unit, so `apt install vmflow` enables the service automatically (create `/etc/vmflow/config.yaml` to start it).
+Uninstall with `sudo vmflow service uninstall` (config and logs are left in place). Inspect with `vmflow service status`.
+
+For a complete removal, run `sudo vmflow uninstall`. It prints the full plan
+and requires confirmation before removing the service, binary, platform-default
+config, installer-owned colocated config, logs, update cache, and vmflow-owned
+certificate caches. An unowned colocated `config.yaml` is preserved. External
+TLS certificate and key files are never removed because they may be shared with
+other services. Custom certificate cache directories are left in place unless
+the directory is exclusively owned by vmflow and contains a `.vmflow-owned`
+marker; use `--dry-run` to inspect the plan without changing the system.
 
 ## Control API
 
-Documented at [vmflow.bestcheapvps.org/api](https://vmflow.bestcheapvps.org/api). Main endpoints:
+Documented in the [HTTP API guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/api.md). Main endpoints:
 
-- `GET /healthz`
 - `GET /v1/rules`
 - `GET /v1/stats`
+- `GET /v1/session`
+- `GET /v1/config/rules`
+- `POST /v1/config/rules/precheck`
+- `PUT /v1/config/rules` (admin token and `If-Match` required)
+- `GET|PUT /v1/config/bot` (admin token; PUT requires `If-Match`)
+- `POST /v1/bot/start`, `POST /v1/bot/stop` (admin token)
 - `GET|POST /v1/precheck`
 - `POST /v1/reload`
 - `GET /metrics`
+
+UDP admission-attempt failures and rate-limit queue-capacity drops are exposed in rule stats and
+as `vmflow_udp_session_rejected_total` and
+`vmflow_udp_packets_dropped_total` metrics. Manager-wide usage is exposed as
+`vmflow_udp_sessions_active` and `vmflow_udp_sessions_limit`.
 
 ## Control API TLS
 
@@ -180,10 +241,41 @@ control_tls:
 Clients then use `https://` for `-addr`. For a private/self-signed CA pass `--tls-ca-file` (or `VMFLOW_TLS_CA_FILE`); for mTLS also pass `--tls-client-cert` / `--tls-client-key` (or `VMFLOW_TLS_CLIENT_*`):
 
 ```bash
-vmflow ctl -addr https://host:19090 -tls-ca-file ca.crt health
+vmflow ctl -addr https://host:19090 -tls-ca-file ca.crt rules
 ```
 
-With `client_ca_file` (mTLS) set, the control API counts as authenticated for the non-loopback fail-closed rule, so it can be exposed without bearer auth. For public exposure, binding loopback behind a TLS-terminating reverse proxy (Caddy/Nginx + ACME) is usually simpler. To expose it with zero inbound ports (and optional SSO), see the [Cloudflare Tunnel + Access runbook](https://vmflow.bestcheapvps.org) for details; the client `-H` flag carries Access service tokens.
+With `cert_file`, `key_file`, and `client_ca_file` set (mTLS), the control API counts as authenticated for the non-loopback fail-closed rule, so it can be exposed without bearer auth. For public exposure, binding loopback behind a TLS-terminating reverse proxy (Caddy/Nginx + ACME) is usually simpler. To expose it with zero inbound ports (and optional SSO), see the [deployment guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/guide/deployment.md); the client `-H` flag carries Access service tokens.
+
+## Telegram Bot
+
+vmflow can run an optional Telegram bot for querying and controlling forwarding from a chat. Configure it in `config.yaml`:
+
+```yaml
+bot_token: "123456:ABC-DEF..."     # Telegram bot token from @BotFather
+bot_chat: 123456789                 # your chat ID (from @userinfobot)
+bot_control_token: "admin-xxx"      # admin auth token; lets the bot write. Omit for read-only.
+```
+
+The bot only responds to `bot_chat` (chat-ID allowlist). Private chats and groups are supported; confirmation results stay in the originating chat. Set `bot_control_token` to an admin `auth.tokens` entry to enable write commands; without it the bot is read-only. Bot control requires `auth.enabled: true`.
+
+Commands:
+
+- `/status`, `/rules`, `/detail <id>` — read-only queries
+- `/reload` — reload configuration from disk
+- `/stop <id>`, `/start_rule <id>`, `/toggle <id>` — disable / enable / toggle a rule (persists to `config.yaml` via the control API, with precheck + optimistic locking)
+
+Write commands go through the same authenticated control handler as the TUI and `vmflow ctl`, so they get precheck, transactional apply with rollback, optimistic concurrency (`If-Match`), and audit logging. Conflicts (HTTP 412, e.g. someone edited the config concurrently) are reported to the chat with a retry hint. Bot requests stay in-process; external control API TLS and mTLS policy remains enforced for network clients without requiring a separate client certificate for the embedded bot.
+
+### Configuring the bot from the TUI
+
+You can also configure and control the bot at runtime from the TUI without editing `config.yaml` or restarting the daemon:
+
+- Press `b` in the Dashboard or Rules view to open the **Bot** panel (running state + current settings; tokens are masked).
+- `e` edits `bot_token` / `bot_chat` / `bot_control_token` (token fields are masked) — `Ctrl+S` verifies the Bot token with Telegram, persists to `config.yaml`, and rebuilds the bot goroutine in place.
+- `s` / `x` start / stop the bot at runtime (not persisted; a daemon restart restores from config).
+- `r` refreshes.
+
+Bot configuration changes go through `GET/PUT /v1/config/bot` (admin, `If-Match` optimistic locking), so they are conflict-aware just like rule edits. A rejected token leaves the existing bot and file untouched; a file commit failure restores the previous runtime bot. Daemon restart is **not** required and forwarding is **not** interrupted.
 
 ## Embedding vmflow
 
@@ -197,19 +289,23 @@ result := rt.Apply(rules) // []engine.Rule
 stats := rt.SnapshotAll()
 ```
 
-The embedding application owns persistence, auth, UI, audit logs, and business rules. `vmflow` owns only in-process forwarding, rule lifecycle, and real-time counters. See the [embedding guide](https://vmflow.bestcheapvps.org).
+The embedding application owns persistence, auth, UI, audit logs, and business rules. `vmflow` owns only in-process forwarding, rule lifecycle, and real-time counters. See the [embedding guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/library/runtime.md).
 
 ## Development
 
 ```bash
 make fmt
 make test
+make race
 make vet
 make smoke
 make build
+make bench
 ```
 
 Some tests bind local ports. If your sandbox blocks sockets, run them in an environment that permits local listeners.
+Benchmark methodology and the current loopback baseline are documented in
+[`BENCHMARKS.md`](BENCHMARKS.md).
 
 ## Release
 
@@ -220,7 +316,7 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-The release workflow publishes cross-platform archives, `.deb` / `.rpm` packages, and `checksums.txt`. Linux/macOS users can also install with [`install.sh`](install.sh).
+The release workflow publishes cross-platform archives and `checksums.txt`. Linux/macOS users can install with [`install.sh`](install.sh) or unpack an archive manually; vmflow does not publish distro-managed `.deb` or `.rpm` packages.
 
 ## Project layout
 
@@ -232,8 +328,8 @@ The release workflow publishes cross-platform archives, `.deb` / `.rpm` packages
 - `tui/` — terminal dashboard client
 - `cmd/vmflow/` — primary all-in-one binary
 - `examples/` — runnable and embeddable examples
-- Documentation — [vmflow.bestcheapvps.org](https://vmflow.bestcheapvps.org) (architecture, API, embedding, roadmap, changelog; not kept in this repo)
+- Documentation — [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs) (architecture, API, embedding, roadmap, changelog; not kept in this repo)
 
 ## License
 
-MIT
+MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled dependency licenses.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -38,78 +40,157 @@ var (
 const usageText = `vmflow - L4 port forwarding engine
 
 Usage:
-  vmflow daemon        [-config path] [-control-listen addr]              Start forwarding daemon
-                       [-insecure-allow-remote-control]                  Allow non-loopback control API without auth (dangerous)
-  vmflow ctl           [-addr url] [-token token] <health|rules|stats|metrics|precheck|reload>    Query running daemon
+  vmflow               [-config path] [-control-listen addr]             Start forwarding in foreground
+                       [-insecure-allow-remote-control]                  Default config: config.yaml beside vmflow
+  vmflow ctl           [-addr url] [-token token] <rules|stats|metrics|precheck|reload>    Query running vmflow
   vmflow tui           [-addr url] [-token token]                      Terminal UI dashboard
   vmflow version       [-json]                                         Show version info
   vmflow update        [--check] [--version tag]                       Self-update vmflow binary
   vmflow service       (install|uninstall|status) [--config path]      Register as a native OS service
                        [--user name] [--log-file path] [--binary path] (systemd / launchd / Windows Service)
+                       [--control-listen addr] [--insecure-allow-remote-control]
+                       [--extra-arg=-future-flag=value]...
   vmflow uninstall     [--dry-run]                                    Uninstall vmflow: remove service, binary,
-                                                                       config, logs, certs, and update cache
+                                                                       owned config/cache, logs, and update cache
 
-Aliases: daemon=d, ctl=c, tui=t, version=v, update=u, service=svc, uninstall=remove,rm
+Aliases: ctl=c, tui=t, version=v, update=u, service=svc, uninstall=remove,rm
 `
 
 func main() {
-	flag.Usage = func() { fmt.Fprint(os.Stderr, usageText) }
-	flag.Parse()
-
-	args := flag.Args()
-	if len(args) == 0 {
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	switch args[0] {
-	case "daemon", "d":
-		runDaemon(args[1:])
+	command, args := routeCLI(os.Args[1:])
+	switch command {
+	case "foreground":
+		runForeground(args)
+	case "help":
+		fmt.Fprint(os.Stdout, usageText)
 	case "ctl", "c":
-		runCtl(args[1:])
+		runCtl(args)
 	case "tui", "t":
-		runTUI(args[1:])
+		runTUI(args)
 	case "version", "v":
-		runVersion(args[1:])
+		runVersion(args)
 	case "update", "u":
-		runUpdate(args[1:])
+		runUpdate(args)
 	case "service", "svc":
-		runService(args[1:])
+		runService(args)
 	case "uninstall", "remove", "rm":
-		runUninstall(args[1:])
+		runUninstall(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
-		flag.Usage()
+		fmt.Fprint(os.Stderr, usageText)
 		os.Exit(1)
 	}
 }
 
-// ── daemon ──────────────────────────────────────────────────────────
+func routeCLI(args []string) (string, []string) {
+	if len(args) == 0 {
+		return "foreground", nil
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		return "help", args[1:]
+	case "ctl", "c", "tui", "t", "version", "v", "update", "u", "service", "svc", "uninstall", "remove", "rm":
+		return args[0], args[1:]
+	default:
+		if strings.HasPrefix(args[0], "-") {
+			return "foreground", args
+		}
+		return "unknown", args
+	}
+}
 
-func runDaemon(args []string) {
-	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
-	configPath := fs.String("config", "", "config file path")
+// ── foreground runtime ──────────────────────────────────────────────
+
+type foregroundOptions struct {
+	configPath          string
+	controlListen       string
+	insecureAllowRemote bool
+	logFile             string
+	serviceName         string
+}
+
+func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, error), output io.Writer) (foregroundOptions, error) {
+	fs := flag.NewFlagSet("vmflow", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.Usage = func() {
+		fmt.Fprintln(output, "Usage:\n  vmflow [flags]\n\nRuns vmflow in the foreground.\n\nOptions:")
+		fs.PrintDefaults()
+	}
+	configPath := fs.String("config", "", "config file path (default: config.yaml beside vmflow)")
 	controlListen := fs.String("control-listen", "", "override control listen addr")
 	insecureAllowRemote := fs.Bool("insecure-allow-remote-control", false,
 		"DANGEROUS: allow binding the control API on a non-loopback address without auth")
 	logFile := fs.String("log-file", "", "write logs to this file instead of stdout (useful under a service manager)")
-	fs.Parse(args)
-
-	if strings.TrimSpace(*configPath) == "" {
-		fmt.Fprintln(os.Stderr, "missing -config")
-		os.Exit(1)
+	serviceName := fs.String("service-name", service.DefaultServiceName, "[Windows SCM] registered service name")
+	if err := fs.Parse(args); err != nil {
+		return foregroundOptions{}, err
+	}
+	if extra := fs.Args(); len(extra) != 0 {
+		return foregroundOptions{}, fmt.Errorf("unexpected argument(s): %v", extra)
 	}
 
-	cfg, err := config.Load(*configPath)
+	resolvedConfig := strings.TrimSpace(*configPath)
+	if resolvedConfig == "" {
+		var err error
+		resolvedConfig, err = resolveDefaultConfig()
+		if err != nil {
+			return foregroundOptions{}, fmt.Errorf("resolve default config path (use -config to override): %w", err)
+		}
+	}
+	return foregroundOptions{
+		configPath:          resolvedConfig,
+		controlListen:       strings.TrimSpace(*controlListen),
+		insecureAllowRemote: *insecureAllowRemote,
+		logFile:             *logFile,
+		serviceName:         *serviceName,
+	}, nil
+}
+
+func defaultRuntimeConfigPath() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("determine executable path: %w", err)
+	}
+	return configPathBesideExecutable(executable)
+}
+
+func configPathBesideExecutable(executable string) (string, error) {
+	executable = strings.TrimSpace(executable)
+	if executable == "" {
+		return "", errors.New("empty executable path")
+	}
+	absolute, err := filepath.Abs(executable)
+	if err != nil {
+		return "", fmt.Errorf("make executable path absolute: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve executable path %s: %w", absolute, err)
+	}
+	return filepath.Join(filepath.Dir(resolved), "config.yaml"), nil
+}
+
+func runForeground(args []string) {
+	opts, err := parseForegroundOptions(args, defaultRuntimeConfigPath, os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid runtime arguments: %v\n", err)
+		os.Exit(2)
+	}
+
+	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
 		os.Exit(1)
 	}
-	if strings.TrimSpace(*controlListen) != "" {
-		cfg.ControlListenAddr = strings.TrimSpace(*controlListen)
+	startupConfig := cfg
+	if opts.controlListen != "" {
+		cfg.ControlListenAddr = opts.controlListen
 	}
 
-	logger, err := newLogger(cfg.Log, *logFile)
+	logger, err := newLogger(cfg.Log, opts.logFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init logger failed: %v\n", err)
 		os.Exit(1)
@@ -118,7 +199,7 @@ func runDaemon(args []string) {
 
 	// On Windows, when launched by the Service Control Manager, hand off to a
 	// native service runner instead of the foreground loop. No-op elsewhere.
-	if maybeRunAsService(cfg, *configPath, logger, *insecureAllowRemote) {
+	if maybeRunAsService(cfg, startupConfig, opts.configPath, logger, opts.insecureAllowRemote, opts.serviceName) {
 		return
 	}
 
@@ -126,7 +207,7 @@ func runDaemon(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := runForwarding(ctx, cfg, *configPath, logger, *insecureAllowRemote); err != nil {
+	if err := runForwarding(ctx, cfg, startupConfig, opts.configPath, logger, opts.insecureAllowRemote); err != nil {
 		os.Exit(1)
 	}
 }
@@ -135,7 +216,27 @@ func runDaemon(args []string) {
 // an already-parsed config, then blocks until ctx is cancelled (SIGINT/SIGTERM,
 // or an SCM stop) or the control server fails. It performs graceful shutdown
 // before returning. Shared by the foreground daemon and the Windows SCM runner.
-func runForwarding(ctx context.Context, cfg config.File, configPath string, logger *slog.Logger, insecureAllowRemote bool) error {
+func runForwarding(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, insecureAllowRemote bool) error {
+	return runForwardingWithReady(ctx, cfg, startupConfig, configPath, logger, insecureAllowRemote, nil)
+}
+
+// runForwardingWithReady reports initialization success only after rules are
+// active and the control listener is bound. Initialization failures are sent to
+// ready before the function returns, allowing the Windows SCM runner to avoid a
+// transient false Running state.
+func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, insecureAllowRemote bool, ready chan<- error) (runErr error) {
+	readyReported := false
+	reportReady := func(err error) {
+		if readyReported {
+			return
+		}
+		readyReported = true
+		if ready != nil {
+			ready <- err
+		}
+	}
+	defer func() { reportReady(runErr) }()
+
 	if err := controlapi.EnsureSafeControlBinding(cfg, insecureAllowRemote, logger); err != nil {
 		return fmt.Errorf("control api: %w", err)
 	}
@@ -146,7 +247,7 @@ func runForwarding(ctx context.Context, cfg config.File, configPath string, logg
 	}
 
 	collector := engine.NewCollector()
-	manager := engine.NewManager(collector)
+	manager := engine.NewManagerWithOptions(collector, engine.ManagerOptions{UDPMaxSessions: cfg.UDPMaxSessions})
 
 	metricsCollector := metrics.New(manager)
 	result := manager.ApplySnapshot(cfg.Rules, engine.ApplySnapshotOptions{ReplaceAll: true})
@@ -160,46 +261,42 @@ func runForwarding(ctx context.Context, cfg config.File, configPath string, logg
 	logger.Info("initial snapshot applied", "component", "engine", "event", "initial_apply", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules)
 
 	runtime := &controlapi.Runtime{
-		ConfigPath: configPath,
-		Manager:    manager,
-		Logger:     logger,
-		Auth:       controlapi.NewAuthenticator(cfg.Auth),
-		Metrics:    metricsCollector,
+		ConfigPath:    configPath,
+		Manager:       manager,
+		Logger:        logger,
+		Auth:          controlapi.NewAuthenticator(cfg.Auth),
+		Metrics:       metricsCollector,
+		StartupConfig: &startupConfig,
 	}
+	handler := controlapi.NewHandler(runtime)
+	botMgr := bot.NewManager(manager, newBotControlFn(handler, logger), logger)
+	runtime.Bot = botMgr
 	server := &http.Server{
 		Addr:              cfg.ControlListenAddr,
-		Handler:           controlapi.NewHandler(runtime),
+		Handler:           handler,
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		scheme, listen := "http", server.ListenAndServe
-		if tlsCfg != nil {
-			scheme = "https"
-			listen = func() error { return server.ListenAndServeTLS("", "") }
-		}
-		logger.Info("vmflow control server listening", "component", "daemon", "event", "control_listen", "addr", cfg.ControlListenAddr, "scheme", scheme, "mtls", tlsCfg != nil && tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert)
-		errCh <- listen()
-	}()
-
-	var botCancel context.CancelFunc
-	if cfg.BotToken != "" && cfg.BotChat != 0 {
-		tgBot, err := bot.NewBot(cfg.BotToken, cfg.BotChat, manager)
-		if err != nil {
-			logger.Error("bot init failed", "component", "bot", "event", "init_failed", "error", err)
-		} else {
-			botCtx, cancel := context.WithCancel(context.Background())
-			botCancel = cancel
-			go func() {
-				if err := tgBot.Start(botCtx); err != nil {
-					logger.Warn("bot stopped", "component", "bot", "event", "stopped", "error", err)
-				}
-			}()
-			logger.Info("telegram bot started", "component", "bot", "event", "started")
-		}
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		manager.StopAll()
+		return fmt.Errorf("listen on control address %s: %w", server.Addr, err)
 	}
+	scheme := "http"
+	errCh := make(chan error, 1)
+	if tlsCfg != nil {
+		scheme = "https"
+		go func() { errCh <- server.ServeTLS(listener, "", "") }()
+	} else {
+		go func() { errCh <- server.Serve(listener) }()
+	}
+	logger.Info("vmflow control server listening", "component", "daemon", "event", "control_listen", "addr", listener.Addr().String(), "scheme", scheme, "mtls", tlsCfg != nil && tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert)
+
+	if err := botMgr.Apply(controlapi.BotSettings{Token: cfg.BotToken, ChatID: cfg.BotChat, ControlToken: cfg.BotControlToken}); err != nil {
+		logger.Error("bot start failed", "component", "bot", "event", "init_failed", "error", err)
+	}
+	reportReady(nil)
 
 	// Block until shutdown is requested (ctx) or the server exits on its own.
 	var serverErr error
@@ -213,15 +310,86 @@ func runForwarding(ctx context.Context, cfg config.File, configPath string, logg
 		}
 	}
 
-	if botCancel != nil {
-		botCancel()
-	}
+	botMgr.Stop()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
 	manager.StopAll()
 	logger.Info("vmflow stopped", "component", "daemon", "event", "stopped")
 	return serverErr
+}
+
+// newBotControlFn builds an in-process control client. Requests still pass
+// through the production handler and bearer-token authorization, while mTLS
+// remains enforced for every connection accepted by the external listener.
+func newBotControlFn(handler http.Handler, logger *slog.Logger) func(controlToken string) *controlapi.Client {
+	return func(controlToken string) *controlapi.Client {
+		if strings.TrimSpace(controlToken) == "" {
+			return nil
+		}
+		client := controlapi.NewClient("http://vmflow.internal", controlToken)
+		client.SetHTTPClient(&http.Client{
+			Timeout:   10 * time.Second,
+			Transport: inProcessRoundTripper{handler: handler},
+		})
+		if logger != nil {
+			logger.Info("bot control client ready", "component", "bot", "transport", "in_process")
+		}
+		return client
+	}
+}
+
+type inProcessRoundTripper struct {
+	handler http.Handler
+}
+
+func (transport inProcessRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if transport.handler == nil {
+		return nil, errors.New("in-process control handler is unavailable")
+	}
+	if request == nil {
+		return nil, errors.New("in-process control request is nil")
+	}
+	recorder := &inProcessResponseWriter{header: make(http.Header)}
+	internalRequest := request.Clone(request.Context())
+	internalRequest.RequestURI = request.URL.RequestURI()
+	internalRequest.RemoteAddr = "127.0.0.1:0"
+	transport.handler.ServeHTTP(recorder, internalRequest)
+	if recorder.status == 0 {
+		recorder.status = http.StatusOK
+	}
+	body := recorder.body.Bytes()
+	return &http.Response{
+		StatusCode:    recorder.status,
+		Status:        fmt.Sprintf("%d %s", recorder.status, http.StatusText(recorder.status)),
+		Header:        recorder.header.Clone(),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       request,
+	}, nil
+}
+
+type inProcessResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (writer *inProcessResponseWriter) Header() http.Header {
+	return writer.header
+}
+
+func (writer *inProcessResponseWriter) WriteHeader(status int) {
+	if writer.status == 0 {
+		writer.status = status
+	}
+}
+
+func (writer *inProcessResponseWriter) Write(payload []byte) (int, error) {
+	if writer.status == 0 {
+		writer.status = http.StatusOK
+	}
+	return writer.body.Write(payload)
 }
 
 // newLogger builds the structured logger. When logFile is empty it logs to
@@ -255,7 +423,7 @@ func runCtl(args []string) {
 
 	cmdArgs := fs.Args()
 	if len(cmdArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: vmflow ctl [-addr url] [-token token] <health|rules|stats|metrics|precheck|reload>")
+		fmt.Fprintln(os.Stderr, "usage: vmflow ctl [-addr url] [-token token] <rules|stats|metrics|precheck|reload>")
 		os.Exit(1)
 	}
 
@@ -263,9 +431,6 @@ func runCtl(args []string) {
 	var path string
 	var reqBody string
 	switch cmdArgs[0] {
-	case "health":
-		method = http.MethodGet
-		path = "/healthz"
 	case "rules":
 		method = http.MethodGet
 		path = "/v1/rules"
@@ -423,6 +588,10 @@ func runUpdate(args []string) {
 		fmt.Fprintln(os.Stderr, "update does not accept positional args")
 		os.Exit(1)
 	}
+	if !checkOnly && !updater.SelfUpdateSupported() {
+		fmt.Fprintln(os.Stderr, "self-update is not supported on Windows; install the release ZIP manually")
+		os.Exit(1)
+	}
 
 	currentRaw := strings.TrimSpace(version)
 	if !checkOnly && targetVersion == "" && strings.EqualFold(currentRaw, "dev") {
@@ -549,8 +718,11 @@ func runService(args []string) {
 	}
 	configPath := fs.String("config", "", "config file path the service runs with (default: platform system path)")
 	user := fs.String("user", "", "[systemd] run as this user; created if missing (default: root)")
-	logFile := fs.String("log-file", "", "redirect daemon logs here (required on Windows)")
-	extraArgs := fs.String("extra-args", "", "extra flags appended to the daemon command line, e.g. \"-control-listen 0.0.0.0:19090\"")
+	logFile := fs.String("log-file", "", "override daemon log destination (Windows default: C:\\ProgramData\\vmflow\\logs\\vmflow.log)")
+	controlListen := fs.String("control-listen", "", "override the daemon control listen address")
+	insecureAllowRemote := fs.Bool("insecure-allow-remote-control", false, "DANGEROUS: allow a non-loopback control API without auth")
+	var extraArgs serviceArgList
+	fs.Var(&extraArgs, "extra-arg", "append a future daemon flag as --extra-arg=-flag=value (repeatable; existing flags have dedicated options)")
 	binaryPath := fs.String("binary", "", "path to the vmflow binary (default: this executable; install requires a trusted root/admin-owned absolute path)")
 
 	if len(args) == 0 {
@@ -571,11 +743,13 @@ func runService(args []string) {
 	}
 
 	cfg := service.Config{
-		BinaryPath: *binaryPath,
-		ConfigPath: *configPath,
-		User:       *user,
-		LogFile:    *logFile,
-		ExtraArgs:  *extraArgs,
+		BinaryPath:                 *binaryPath,
+		ConfigPath:                 *configPath,
+		User:                       *user,
+		LogFile:                    *logFile,
+		ControlListen:              *controlListen,
+		InsecureAllowRemoteControl: *insecureAllowRemote,
+		ExtraArgs:                  []string(extraArgs),
 	}
 
 	var err error
@@ -594,4 +768,22 @@ func runService(args []string) {
 		fmt.Fprintf(os.Stderr, "service %s failed: %v\n", action, err)
 		os.Exit(1)
 	}
+}
+
+type serviceArgList []string
+
+func (args *serviceArgList) String() string {
+	if args == nil {
+		return ""
+	}
+	return strings.Join(*args, " ")
+}
+
+func (args *serviceArgList) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("extra argument must not be empty")
+	}
+	*args = append(*args, value)
+	return nil
 }

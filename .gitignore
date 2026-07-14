@@ -72,6 +72,6 @@ sh/
 # Experimental local-only Rust port; not part of the public release.
 /vmflow-rs/
 
-# Documentation is published to https://vmflow.bestcheapvps.org
-# (source: github.com/cloudapp3/vmdocs); not kept in this source repo.
+# Documentation source lives at github.com/cloudapp3/vmdocs and is not kept in
+# this source repo.
 /docs/

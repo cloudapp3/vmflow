@@ -91,6 +91,11 @@ func TestBuildServerTLSConfig(t *testing.T) {
 			t.Fatal("want error for cert without key")
 		}
 	})
+	t.Run("client ca without server key pair rejected", func(t *testing.T) {
+		if _, err := BuildServerTLSConfig(config.ControlTLSConfig{ClientCAFile: caBundle}); err == nil {
+			t.Fatal("want error for client CA without server cert and key")
+		}
+	})
 	t.Run("both produces tls config with tls1.2", func(t *testing.T) {
 		got, err := BuildServerTLSConfig(config.ControlTLSConfig{CertFile: dir + "/server.crt", KeyFile: dir + "/server.key"})
 		if err != nil {

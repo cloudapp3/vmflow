@@ -21,7 +21,7 @@ import (
 // true, in which case a warning is logged and nil is returned. The caller MUST
 // abort startup (e.g. os.Exit) when this returns a non-nil error.
 func EnsureSafeControlBinding(cfg config.File, allowRemote bool, logger *slog.Logger) error {
-	if cfg.Auth.Enabled || cfg.ControlTLS.ClientCAFile != "" {
+	if cfg.Auth.Enabled || hasMutualTLSConfig(cfg.ControlTLS) {
 		return nil
 	}
 	host, _, err := net.SplitHostPort(cfg.ControlListenAddr)
@@ -49,6 +49,12 @@ func EnsureSafeControlBinding(cfg config.File, allowRemote bool, logger *slog.Lo
 			"(auth.enabled + tokens), or pass --insecure-allow-remote-control to acknowledge",
 		cfg.ControlListenAddr,
 	)
+}
+
+func hasMutualTLSConfig(cfg config.ControlTLSConfig) bool {
+	return strings.TrimSpace(cfg.CertFile) != "" &&
+		strings.TrimSpace(cfg.KeyFile) != "" &&
+		strings.TrimSpace(cfg.ClientCAFile) != ""
 }
 
 // isLoopbackHost reports whether host is a loopback address. An empty host

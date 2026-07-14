@@ -4,25 +4,23 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/cloudapp3/vmflow/config"
+	"github.com/cloudapp3/vmflow/internal/service"
 	"golang.org/x/sys/windows/svc"
 )
-
-// serviceWinName is the name the daemon registers under with the Windows
-// Service Control Manager. It must match the name used by `vmflow service
-// install` (the ServiceName, default "vmflow").
-const serviceWinName = "vmflow"
 
 // maybeRunAsService detects whether the process was launched by the Windows
 // Service Control Manager. If so, it runs the forwarding engine as a native
 // service — reporting state to the SCM and handling Stop/Shutdown controls —
 // and blocks until the service stops, then returns true. Otherwise it returns
 // false and the caller runs the daemon in the foreground as usual.
-func maybeRunAsService(cfg config.File, configPath string, logger *slog.Logger, insecure bool) bool {
+func maybeRunAsService(cfg, startupConfig config.File, configPath string, logger *slog.Logger, insecure bool, serviceName string) bool {
 	isSvc, err := svc.IsWindowsService()
 	if err != nil {
 		logger.Error("cannot determine if running as a Windows service", "component", "service", "error", err)
@@ -31,7 +29,11 @@ func maybeRunAsService(cfg config.File, configPath string, logger *slog.Logger, 
 	if !isSvc {
 		return false
 	}
-	if err := svc.Run(serviceWinName, &vmflowService{cfg: cfg, configPath: configPath, logger: logger, insecure: insecure}); err != nil {
+	serviceName = strings.TrimSpace(serviceName)
+	if serviceName == "" {
+		serviceName = service.DefaultServiceName
+	}
+	if err := svc.Run(serviceName, &vmflowService{cfg: cfg, startupConfig: startupConfig, configPath: configPath, logger: logger, insecure: insecure}); err != nil {
 		logger.Error("service runner failed", "component", "service", "error", err)
 		os.Exit(1)
 	}
@@ -41,10 +43,11 @@ func maybeRunAsService(cfg config.File, configPath string, logger *slog.Logger, 
 // vmflowService implements svc.Handler, bridging the SCM lifecycle to the
 // shared runForwarding engine loop.
 type vmflowService struct {
-	cfg        config.File
-	configPath string
-	logger     *slog.Logger
-	insecure   bool
+	cfg           config.File
+	startupConfig config.File
+	configPath    string
+	logger        *slog.Logger
+	insecure      bool
 }
 
 // Execute is invoked by the SCM. It reports StartPending -> Running, starts the
@@ -58,12 +61,20 @@ func (m *vmflowService) Execute(_ []string, changes <-chan svc.ChangeRequest, st
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	readyCh := make(chan error, 1)
 	errCh := make(chan error, 1)
-	go func() { errCh <- runForwarding(ctx, m.cfg, m.configPath, m.logger, m.insecure) }()
+	go func() {
+		errCh <- runForwardingWithReady(ctx, m.cfg, m.startupConfig, m.configPath, m.logger, m.insecure, readyCh)
+	}()
 
+	if err := <-readyCh; err != nil {
+		m.logger.Error("service initialization failed", "component", "service", "event", "service_init_failed", "error", err)
+		return true, 1
+	}
 	status <- svc.Status{State: svc.Running, Accepts: accepts}
 
 	var runErr error
+	engineDone := false
 loop:
 	for {
 		select {
@@ -77,19 +88,26 @@ loop:
 			}
 		case e := <-errCh:
 			runErr = e
+			if runErr == nil {
+				runErr = fmt.Errorf("forwarding engine stopped unexpectedly")
+			}
+			engineDone = true
 			break loop
 		}
 	}
 
 	status <- svc.Status{State: svc.StopPending}
 	cancel()
-	// Give the engine up to a few seconds to finish graceful shutdown.
-	select {
-	case e := <-errCh:
-		if runErr == nil {
-			runErr = e
+	if !engineDone {
+		// Give the engine up to a few seconds to finish graceful shutdown.
+		select {
+		case e := <-errCh:
+			if runErr == nil {
+				runErr = e
+			}
+		case <-time.After(6 * time.Second):
+			m.logger.Warn("service shutdown timed out", "component", "service", "event", "service_stop_timeout")
 		}
-	case <-time.After(6 * time.Second):
 	}
 
 	if runErr != nil {

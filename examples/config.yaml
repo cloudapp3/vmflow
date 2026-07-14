@@ -1,5 +1,6 @@
 version: 1
 control_listen_addr: 127.0.0.1:19090
+udp_max_sessions: 256 # total active UDP sessions across all rules; 0 = default 256; maximum 4096
 # control_tls:                       # enable TLS on the control API
 #   cert_file: /etc/vmflow/control.crt
 #   key_file:  /etc/vmflow/control.key
@@ -10,15 +11,28 @@ log:
   level: info
   format: text # text or json
 
-# The daemon refuses to start if control_listen_addr is non-loopback without auth.
+# vmflow refuses to start if control_listen_addr is non-loopback without auth.
 # Bind 127.0.0.1 (default) or enable auth below before exposing it remotely.
 # relayctl/vmflow ctl can pass the token with -token or VMFLOW_CONTROL_TOKEN.
+# Persistent TUI rule edits require auth.enabled: true and an admin token.
+# Viewer and auth-disabled TUI sessions are read-only. Auth, TLS, and log
+# changes still require editing this YAML and restarting vmflow.
 auth:
   enabled: false
   tokens:
     - name: admin
       token: change-me
       role: admin
+
+# Telegram bot (optional). bot_token + bot_chat start a polling bot that only
+# responds to that chat. Set bot_control_token to an admin auth token to let the
+# bot control forwarding (/reload, /start_rule, /stop, /toggle); leave it unset for a
+# read-only bot. Bot control requires auth.enabled: true and an admin token.
+# The bot can also be configured and started/stopped at runtime from the TUI
+# (press b in the Dashboard or Rules view) without restarting the daemon.
+# bot_token: "123456:ABC-DEF..."
+# bot_chat: 123456789
+# bot_control_token: "change-me"  # must match an admin auth.tokens entry
 
 rules:
   - rule_id: ssh-forward
@@ -30,6 +44,6 @@ rules:
     target_port: 22
     enabled: true
     speed_limit: 0
-    max_conn: 0        # 0 = unlimited (not recommended on exposed ports)
+    max_conn: 0        # TCP: unlimited; UDP: default 256 sessions
     idle_timeout: 300  # seconds; 0 = default 5 min. Reaps silent connections.
     remark: example

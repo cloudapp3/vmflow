@@ -66,10 +66,11 @@ func (e *Error) Error() string {
 func CheckConfig(cfg config.File, running []engine.Rule, opts Options) Result {
 	start := time.Now()
 	checker := &checker{
-		cfg:     cfg,
-		running: running,
-		opts:    opts,
-		seen:    make(map[string]struct{}, len(cfg.Rules)),
+		cfg:              cfg,
+		opts:             opts,
+		seen:             make(map[string]struct{}, len(cfg.Rules)),
+		endpoints:        newEndpointIndex(),
+		runningEndpoints: indexRunningEndpoints(running),
 	}
 	checker.checkRules()
 	checker.checkACME()
@@ -89,18 +90,38 @@ func CheckConfig(cfg config.File, running []engine.Rule, opts Options) Result {
 }
 
 type checker struct {
-	cfg     config.File
-	running []engine.Rule
-	opts    Options
+	cfg  config.File
+	opts Options
 
-	seen      map[string]struct{}
-	endpoints []endpoint
-	items     []Item
-	errors    int
-	warnings  int
+	seen             map[string]struct{}
+	endpoints        endpointIndex
+	runningEndpoints map[runningEndpointKey]struct{}
+	items            []Item
+	errors           int
+	warnings         int
 }
 
 type endpoint struct {
+	Network string
+	Addr    string
+	Port    int
+	RuleID  string
+}
+
+type endpointGroup struct {
+	Network string
+	Port    int
+}
+
+type endpointBucket struct {
+	first    *endpoint
+	wildcard *endpoint
+	byAddr   map[string]endpoint
+}
+
+type endpointIndex map[endpointGroup]*endpointBucket
+
+type runningEndpointKey struct {
 	Network string
 	Addr    string
 	Port    int
@@ -132,7 +153,6 @@ func (c *checker) checkRules() {
 
 		for _, ep := range endpointsForRule(rule) {
 			c.checkEndpointConflict(ep)
-			c.endpoints = append(c.endpoints, ep)
 			if c.opts.CheckBind && rule.Enabled && !c.ownedBySameRunningRule(ep) {
 				c.checkBind(ep)
 			}
@@ -145,14 +165,10 @@ func (c *checker) checkRules() {
 }
 
 func (c *checker) checkEndpointConflict(ep endpoint) {
-	for _, existing := range c.endpoints {
-		if existing.Network != ep.Network || existing.Port != ep.Port {
-			continue
-		}
-		if endpointAddrConflict(existing.Addr, ep.Addr) {
-			c.addError("listen_conflict", ep.RuleID, fmt.Sprintf("listen %s/%s:%d conflicts with rule %s", ep.Network, displayAddr(ep.Addr), ep.Port, existing.RuleID))
-		}
+	if existing, ok := c.endpoints.conflict(ep); ok {
+		c.addError("listen_conflict", ep.RuleID, fmt.Sprintf("listen %s/%s:%d conflicts with rule %s", ep.Network, displayAddr(ep.Addr), ep.Port, existing.RuleID))
 	}
+	c.endpoints.add(ep)
 }
 
 func (c *checker) checkBind(ep endpoint) {
@@ -237,10 +253,8 @@ func (c *checker) checkACME() {
 		return
 	}
 	ep := endpoint{Network: "tcp", Addr: normalizeAddr(host), Port: port}
-	for _, existing := range c.endpoints {
-		if existing.Network == ep.Network && existing.Port == ep.Port && endpointAddrConflict(existing.Addr, ep.Addr) {
-			c.addError("acme_http01_addr", "", fmt.Sprintf("acme_http01_addr %s conflicts with rule %s", addr, existing.RuleID))
-		}
+	if existing, ok := c.endpoints.conflict(ep); ok {
+		c.addError("acme_http01_addr", "", fmt.Sprintf("acme_http01_addr %s conflicts with rule %s", addr, existing.RuleID))
 	}
 	if c.opts.CheckBind {
 		c.checkBind(ep)
@@ -248,18 +262,76 @@ func (c *checker) checkACME() {
 }
 
 func (c *checker) ownedBySameRunningRule(ep endpoint) bool {
-	for _, rule := range c.running {
-		rule = rule.Standardize()
-		if rule.RuleID != ep.RuleID {
-			continue
+	_, ok := c.runningEndpoints[runningEndpointKey{
+		Network: ep.Network,
+		Addr:    normalizeAddr(ep.Addr),
+		Port:    ep.Port,
+		RuleID:  ep.RuleID,
+	}]
+	return ok
+}
+
+func newEndpointIndex() endpointIndex {
+	return make(endpointIndex)
+}
+
+func (index endpointIndex) conflict(ep endpoint) (endpoint, bool) {
+	bucket := index[endpointGroup{Network: ep.Network, Port: ep.Port}]
+	if bucket == nil {
+		return endpoint{}, false
+	}
+	addr := normalizeAddr(ep.Addr)
+	if addr == "" {
+		if bucket.first == nil {
+			return endpoint{}, false
 		}
-		for _, runningEP := range endpointsForRule(rule) {
-			if runningEP.Network == ep.Network && runningEP.Port == ep.Port && normalizeAddr(runningEP.Addr) == normalizeAddr(ep.Addr) {
-				return true
-			}
+		return *bucket.first, true
+	}
+	if bucket.wildcard != nil {
+		return *bucket.wildcard, true
+	}
+	existing, ok := bucket.byAddr[addr]
+	return existing, ok
+}
+
+func (index endpointIndex) add(ep endpoint) {
+	ep.Addr = normalizeAddr(ep.Addr)
+	group := endpointGroup{Network: ep.Network, Port: ep.Port}
+	bucket := index[group]
+	if bucket == nil {
+		bucket = &endpointBucket{byAddr: make(map[string]endpoint)}
+		index[group] = bucket
+	}
+	if bucket.first == nil {
+		first := ep
+		bucket.first = &first
+	}
+	if ep.Addr == "" {
+		if bucket.wildcard == nil {
+			wildcard := ep
+			bucket.wildcard = &wildcard
+		}
+		return
+	}
+	if _, exists := bucket.byAddr[ep.Addr]; !exists {
+		bucket.byAddr[ep.Addr] = ep
+	}
+}
+
+func indexRunningEndpoints(running []engine.Rule) map[runningEndpointKey]struct{} {
+	index := make(map[runningEndpointKey]struct{}, len(running))
+	for _, rule := range running {
+		rule = rule.Standardize()
+		for _, ep := range endpointsForRule(rule) {
+			index[runningEndpointKey{
+				Network: ep.Network,
+				Addr:    normalizeAddr(ep.Addr),
+				Port:    ep.Port,
+				RuleID:  ep.RuleID,
+			}] = struct{}{}
 		}
 	}
-	return false
+	return index
 }
 
 func (c *checker) addError(check, ruleID, message string) {
@@ -305,12 +377,6 @@ func displayAddr(addr string) string {
 		return "*"
 	}
 	return addr
-}
-
-func endpointAddrConflict(a, b string) bool {
-	a = normalizeAddr(a)
-	b = normalizeAddr(b)
-	return a == "" || b == "" || a == b
 }
 
 // SortItems sorts result items by severity/check/rule_id for stable output.

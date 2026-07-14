@@ -9,6 +9,10 @@ import (
 	"path/filepath"
 )
 
+// SelfUpdateSupported reports whether the running platform can replace its own
+// executable in place.
+func SelfUpdateSupported() bool { return true }
+
 // SelfPath returns the absolute path of the currently running executable,
 // resolving any symlinks.
 func SelfPath() (string, error) {

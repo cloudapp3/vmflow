@@ -34,24 +34,173 @@ func platformInstall(cfg Config, w io.Writer) error {
 	}
 
 	path := unitPath(cfg)
-	if err := writeFileAtomic(path, []byte(systemdUnit(cfg)), 0o644); err != nil {
-		return fmt.Errorf("write unit file: %w", err)
+	if err := installSystemdUnit(cfg, path, runCombined); err != nil {
+		return err
 	}
 	fmt.Fprintf(w, "installed %s\n", path)
-
-	for _, step := range [][]string{
-		{"systemctl", "daemon-reload"},
-		{"systemctl", "enable", cfg.ServiceName},
-		{"systemctl", "start", cfg.ServiceName},
-	} {
-		out, err := runCombined(step)
-		if err != nil {
-			return fmt.Errorf("%s: %w (%s)", strings.Join(step, " "), err, strings.TrimSpace(string(out)))
-		}
-	}
 	fmt.Fprintf(w, "service %s enabled and started\n", cfg.ServiceName)
 	fmt.Fprintf(w, "logs: journalctl -u %s   |   status: vmflow service status\n", cfg.ServiceName)
 	return nil
+}
+
+type systemdCommandRunner func([]string) ([]byte, error)
+
+type unitFileSnapshot struct {
+	exists     bool
+	mode       os.FileMode
+	data       []byte
+	linkTarget string
+}
+
+type systemdState struct {
+	known   bool
+	enabled bool
+	active  bool
+}
+
+// installSystemdUnit applies a unit update transactionally. A failed reload,
+// enable, restart, or active-state check restores both the previous unit file
+// and its enabled/running state as far as systemctl permits.
+func installSystemdUnit(cfg Config, path string, runner systemdCommandRunner) error {
+	previousUnit, err := snapshotUnitFile(path)
+	if err != nil {
+		return fmt.Errorf("snapshot existing unit file: %w", err)
+	}
+	previousState := snapshotSystemdState(cfg.ServiceName, runner)
+
+	if err := writeFileAtomic(path, []byte(systemdUnit(cfg)), 0o644); err != nil {
+		return fmt.Errorf("write unit file: %w", err)
+	}
+
+	enableAttempted := false
+	restartAttempted := false
+	for _, step := range [][]string{
+		{"systemctl", "daemon-reload"},
+		{"systemctl", "enable", cfg.ServiceName},
+		{"systemctl", "restart", cfg.ServiceName},
+		{"systemctl", "is-active", "--quiet", cfg.ServiceName},
+	} {
+		if len(step) > 1 && step[1] == "restart" {
+			restartAttempted = true
+		}
+		if len(step) > 1 && step[1] == "enable" {
+			enableAttempted = true
+		}
+		if err := runSystemdCommand(runner, step); err != nil {
+			rollbackErr := rollbackSystemdInstall(path, previousUnit, previousState, cfg.ServiceName, enableAttempted, restartAttempted, runner)
+			if rollbackErr != nil {
+				return fmt.Errorf("%w; rollback incomplete: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("%w; previous unit and service state restored", err)
+		}
+	}
+	return nil
+}
+
+func snapshotUnitFile(path string) (unitFileSnapshot, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return unitFileSnapshot{}, nil
+	}
+	if err != nil {
+		return unitFileSnapshot{}, err
+	}
+
+	snapshot := unitFileSnapshot{exists: true, mode: info.Mode()}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil {
+			return unitFileSnapshot{}, err
+		}
+		snapshot.linkTarget = target
+		return snapshot, nil
+	}
+	if !info.Mode().IsRegular() {
+		return unitFileSnapshot{}, fmt.Errorf("existing unit path %s is not a regular file or symlink", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return unitFileSnapshot{}, err
+	}
+	snapshot.data = data
+	return snapshot, nil
+}
+
+func restoreUnitFile(path string, snapshot unitFileSnapshot) error {
+	if !snapshot.exists {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if snapshot.mode&os.ModeSymlink != 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return os.Symlink(snapshot.linkTarget, path)
+	}
+	return writeFileAtomic(path, snapshot.data, snapshot.mode.Perm())
+}
+
+func snapshotSystemdState(serviceName string, runner systemdCommandRunner) systemdState {
+	_, knownErr := runner([]string{"systemctl", "cat", serviceName})
+	_, enabledErr := runner([]string{"systemctl", "is-enabled", "--quiet", serviceName})
+	_, activeErr := runner([]string{"systemctl", "is-active", "--quiet", serviceName})
+	return systemdState{
+		known:   knownErr == nil || enabledErr == nil || activeErr == nil,
+		enabled: enabledErr == nil,
+		active:  activeErr == nil,
+	}
+}
+
+func rollbackSystemdInstall(path string, previousUnit unitFileSnapshot, previousState systemdState, serviceName string, enableAttempted, restartAttempted bool, runner systemdCommandRunner) error {
+	var problems []string
+	if previousState.active || restartAttempted {
+		if err := runSystemdCommand(runner, []string{"systemctl", "stop", serviceName}); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	// `systemctl enable` can create wants links before a later step fails. Remove
+	// them while the new unit is still present unless the old service was enabled.
+	if enableAttempted && !previousState.enabled {
+		if err := runSystemdCommand(runner, []string{"systemctl", "disable", serviceName}); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	if err := restoreUnitFile(path, previousUnit); err != nil {
+		problems = append(problems, fmt.Sprintf("restore unit file: %v", err))
+	}
+	if err := runSystemdCommand(runner, []string{"systemctl", "daemon-reload"}); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if previousState.known {
+		enableAction := "disable"
+		if previousState.enabled {
+			enableAction = "enable"
+		}
+		if err := runSystemdCommand(runner, []string{"systemctl", enableAction, serviceName}); err != nil {
+			problems = append(problems, err.Error())
+		}
+		activeAction := "stop"
+		if previousState.active {
+			activeAction = "restart"
+		}
+		if err := runSystemdCommand(runner, []string{"systemctl", activeAction, serviceName}); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	if len(problems) != 0 {
+		return fmt.Errorf("%s", strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+func runSystemdCommand(runner systemdCommandRunner, argv []string) error {
+	out, err := runner(argv)
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w (%s)", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
 }
 
 func platformUninstall(cfg Config, w io.Writer) error {

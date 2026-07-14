@@ -26,9 +26,6 @@ func main() {
 	var method string
 	var path string
 	switch args[0] {
-	case "health":
-		method = http.MethodGet
-		path = "/healthz"
 	case "rules":
 		method = http.MethodGet
 		path = "/v1/rules"
@@ -88,5 +85,5 @@ func doRequest(baseURL, token string, tlsOpts controlapi.ClientTLSOptions, heade
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: relayctl [-addr http://127.0.0.1:19090] [-token token] <health|rules|stats|metrics|precheck|reload>")
+	fmt.Fprintln(os.Stderr, "usage: relayctl [-addr http://127.0.0.1:19090] [-token token] <rules|stats|metrics|precheck|reload>")
 }

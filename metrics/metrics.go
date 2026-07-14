@@ -57,8 +57,8 @@ func (c *Collector) ObserveControlRequest(method, path string, status int, durat
 		return
 	}
 	key := controlRequestKey{
-		Method: strings.ToUpper(strings.TrimSpace(method)),
-		Path:   normalizePath(path),
+		Method: normalizeMethod(method),
+		Path:   normalizeControlPath(path),
 		Status: strconv.Itoa(status),
 	}
 	c.mu.Lock()
@@ -116,12 +116,20 @@ func (c *Collector) Write(w io.Writer) error {
 	}
 	rules := c.runningRules()
 	snapshots := c.snapshots()
+	protocols := c.ruleProtocols()
 	controlRequests, reloads, applyActions := c.copyCounters()
 
 	if _, err := fmt.Fprintf(w, "# HELP vmflow_build_info Static build info for vmflow.\n# TYPE vmflow_build_info gauge\nvmflow_build_info 1\n"); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintf(w, "# HELP vmflow_uptime_seconds Time since this vmflow process metrics collector started.\n# TYPE vmflow_uptime_seconds gauge\nvmflow_uptime_seconds %.0f\n", time.Since(c.started).Seconds()); err != nil {
+		return err
+	}
+	udpLimit, udpActive := engine.DefaultUDPGlobalMaxSessions, 0
+	if c.manager != nil {
+		udpLimit, udpActive = c.manager.UDPMaxSessions()
+	}
+	if _, err := fmt.Fprintf(w, "# HELP vmflow_udp_sessions_limit Manager-wide UDP session admission limit.\n# TYPE vmflow_udp_sessions_limit gauge\nvmflow_udp_sessions_limit %d\n# HELP vmflow_udp_sessions_active Active UDP sessions across all rules in this manager.\n# TYPE vmflow_udp_sessions_active gauge\nvmflow_udp_sessions_active %d\n", udpLimit, udpActive); err != nil {
 		return err
 	}
 
@@ -138,7 +146,7 @@ func (c *Collector) Write(w io.Writer) error {
 		return err
 	}
 	for _, sample := range snapshots {
-		protocol := protocolForRule(rules, sample.RuleID)
+		protocol := protocolForRule(protocols, sample.RuleID)
 		if _, err := fmt.Fprintf(w, "vmflow_rule_connections{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.Conns); err != nil {
 			return err
 		}
@@ -148,7 +156,7 @@ func (c *Collector) Write(w io.Writer) error {
 		return err
 	}
 	for _, sample := range snapshots {
-		protocol := protocolForRule(rules, sample.RuleID)
+		protocol := protocolForRule(protocols, sample.RuleID)
 		if _, err := fmt.Fprintf(w, "vmflow_rule_upload_bytes_total{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.UploadBytes); err != nil {
 			return err
 		}
@@ -158,8 +166,34 @@ func (c *Collector) Write(w io.Writer) error {
 		return err
 	}
 	for _, sample := range snapshots {
-		protocol := protocolForRule(rules, sample.RuleID)
+		protocol := protocolForRule(protocols, sample.RuleID)
 		if _, err := fmt.Fprintf(w, "vmflow_rule_download_bytes_total{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.DownloadBytes); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprint(w, "# HELP vmflow_udp_session_rejected_total Total UDP session admission attempts rejected by rule or manager limits.\n# TYPE vmflow_udp_session_rejected_total counter\n"); err != nil {
+		return err
+	}
+	for _, sample := range snapshots {
+		protocol := protocolForRule(protocols, sample.RuleID)
+		if !hasUDPStats(protocol, sample) {
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "vmflow_udp_session_rejected_total{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.UDPSessionRejected); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprint(w, "# HELP vmflow_udp_packets_dropped_total Total UDP packets dropped because the bounded upload queue was full.\n# TYPE vmflow_udp_packets_dropped_total counter\n"); err != nil {
+		return err
+	}
+	for _, sample := range snapshots {
+		protocol := protocolForRule(protocols, sample.RuleID)
+		if !hasUDPStats(protocol, sample) {
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "vmflow_udp_packets_dropped_total{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.UDPPacketsDropped); err != nil {
 			return err
 		}
 	}
@@ -211,6 +245,13 @@ func (c *Collector) runningRules() []engine.Rule {
 	return c.manager.RunningRules()
 }
 
+func (c *Collector) ruleProtocols() map[string]engine.Protocol {
+	if c == nil || c.manager == nil {
+		return nil
+	}
+	return c.manager.RuleProtocols()
+}
+
 func (c *Collector) snapshots() []engine.TrafficSnapshot {
 	if c == nil || c.manager == nil {
 		return nil
@@ -242,21 +283,62 @@ func (c *Collector) copyCounters() (map[controlRequestKey]controlRequestStats, m
 	return controlRequests, reloads, applyActions
 }
 
-func protocolForRule(rules []engine.Rule, ruleID string) string {
-	for _, rule := range rules {
-		if rule.RuleID == ruleID {
-			return string(rule.Protocol)
-		}
+func protocolForRule(protocols map[string]engine.Protocol, ruleID string) string {
+	if protocol := protocols[ruleID]; protocol != "" {
+		return string(protocol)
 	}
 	return "unknown"
 }
 
-func normalizePath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return "/"
+func indexRuleProtocols(rules []engine.Rule) map[string]engine.Protocol {
+	protocols := make(map[string]engine.Protocol, len(rules))
+	for _, rule := range rules {
+		protocols[rule.RuleID] = rule.Protocol
 	}
-	return path
+	return protocols
+}
+
+func hasUDPStats(protocol string, sample engine.TrafficSnapshot) bool {
+	return protocol == string(engine.ProtocolUDP) ||
+		protocol == string(engine.ProtocolTCPUDP) ||
+		sample.UDPSessionRejected != 0 ||
+		sample.UDPPacketsDropped != 0
+}
+
+func normalizeMethod(method string) string {
+	switch method = strings.ToUpper(strings.TrimSpace(method)); method {
+	case http.MethodGet,
+		http.MethodHead,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodOptions:
+		return method
+	default:
+		return "OTHER"
+	}
+}
+
+func normalizeControlPath(path string) string {
+	path = strings.TrimSpace(path)
+	switch path {
+	case "/metrics",
+		"/v1/rules",
+		"/v1/stats",
+		"/v1/precheck",
+		"/v1/reload",
+		"/v1/certs",
+		"/v1/certs/obtain",
+		"/v1/certs/review":
+		return path
+	}
+
+	const certDetailPrefix = "/v1/certs/"
+	if suffix, ok := strings.CutPrefix(path, certDetailPrefix); ok && suffix != "" && !strings.Contains(suffix, "/") {
+		return "/v1/certs/{domain}"
+	}
+	return "/unknown"
 }
 
 func normalizeStatus(status string) string {

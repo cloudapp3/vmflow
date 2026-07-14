@@ -120,6 +120,9 @@ func (u *Updater) CheckSpecificVersion(ctx context.Context, tag string) (*CheckR
 // DownloadAndInstall downloads the archive for the current OS/arch,
 // verifies the SHA-256 checksum, and atomically replaces the binary.
 func (u *Updater) DownloadAndInstall(ctx context.Context, release *Release, progress io.Writer) error {
+	if !SelfUpdateSupported() {
+		return fmt.Errorf("self-update is not supported on %s; install the release archive manually", runtime.GOOS)
+	}
 	archiveName := u.archiveName(release.TagName)
 	downloadURL := fmt.Sprintf(
 		"https://github.com/%s/releases/download/%s/%s",

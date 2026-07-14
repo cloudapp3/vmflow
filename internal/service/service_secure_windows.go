@@ -28,13 +28,21 @@ const windowsDangerousWriteMask windows.ACCESS_MASK = windows.GENERIC_ALL |
 	windowsFileDeleteChild
 
 func validateTrustedServiceBinary(path string, _ os.FileInfo) error {
+	return validateTrustedWindowsServicePath(path, "binary")
+}
+
+func validateTrustedServiceConfig(path string, _ os.FileInfo) error {
+	return validateTrustedWindowsServicePath(path, "config")
+}
+
+func validateTrustedWindowsServicePath(path, kind string) error {
 	parent := filepath.Dir(path)
 	if windowsIsRoot(parent) {
-		return fmt.Errorf("service binary %s is not trusted: binary must be under a protected install directory, not directly in %s", path, parent)
+		return fmt.Errorf("service %s %s is not trusted: file must be under a protected directory, not directly in %s", kind, path, parent)
 	}
 
 	for _, objectPath := range windowsTrustedPathComponents(path) {
-		if err := validateTrustedWindowsObject(path, objectPath); err != nil {
+		if err := validateTrustedWindowsObject(path, kind, objectPath); err != nil {
 			return err
 		}
 	}
@@ -54,40 +62,40 @@ func windowsIsRoot(path string) bool {
 	return filepath.Dir(clean) == clean
 }
 
-func validateTrustedWindowsObject(binaryPath, objectPath string) error {
+func validateTrustedWindowsObject(servicePath, serviceKind, objectPath string) error {
 	sd, err := windows.GetNamedSecurityInfo(
 		objectPath,
 		windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
 	)
 	if err != nil {
-		return fmt.Errorf("service binary %s is not trusted: inspect ACL for %s: %w", binaryPath, objectPath, err)
+		return fmt.Errorf("service %s %s is not trusted: inspect ACL for %s: %w", serviceKind, servicePath, objectPath, err)
 	}
 	if sd == nil {
-		return fmt.Errorf("service binary %s is not trusted: %s has no security descriptor", binaryPath, objectPath)
+		return fmt.Errorf("service %s %s is not trusted: %s has no security descriptor", serviceKind, servicePath, objectPath)
 	}
 
 	owner, _, err := sd.Owner()
 	if err != nil {
-		return fmt.Errorf("service binary %s is not trusted: inspect owner for %s: %w", binaryPath, objectPath, err)
+		return fmt.Errorf("service %s %s is not trusted: inspect owner for %s: %w", serviceKind, servicePath, objectPath, err)
 	}
 	if owner == nil || !windowsTrustedPrincipal(owner) {
-		return fmt.Errorf("service binary %s is not trusted: %s is owned by %s, not Administrators/SYSTEM/TrustedInstaller", binaryPath, objectPath, windowsSIDLabel(owner))
+		return fmt.Errorf("service %s %s is not trusted: %s is owned by %s, not Administrators/SYSTEM/TrustedInstaller", serviceKind, servicePath, objectPath, windowsSIDLabel(owner))
 	}
 
 	dacl, _, err := sd.DACL()
 	if err != nil {
-		return fmt.Errorf("service binary %s is not trusted: inspect DACL for %s: %w", binaryPath, objectPath, err)
+		return fmt.Errorf("service %s %s is not trusted: inspect DACL for %s: %w", serviceKind, servicePath, objectPath, err)
 	}
 	// A nil DACL grants full access to everyone.
 	if dacl == nil {
-		return fmt.Errorf("service binary %s is not trusted: %s has a nil DACL", binaryPath, objectPath)
+		return fmt.Errorf("service %s %s is not trusted: %s has a nil DACL", serviceKind, servicePath, objectPath)
 	}
 
 	for i := uint32(0); i < uint32(dacl.AceCount); i++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, i, &ace); err != nil {
-			return fmt.Errorf("service binary %s is not trusted: read ACE %d for %s: %w", binaryPath, i, objectPath, err)
+			return fmt.Errorf("service %s %s is not trusted: read ACE %d for %s: %w", serviceKind, servicePath, i, objectPath, err)
 		}
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
 			continue
@@ -101,7 +109,7 @@ func validateTrustedWindowsObject(binaryPath, objectPath string) error {
 
 		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 		if !windowsTrustedPrincipal(sid) {
-			return fmt.Errorf("service binary %s is not trusted: %s grants write access to %s", binaryPath, objectPath, windowsSIDLabel(sid))
+			return fmt.Errorf("service %s %s is not trusted: %s grants write access to %s", serviceKind, servicePath, objectPath, windowsSIDLabel(sid))
 		}
 	}
 	return nil

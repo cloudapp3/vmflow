@@ -59,7 +59,7 @@ func TestAuthRateLimitedReturns429(t *testing.T) {
 	defer server.Close()
 
 	for i := 0; i < authFailMax; i++ {
-		resp, err := http.Get(server.URL + "/healthz")
+		resp, err := http.Get(server.URL + "/v1/rules")
 		if err != nil {
 			t.Fatalf("get: %v", err)
 		}
@@ -69,7 +69,7 @@ func TestAuthRateLimitedReturns429(t *testing.T) {
 		}
 	}
 
-	resp, err := http.Get(server.URL + "/healthz")
+	resp, err := http.Get(server.URL + "/v1/rules")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

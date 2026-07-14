@@ -1,11 +1,376 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
+
+type scriptedRunnerFactory struct {
+	events      []string
+	startErrors map[string][]error
+}
+
+func newScriptedManager(collector *Collector, script *scriptedRunnerFactory) *Manager {
+	manager := NewManager(collector)
+	manager.runnerBuilder = func(rule Rule) ([]Runner, error) {
+		return []Runner{&scriptedRunner{name: rule.Name, factory: script}}, nil
+	}
+	return manager
+}
+
+type scriptedRunner struct {
+	name    string
+	factory *scriptedRunnerFactory
+}
+
+func (runner *scriptedRunner) Start() error {
+	runner.factory.events = append(runner.factory.events, "start:"+runner.name)
+	errorsForRule := runner.factory.startErrors[runner.name]
+	if len(errorsForRule) == 0 {
+		return nil
+	}
+	err := errorsForRule[0]
+	runner.factory.startErrors[runner.name] = errorsForRule[1:]
+	return err
+}
+
+func (runner *scriptedRunner) Stop() {
+	runner.factory.events = append(runner.factory.events, "stop:"+runner.name)
+}
+
+func transactionRule(ruleID, name string, targetPort int) Rule {
+	return Rule{
+		RuleID:     ruleID,
+		Name:       name,
+		Protocol:   ProtocolTCP,
+		ListenAddr: "127.0.0.1",
+		ListenPort: 12000 + len(ruleID),
+		TargetAddr: "127.0.0.1",
+		TargetPort: targetPort,
+		Enabled:    true,
+	}
+}
+
+func TestApplySnapshotTransactionalPrevalidatesEntireBatch(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: make(map[string][]error)}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	oldRule := transactionRule("a", "old-a", 21001)
+	if err := manager.StartRule(oldRule); err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore := append([]string(nil), script.events...)
+
+	invalid := transactionRule("b", "", 21002)
+	result := manager.ApplySnapshotTransactional([]Rule{
+		transactionRule("a", "new-a", 22001),
+		invalid,
+	}, ApplySnapshotOptions{ReplaceAll: true})
+	if result.ApplyFailure == nil || !strings.Contains(result.ApplyFailure.Error, "missing rule name") {
+		t.Fatalf("apply failure = %+v, want validation error", result.ApplyFailure)
+	}
+	if result.Rollback.Attempted {
+		t.Fatalf("validation failure unexpectedly attempted rollback: %+v", result.Rollback)
+	}
+	if !reflect.DeepEqual(script.events, eventsBefore) {
+		t.Fatalf("runtime changed before validation completed: %v", script.events)
+	}
+	if got := manager.RunningRules(); len(got) != 1 || !got[0].RuntimeEqual(oldRule) || got[0].Name != oldRule.Name {
+		t.Fatalf("running rules changed after validation failure: %+v", got)
+	}
+}
+
+func TestApplySnapshotTransactionalUpdateFailureRestoresOldRuleAndCounters(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: map[string][]error{
+		"new-a": {errors.New("new runner unavailable")},
+	}}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	oldRule := transactionRule("a", "old-a", 21001)
+	if err := manager.StartRule(oldRule); err != nil {
+		t.Fatal(err)
+	}
+	collector.AddUpload("a", 11)
+	collector.AddDownload("a", 22)
+	collector.SetConns("a", 3)
+	counterBefore := manager.Snapshot("a")
+	protocolsBefore := manager.RuleProtocols()
+
+	result := manager.ApplySnapshotTransactional(
+		[]Rule{transactionRule("a", "new-a", 22001)},
+		ApplySnapshotOptions{ReplaceAll: true},
+	)
+	if result.ApplyFailure == nil || result.ApplyFailure.RuleID != "a" {
+		t.Fatalf("apply failure = %+v, want rule a", result.ApplyFailure)
+	}
+	if !result.Rollback.Attempted || result.Rollback.Failed {
+		t.Fatalf("rollback = %+v, want successful restoration", result.Rollback)
+	}
+	if len(result.Rollback.Items) != 1 || result.Rollback.Items[0].RuleID != "a" || result.Rollback.Items[0].Status != "ok" {
+		t.Fatalf("rollback items = %+v", result.Rollback.Items)
+	}
+	if got := manager.RunningRules(); len(got) != 1 || !got[0].RuntimeEqual(oldRule) || got[0].Name != oldRule.Name {
+		t.Fatalf("old rule was not restored: %+v", got)
+	}
+	gotCounter := manager.Snapshot("a")
+	if gotCounter.UploadBytes != counterBefore.UploadBytes || gotCounter.DownloadBytes != counterBefore.DownloadBytes || gotCounter.UDPSessionRejected != counterBefore.UDPSessionRejected || gotCounter.UDPPacketsDropped != counterBefore.UDPPacketsDropped {
+		t.Fatalf("cumulative counters after rollback = %+v, want values from %+v", gotCounter, counterBefore)
+	}
+	if gotCounter.Conns != 0 {
+		t.Fatalf("connections after runner restart = %d, want 0", gotCounter.Conns)
+	}
+	if got := manager.RuleProtocols(); !reflect.DeepEqual(got, protocolsBefore) {
+		t.Fatalf("protocol metadata after rollback = %+v, want %+v", got, protocolsBefore)
+	}
+	wantEvents := []string{"start:old-a", "stop:old-a", "start:new-a", "start:old-a"}
+	if !reflect.DeepEqual(script.events, wantEvents) {
+		t.Fatalf("runner events = %v, want %v", script.events, wantEvents)
+	}
+}
+
+func TestApplySnapshotTransactionalRollsBackPriorRulesInReverseOrder(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: map[string][]error{
+		"new-c": {errors.New("third rule failed")},
+	}}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	oldA := transactionRule("a", "old-a", 21001)
+	oldB := transactionRule("b", "old-b", 21002)
+	if err := manager.StartRule(oldA); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.StartRule(oldB); err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore := len(script.events)
+
+	result := manager.ApplySnapshotTransactional([]Rule{
+		transactionRule("a", "new-a", 22001),
+		transactionRule("b", "new-b", 22002),
+		transactionRule("c", "new-c", 22003),
+	}, ApplySnapshotOptions{ReplaceAll: true})
+	if result.ApplyFailure == nil || result.ApplyFailure.RuleID != "c" {
+		t.Fatalf("apply failure = %+v, want rule c", result.ApplyFailure)
+	}
+	if result.Rollback.Failed || len(result.Rollback.Items) != 2 {
+		t.Fatalf("rollback = %+v", result.Rollback)
+	}
+	if got := []string{result.Rollback.Items[0].RuleID, result.Rollback.Items[1].RuleID}; !reflect.DeepEqual(got, []string{"b", "a"}) {
+		t.Fatalf("rollback order = %v, want [b a]", got)
+	}
+	wantEvents := []string{
+		"stop:old-a", "start:new-a",
+		"stop:old-b", "start:new-b",
+		"start:new-c",
+		"stop:new-b", "start:old-b",
+		"stop:new-a", "start:old-a",
+	}
+	if got := script.events[eventsBefore:]; !reflect.DeepEqual(got, wantEvents) {
+		t.Fatalf("transaction events = %v, want %v", got, wantEvents)
+	}
+	if got := manager.RunningRules(); len(got) != 2 || got[0].Name != "old-a" || got[1].Name != "old-b" {
+		t.Fatalf("running rules after rollback = %+v", got)
+	}
+}
+
+func TestApplySnapshotTransactionalPreservesConnsForMetadataOnlyRollback(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: map[string][]error{
+		"new-c": {errors.New("later apply failed")},
+	}}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	oldA := transactionRule("a", "old-a", 21001)
+	if err := manager.StartRule(oldA); err != nil {
+		t.Fatal(err)
+	}
+	collector.SetConns("a", 4)
+	metadataOnly := oldA
+	metadataOnly.Name = "renamed-a"
+	metadataOnly.Remark = "metadata change"
+
+	result := manager.ApplySnapshotTransactional([]Rule{
+		metadataOnly,
+		transactionRule("c", "new-c", 22003),
+	}, ApplySnapshotOptions{ReplaceAll: true})
+	if result.ApplyFailure == nil || result.Rollback.Failed {
+		t.Fatalf("transaction result = %+v", result)
+	}
+	if got := manager.Snapshot("a").Conns; got != 4 {
+		t.Fatalf("metadata-only rule connections = %d after rollback, want 4", got)
+	}
+	if got := manager.RunningRules(); len(got) != 1 || got[0].Name != oldA.Name || got[0].Remark != oldA.Remark {
+		t.Fatalf("metadata was not rolled back: %+v", got)
+	}
+}
+
+func TestPendingSnapshotRollbackPreservesLiveCounterUpdates(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: make(map[string][]error)}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	oldRule := transactionRule("live", "old", 21001)
+	if err := manager.StartRule(oldRule); err != nil {
+		t.Fatal(err)
+	}
+	collector.AddUpload("live", 10)
+	collector.SetConns("live", 2)
+	metadataOnly := oldRule
+	metadataOnly.Name = "renamed"
+
+	pending, result := manager.BeginApplySnapshotTransactional([]Rule{metadataOnly}, ApplySnapshotOptions{ReplaceAll: true})
+	if pending == nil || result.ApplyFailure != nil {
+		t.Fatalf("begin transaction = (%v, %+v)", pending, result)
+	}
+	// The runner remains live while an external config commit is pending.
+	collector.AddUpload("live", 7)
+	collector.IncConns("live")
+	rollback := pending.Rollback()
+	if rollback.Failed {
+		t.Fatalf("rollback = %+v", rollback)
+	}
+	got := manager.Snapshot("live")
+	if got.UploadBytes != 17 || got.Conns != 3 {
+		t.Fatalf("live counters were rewound by rollback: %+v", got)
+	}
+	if rules := manager.RunningRules(); len(rules) != 1 || rules[0].Name != oldRule.Name {
+		t.Fatalf("metadata was not restored: %+v", rules)
+	}
+}
+
+func TestPendingSnapshotRollbackRestoresRemovedCountersAndDisabledMetadata(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: make(map[string][]error)}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	running := transactionRule("running", "running", 21001)
+	disabled := transactionRule("disabled", "disabled", 21002)
+	disabled.Enabled = false
+	if result := manager.ApplySnapshot([]Rule{running, disabled}, ApplySnapshotOptions{ReplaceAll: true}); result.FailedRules != 0 {
+		t.Fatalf("initial apply = %+v", result)
+	}
+	collector.AddUpload("running", 11)
+	collector.AddDownload("disabled", 22)
+
+	pending, result := manager.BeginApplySnapshotTransactional(nil, ApplySnapshotOptions{ReplaceAll: true})
+	if pending == nil || result.ApplyFailure != nil {
+		t.Fatalf("begin removal = (%v, %+v)", pending, result)
+	}
+	if snapshots := manager.SnapshotAll(); len(snapshots) != 0 {
+		t.Fatalf("candidate counters were not removed: %+v", snapshots)
+	}
+	rollback := pending.Rollback()
+	if rollback.Failed {
+		t.Fatalf("rollback = %+v", rollback)
+	}
+	if got := manager.Snapshot("running"); got.UploadBytes != 11 || got.Conns != 0 {
+		t.Fatalf("running counter was not restored correctly: %+v", got)
+	}
+	if got := manager.Snapshot("disabled"); got.DownloadBytes != 22 {
+		t.Fatalf("disabled counter was not restored: %+v", got)
+	}
+	protocols := manager.RuleProtocols()
+	if protocols["running"] != ProtocolTCP || protocols["disabled"] != ProtocolTCP {
+		t.Fatalf("protocol metadata was not restored: %+v", protocols)
+	}
+}
+
+func TestApplySnapshotTransactionalReportsRollbackFailure(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: map[string][]error{
+		"old-a": {nil, errors.New("old runner cannot be restored")},
+		"new-c": {errors.New("later apply failed")},
+	}}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	oldA := transactionRule("a", "old-a", 21001)
+	newA := transactionRule("a", "new-a", 22001)
+	newA.Protocol = ProtocolUDP
+	if err := manager.StartRule(oldA); err != nil {
+		t.Fatal(err)
+	}
+	result := manager.ApplySnapshotTransactional([]Rule{
+		newA,
+		transactionRule("c", "new-c", 22003),
+	}, ApplySnapshotOptions{ReplaceAll: true})
+	if result.ApplyFailure == nil || result.ApplyFailure.RuleID != "c" {
+		t.Fatalf("apply failure = %+v, want rule c", result.ApplyFailure)
+	}
+	if !result.Rollback.Attempted || !result.Rollback.Failed {
+		t.Fatalf("rollback failure was not observable: %+v", result.Rollback)
+	}
+	if len(result.Rollback.Items) != 1 || result.Rollback.Items[0].Status != "failed" || !strings.Contains(result.Rollback.Items[0].Error, "old runner cannot be restored") {
+		t.Fatalf("rollback items = %+v", result.Rollback.Items)
+	}
+	if got := manager.RunningRules(); len(got) != 1 || !got[0].RuntimeEqual(newA) || got[0].Name != newA.Name {
+		t.Fatalf("best-effort rollback should retain the last working runner: %+v", got)
+	}
+	if got := manager.RuleProtocols()["a"]; got != ProtocolUDP {
+		t.Fatalf("protocol metadata = %q, want active replacement protocol %q", got, ProtocolUDP)
+	}
+}
+
+func TestApplySnapshotTransactionalDisabledAndRemove(t *testing.T) {
+	collector := NewCollector()
+	script := &scriptedRunnerFactory{startErrors: make(map[string][]error)}
+	manager := newScriptedManager(collector, script)
+	defer manager.StopAll()
+
+	ruleA := transactionRule("a", "old-a", 21001)
+	ruleB := transactionRule("b", "old-b", 21002)
+	if err := manager.StartRule(ruleA); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.StartRule(ruleB); err != nil {
+		t.Fatal(err)
+	}
+	disabledA := ruleA
+	disabledA.Enabled = false
+
+	result := manager.ApplySnapshotTransactional([]Rule{disabledA}, ApplySnapshotOptions{ReplaceAll: true})
+	if result.ApplyFailure != nil || result.Rollback.Attempted {
+		t.Fatalf("transaction failed: %+v", result)
+	}
+	if len(result.Apply.Items) != 2 || result.Apply.Items[0].Action != ApplyActionStopped || result.Apply.Items[1].Action != ApplyActionRemoved {
+		t.Fatalf("apply items = %+v, want stopped then removed", result.Apply.Items)
+	}
+	if manager.RunningCount() != 0 {
+		t.Fatalf("running count = %d, want 0", manager.RunningCount())
+	}
+	if snapshots := manager.SnapshotAll(); len(snapshots) != 1 || snapshots[0].RuleID != "a" {
+		t.Fatalf("disabled counter should remain and removed counter should not: %+v", snapshots)
+	}
+	protocols := manager.RuleProtocols()
+	if len(protocols) != 1 || protocols["a"] != ProtocolTCP {
+		t.Fatalf("protocol metadata = %+v, want only disabled rule a", protocols)
+	}
+
+	removeDisabled := manager.ApplySnapshotTransactional(nil, ApplySnapshotOptions{ReplaceAll: true})
+	if removeDisabled.ApplyFailure != nil || len(removeDisabled.Apply.Items) != 1 || removeDisabled.Apply.Items[0].RuleID != "a" || removeDisabled.Apply.Items[0].Action != ApplyActionRemoved {
+		t.Fatalf("removing disabled rule = %+v", removeDisabled)
+	}
+	if snapshots := manager.SnapshotAll(); len(snapshots) != 0 {
+		t.Fatalf("removed disabled counter remains: %+v", snapshots)
+	}
+	if protocols := manager.RuleProtocols(); len(protocols) != 0 {
+		t.Fatalf("removed disabled protocol remains: %+v", protocols)
+	}
+}
 
 func TestApplySnapshotStartAndRemove(t *testing.T) {
 	manager := NewManager(NewCollector())

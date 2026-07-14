@@ -21,11 +21,13 @@ const (
 type File struct {
 	Version           int              `json:"version" yaml:"version"`
 	ControlListenAddr string           `json:"control_listen_addr" yaml:"control_listen_addr"`
+	UDPMaxSessions    int              `json:"udp_max_sessions,omitempty" yaml:"udp_max_sessions,omitempty"`
 	ControlTLS        ControlTLSConfig `json:"control_tls,omitempty" yaml:"control_tls,omitempty"`
 	Log               LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
 	Auth              AuthConfig       `json:"auth,omitempty" yaml:"auth,omitempty"`
 	BotToken          string           `json:"bot_token,omitempty" yaml:"bot_token,omitempty"`
 	BotChat           int64            `json:"bot_chat,omitempty" yaml:"bot_chat,omitempty"`
+	BotControlToken   string           `json:"bot_control_token,omitempty" yaml:"bot_control_token,omitempty"`
 	AcmeChallenge     string           `json:"acme_challenge,omitempty" yaml:"acme_challenge,omitempty"`
 	AcmeHTTP01Addr    string           `json:"acme_http01_addr,omitempty" yaml:"acme_http01_addr,omitempty"`
 	AcmeCacheDir      string           `json:"acme_cache_dir,omitempty" yaml:"acme_cache_dir,omitempty"`
@@ -116,7 +118,14 @@ func Parse(raw []byte) (File, error) {
 	if cfg.ControlListenAddr == "" {
 		cfg.ControlListenAddr = DefaultControlListenAddr
 	}
+	if cfg.UDPMaxSessions == 0 {
+		cfg.UDPMaxSessions = engine.DefaultUDPGlobalMaxSessions
+	}
+	if cfg.UDPMaxSessions < 0 || cfg.UDPMaxSessions > engine.MaxUDPGlobalMaxSessions {
+		return File{}, fmt.Errorf("udp_max_sessions must be 0 (default) or between 1 and %d", engine.MaxUDPGlobalMaxSessions)
+	}
 	cfg.Log = normalizeLog(cfg.Log)
+	cfg.ControlTLS = normalizeControlTLS(cfg.ControlTLS)
 	if err := validateControlTLS(cfg.ControlTLS); err != nil {
 		return File{}, err
 	}
@@ -140,9 +149,20 @@ func Parse(raw []byte) (File, error) {
 	return cfg, nil
 }
 
+func normalizeControlTLS(t ControlTLSConfig) ControlTLSConfig {
+	t.CertFile = strings.TrimSpace(t.CertFile)
+	t.KeyFile = strings.TrimSpace(t.KeyFile)
+	t.ClientCAFile = strings.TrimSpace(t.ClientCAFile)
+	t.MinVersion = strings.TrimSpace(t.MinVersion)
+	return t
+}
+
 func validateControlTLS(t ControlTLSConfig) error {
 	if (t.CertFile == "") != (t.KeyFile == "") {
 		return fmt.Errorf("control_tls: cert_file and key_file must both be set or both omitted")
+	}
+	if t.ClientCAFile != "" && (t.CertFile == "" || t.KeyFile == "") {
+		return fmt.Errorf("control_tls: client_ca_file requires cert_file and key_file")
 	}
 	switch t.MinVersion {
 	case "", "1.2", "1.3":

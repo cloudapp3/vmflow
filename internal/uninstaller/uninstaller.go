@@ -1,6 +1,7 @@
 // Package uninstaller performs a complete one-command uninstall of vmflow:
-// it removes the native service, deletes the binary, and purges config, logs,
-// TLS/ACME certificates, and the self-update cache.
+// it removes the native service, deletes the binary, and purges owned config,
+// logs, owned certificate caches, and the self-update cache. External TLS
+// certificate and key files referenced by config are deliberately preserved.
 //
 // The flow is plan → confirm → execute. Plan probes the system and returns the
 // ordered list of items to remove (service first, the running binary last).
@@ -18,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/cloudapp3/vmflow/config"
@@ -26,16 +28,19 @@ import (
 )
 
 const (
-	kindService = "service"
-	kindBinary  = "binary"
-	kindFile    = "file"
-	kindDir     = "dir"
+	kindService               = "service"
+	kindBinary                = "binary"
+	kindFile                  = "file"
+	kindDir                   = "dir"
+	kindOwnedConfig           = "owned-config"
+	colocatedConfigName       = "config.yaml"
+	colocatedConfigMarkerName = ".vmflow-config-owned"
 )
 
 // Item describes one artifact the uninstall removes.
 type Item struct {
 	Path string // filesystem path; empty for the service item
-	Kind string // kindService | kindBinary | kindFile | kindDir
+	Kind string // kindService | kindBinary | kindFile | kindDir | kindOwnedConfig
 	Note string // human-readable description shown in the plan
 	Self bool   // marks the running binary; removed last
 }
@@ -51,13 +56,19 @@ func Plan() (items []Item, warnings []string) {
 		})
 	}
 
-	if cfgPath := defaultConfigPath(); pathExists(cfgPath) {
-		items = append(items, Item{Kind: kindFile, Path: cfgPath, Note: "config file"})
-		for _, p := range certPathsFromConfig(cfgPath) {
-			if pathExists(p) {
-				items = append(items, Item{Kind: certKind(p), Path: p, Note: "TLS / ACME certificate (referenced by config)"})
-			}
+	binPath, warn := selfBinary()
+	if warn != "" {
+		warnings = append(warnings, warn)
+	}
+
+	items, warnings = appendConfigPlan(items, warnings, defaultConfigPath(), kindFile)
+	if cfgPath, markerPath, owned := colocatedConfig(binPath); owned {
+		if !samePath(cfgPath, defaultConfigPath()) {
+			items, warnings = appendConfigPlan(items, warnings, cfgPath, kindOwnedConfig)
 		}
+		items = append(items, Item{Kind: kindFile, Path: markerPath, Note: "colocated config ownership marker"})
+	} else if pathLexists(cfgPath) && !samePath(cfgPath, defaultConfigPath()) {
+		warnings = append(warnings, fmt.Sprintf("leaving colocated config %s in place (missing %s ownership marker)", cfgPath, colocatedConfigMarkerName))
 	}
 
 	for _, p := range defaultLogPaths() {
@@ -66,14 +77,14 @@ func Plan() (items []Item, warnings []string) {
 		}
 	}
 
-	if cache := updater.CacheDir(); pathExists(cache) {
-		items = append(items, Item{Kind: kindDir, Path: cache, Note: "self-update cache"})
+	if cacheFile := updater.CacheFilePath(); pathExists(cacheFile) {
+		if filepath.IsAbs(cacheFile) {
+			items = append(items, Item{Kind: kindFile, Path: cacheFile, Note: "self-update cache file"})
+		} else {
+			warnings = append(warnings, fmt.Sprintf("leaving relative self-update cache path %s in place", cacheFile))
+		}
 	}
 
-	binPath, warn := selfBinary()
-	if warn != "" {
-		warnings = append(warnings, warn)
-	}
 	if binPath != "" {
 		if owner := packageOwner(binPath); owner != "" {
 			warnings = append(warnings,
@@ -82,6 +93,60 @@ func Plan() (items []Item, warnings []string) {
 		items = append(items, Item{Kind: kindBinary, Path: binPath, Note: "vmflow binary", Self: true})
 	}
 	return items, warnings
+}
+
+func appendConfigPlan(items []Item, warnings []string, cfgPath, configKind string) ([]Item, []string) {
+	if !pathLexists(cfgPath) {
+		return items, warnings
+	}
+	items = append(items, Item{Kind: configKind, Path: cfgPath, Note: "config file"})
+	if !pathExists(cfgPath) {
+		return items, warnings
+	}
+
+	certPaths, cacheDirs := cleanupPathsFromConfig(cfgPath)
+	for _, p := range certPaths {
+		warnings = append(warnings, fmt.Sprintf("leaving external TLS certificate/key path %s in place (ownership cannot be proven)", p))
+	}
+	for _, p := range cacheDirs {
+		if !filepath.IsAbs(p) {
+			warnings = append(warnings, fmt.Sprintf("leaving relative cache path %s in place", p))
+			continue
+		}
+		info, err := os.Lstat(p)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			warnings = append(warnings, fmt.Sprintf("leaving cache symlink %s in place (ownership cannot be proven)", p))
+			continue
+		}
+		if !info.IsDir() {
+			warnings = append(warnings, fmt.Sprintf("refusing to remove cache path %s because it is not a directory", p))
+			continue
+		}
+		if tlsPath, contains := cacheContainsReferencedTLS(p, certPaths); contains {
+			warnings = append(warnings, fmt.Sprintf("leaving cache directory %s in place because it may contain referenced TLS path %s", p, tlsPath))
+			continue
+		}
+		if !canRemoveVMFlowDir(p) {
+			warnings = append(warnings, fmt.Sprintf("leaving custom cache directory %s in place (missing %s ownership marker)", p, ownedDirMarker))
+			continue
+		}
+		items = append(items, Item{Kind: kindDir, Path: p, Note: "vmflow-owned certificate cache"})
+	}
+	return items, warnings
+}
+
+func colocatedConfig(binaryPath string) (configPath, markerPath string, owned bool) {
+	if strings.TrimSpace(binaryPath) == "" {
+		return "", "", false
+	}
+	dir := filepath.Dir(binaryPath)
+	configPath = filepath.Join(dir, colocatedConfigName)
+	markerPath = filepath.Join(dir, colocatedConfigMarkerName)
+	info, err := os.Lstat(markerPath)
+	return configPath, markerPath, err == nil && info.Mode().IsRegular()
 }
 
 // Print writes the plan (warnings + items) to w.
@@ -138,6 +203,38 @@ func Execute(w io.Writer, items []Item) error {
 				problems = append(problems, fmt.Sprintf("refusing to remove protected path: %s", it.Path))
 				continue
 			}
+			if info, err := os.Lstat(it.Path); err == nil && info.IsDir() {
+				problems = append(problems, fmt.Sprintf("refusing to remove directory as a file: %s", it.Path))
+				continue
+			}
+			if err := os.Remove(it.Path); err != nil && !os.IsNotExist(err) {
+				problems = append(problems, fmt.Sprintf("%s: %v", it.Path, err))
+				continue
+			}
+			fmt.Fprintf(w, "removed %s\n", it.Path)
+		case kindOwnedConfig:
+			if isProtected(it.Path) {
+				problems = append(problems, fmt.Sprintf("refusing to remove protected path: %s", it.Path))
+				continue
+			}
+			info, err := os.Lstat(it.Path)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("cannot inspect colocated config %s: %v", it.Path, err))
+				continue
+			}
+			if info.IsDir() {
+				problems = append(problems, fmt.Sprintf("refusing to remove directory as a config file: %s", it.Path))
+				continue
+			}
+			markerPath := filepath.Join(filepath.Dir(it.Path), colocatedConfigMarkerName)
+			markerInfo, err := os.Lstat(markerPath)
+			if err != nil || !markerInfo.Mode().IsRegular() {
+				problems = append(problems, fmt.Sprintf("refusing to remove colocated config after ownership marker changed: %s", it.Path))
+				continue
+			}
 			if err := os.Remove(it.Path); err != nil && !os.IsNotExist(err) {
 				problems = append(problems, fmt.Sprintf("%s: %v", it.Path, err))
 				continue
@@ -146,6 +243,15 @@ func Execute(w io.Writer, items []Item) error {
 		case kindDir:
 			if isProtected(it.Path) {
 				problems = append(problems, fmt.Sprintf("refusing to remove protected path: %s", it.Path))
+				continue
+			}
+			if _, err := os.Lstat(it.Path); err == nil {
+				if !canRemoveVMFlowDir(it.Path) {
+					problems = append(problems, fmt.Sprintf("refusing to recursively remove directory without vmflow ownership: %s", it.Path))
+					continue
+				}
+			} else if !os.IsNotExist(err) {
+				problems = append(problems, fmt.Sprintf("cannot inspect directory before removal %s: %v", it.Path, err))
 				continue
 			}
 			if err := os.RemoveAll(it.Path); err != nil && !os.IsNotExist(err) {
@@ -194,34 +300,82 @@ func pathExists(p string) bool {
 	return err == nil
 }
 
-// certKind returns kindDir when p is a directory, else kindFile.
-func certKind(p string) string {
-	if info, err := os.Lstat(p); err == nil && info.IsDir() {
-		return kindDir
+func pathLexists(p string) bool {
+	if strings.TrimSpace(p) == "" {
+		return false
 	}
-	return kindFile
+	_, err := os.Lstat(p)
+	return err == nil
 }
 
-// certPathsFromConfig loads the config at cfgPath and returns the certificate /
-// key / cache paths it references. A config that fails to parse yields nothing
-// (the config file itself is still removed by its own Item).
-func certPathsFromConfig(cfgPath string) []string {
+// cleanupPathsFromConfig returns individual certificate files separately from
+// cache directories. A config that fails to parse yields no paths; the config
+// file itself is still removed by its own Item.
+func cleanupPathsFromConfig(cfgPath string) (certFiles, cacheDirs []string) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
-	var paths []string
-	add := func(p string) {
+	add := func(dst *[]string, p string) {
 		if p = strings.TrimSpace(p); p != "" {
-			paths = append(paths, p)
+			*dst = append(*dst, p)
 		}
 	}
-	add(cfg.ControlTLS.CertFile)
-	add(cfg.ControlTLS.KeyFile)
-	add(cfg.ControlTLS.ClientCAFile)
-	add(cfg.AcmeCacheDir)
-	add(cfg.CertCacheDir)
-	return paths
+	add(&certFiles, cfg.ControlTLS.CertFile)
+	add(&certFiles, cfg.ControlTLS.KeyFile)
+	add(&certFiles, cfg.ControlTLS.ClientCAFile)
+	add(&cacheDirs, cfg.AcmeCacheDir)
+	add(&cacheDirs, cfg.CertCacheDir)
+	return certFiles, cacheDirs
+}
+
+const ownedDirMarker = ".vmflow-owned"
+
+func canRemoveVMFlowDir(path string) bool {
+	clean := filepath.Clean(path)
+	for _, known := range defaultLogPaths() {
+		if samePath(clean, filepath.Clean(known)) {
+			return true
+		}
+	}
+	info, err := os.Lstat(filepath.Join(clean, ownedDirMarker))
+	return err == nil && info.Mode().IsRegular()
+}
+
+func cacheContainsReferencedTLS(cacheDir string, certPaths []string) (string, bool) {
+	resolvedCache := resolvedExistingPath(cacheDir)
+	for _, certPath := range certPaths {
+		// Runtime-relative paths depend on the daemon's working directory, which
+		// the uninstaller cannot reconstruct safely. Preserve the cache rather
+		// than risk removing the referenced file indirectly.
+		if !filepath.IsAbs(certPath) {
+			return certPath, true
+		}
+		resolvedCert := resolvedExistingPath(certPath)
+		rel, err := filepath.Rel(resolvedCache, resolvedCert)
+		if err != nil {
+			continue
+		}
+		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+			return certPath, true
+		}
+	}
+	return "", false
+}
+
+func resolvedExistingPath(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(path)
+}
+
+func samePath(left, right string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 // packageOwner returns a "tool: owner" label when the binary is managed by
@@ -251,8 +405,7 @@ func packageOwner(path string) string {
 }
 
 // isProtected reports whether removing path would be dangerous (a system root
-// or the user's home directory itself). Config-referenced certificate paths are
-// validated through this before deletion.
+// or the user's home directory itself).
 func isProtected(path string) bool {
 	clean := filepath.Clean(path)
 	if isProtectedPath(clean) {

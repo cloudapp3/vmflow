@@ -102,8 +102,15 @@ func (rule Rule) RuntimeEqual(other Rule) bool {
 		left.TargetPort == right.TargetPort &&
 		left.Enabled == right.Enabled &&
 		left.SpeedLimit == right.SpeedLimit &&
-		left.MaxConn == right.MaxConn &&
+		runtimeMaxConn(left) == runtimeMaxConn(right) &&
 		left.IdleTimeout == right.IdleTimeout
+}
+
+func runtimeMaxConn(rule Rule) int {
+	if rule.Protocol == ProtocolUDP && rule.MaxConn == 0 {
+		return DefaultUDPRuleMaxSessions
+	}
+	return rule.MaxConn
 }
 
 type ApplySnapshotOptions struct {
@@ -137,12 +144,46 @@ type ApplyResult struct {
 	Items        []ApplyItemResult `json:"items"`
 }
 
+// ApplyFailure identifies the operation that prevented a transactional
+// snapshot from being committed. Validation failures are also listed in
+// Apply.Items; this field points at the first failure that stopped the batch.
+type ApplyFailure struct {
+	RuleID   string `json:"rule_id,omitempty"`
+	Revision int64  `json:"revision,omitempty"`
+	Error    string `json:"error"`
+}
+
+// RollbackItemResult reports the outcome of reverting one successfully applied
+// rule operation. Action is the original operation being reverted.
+type RollbackItemResult struct {
+	RuleID string      `json:"rule_id"`
+	Action ApplyAction `json:"action"`
+	Status string      `json:"status"`
+	Error  string      `json:"error,omitempty"`
+}
+
+type RollbackResult struct {
+	Attempted bool                 `json:"attempted"`
+	Failed    bool                 `json:"failed"`
+	Items     []RollbackItemResult `json:"items,omitempty"`
+}
+
+// TransactionalApplyResult separates the error that stopped the desired
+// snapshot from any error encountered while restoring the previous snapshot.
+type TransactionalApplyResult struct {
+	Apply        ApplyResult    `json:"apply"`
+	ApplyFailure *ApplyFailure  `json:"apply_failure,omitempty"`
+	Rollback     RollbackResult `json:"rollback"`
+}
+
 type TrafficSnapshot struct {
-	RuleID        string `json:"rule_id"`
-	UploadBytes   int64  `json:"upload_bytes"`
-	DownloadBytes int64  `json:"download_bytes"`
-	Conns         int64  `json:"conns"`
-	UpdatedTime   int64  `json:"updated_time"`
+	RuleID             string `json:"rule_id"`
+	UploadBytes        int64  `json:"upload_bytes"`
+	DownloadBytes      int64  `json:"download_bytes"`
+	Conns              int64  `json:"conns"`
+	UDPSessionRejected int64  `json:"udp_session_rejected_total,omitempty"`
+	UDPPacketsDropped  int64  `json:"udp_packets_dropped_total,omitempty"`
+	UpdatedTime        int64  `json:"updated_time"`
 }
 
 func standardizeProtocol(value Protocol) Protocol {

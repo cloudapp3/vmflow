@@ -32,20 +32,12 @@ func platformInstall(cfg Config, w io.Writer) error {
 	}
 
 	path := plistPath(cfg)
-	if err := writeFileAtomic(path, []byte(launchdPlist(cfg)), 0o644); err != nil {
-		return fmt.Errorf("write plist: %w", err)
+	if err := installLaunchdDaemon(cfg, path, runCombined); err != nil {
+		return err
 	}
 	fmt.Fprintf(w, "installed %s\n", path)
 
 	label := launchdLabel(cfg)
-	// If a previous generation is still loaded, unload it first so bootstrap
-	// picks up the new plist cleanly.
-	_, _ = runCombined([]string{"launchctl", "bootout", "system/" + label})
-
-	out, err := runCombined([]string{"launchctl", "bootstrap", "system", path})
-	if err != nil {
-		return fmt.Errorf("launchctl bootstrap: %w (%s)", err, strings.TrimSpace(string(out)))
-	}
 	fmt.Fprintf(w, "daemon %s loaded and started\n", label)
 	fmt.Fprintf(w, "logs: %s , %s   |   status: vmflow service status\n", logStdout(cfg), logStderr(cfg))
 	return nil

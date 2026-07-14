@@ -59,3 +59,13 @@ func TestRuntimeWithCollector(t *testing.T) {
 		t.Fatalf("expected manager")
 	}
 }
+
+func TestRuntimeConfiguresUDPMaxSessions(t *testing.T) {
+	rt := NewRuntime(Options{UDPMaxSessions: 123})
+	defer rt.Close()
+
+	limit, active := rt.Manager().UDPMaxSessions()
+	if limit != 123 || active != 0 {
+		t.Fatalf("UDPMaxSessions = (%d, %d), want (123, 0)", limit, active)
+	}
+}

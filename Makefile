@@ -1,4 +1,4 @@
-.PHONY: build test vet fmt run smoke clean
+.PHONY: build test race bench vet fmt run smoke clean
 
 BINARY ?= vmflow
 CONFIG ?= ./examples/config.yaml
@@ -11,6 +11,12 @@ build:
 test:
 	GOCACHE=$(GOCACHE) go test ./...
 
+race:
+	GOCACHE=$(GOCACHE) go test -race ./engine ./metrics ./precheck ./controlapi ./config .
+
+bench:
+	GOCACHE=$(GOCACHE) go test ./engine ./metrics ./precheck -run '^$$' -bench . -benchmem
+
 vet:
 	GOCACHE=$(GOCACHE) go vet ./...
 
@@ -18,7 +24,7 @@ fmt:
 	gofmt -w $(GO_FILES)
 
 run:
-	GOCACHE=$(GOCACHE) GOFLAGS=-buildvcs=false go run ./cmd/vmflow daemon -config $(CONFIG)
+	GOCACHE=$(GOCACHE) GOFLAGS=-buildvcs=false go run ./cmd/vmflow -config $(CONFIG)
 
 smoke:
 	GOCACHE=$(GOCACHE) GOFLAGS=-buildvcs=false go run ./cmd/vmflow version

@@ -1,45 +1,49 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
 
 // ── Color Constants (Tokyo Night) ──────────────────────────────────
 
 var (
-	CText   = lipgloss.Color("#c0caf5")
-	CDim    = lipgloss.Color("#565f89")
-	CBorder = lipgloss.Color("#3b4261")
+	CText   = lipgloss.AdaptiveColor{Light: "#1f2937", Dark: "#c0caf5"}
+	CDim    = lipgloss.AdaptiveColor{Light: "#667085", Dark: "#7f849c"}
+	CBorder = lipgloss.AdaptiveColor{Light: "#cbd5e1", Dark: "#3b4261"}
 
-	CCyan   = lipgloss.Color("#7dcfff")
-	CGreen  = lipgloss.Color("#9ece6a")
-	CYellow = lipgloss.Color("#e0af68")
-	CRed    = lipgloss.Color("#f7768e")
-	CPurple = lipgloss.Color("#bb9af7")
-	CBlue   = lipgloss.Color("#7aa2f7")
-	COrange = lipgloss.Color("#ff9e64")
-	CTeal   = lipgloss.Color("#73daca")
+	CCyan   = lipgloss.AdaptiveColor{Light: "#0e7490", Dark: "#7dcfff"}
+	CGreen  = lipgloss.AdaptiveColor{Light: "#15803d", Dark: "#9ece6a"}
+	CYellow = lipgloss.AdaptiveColor{Light: "#a16207", Dark: "#e0af68"}
+	CRed    = lipgloss.AdaptiveColor{Light: "#b42318", Dark: "#f7768e"}
+	CPurple = lipgloss.AdaptiveColor{Light: "#7e22ce", Dark: "#bb9af7"}
+	CBlue   = lipgloss.AdaptiveColor{Light: "#1d4ed8", Dark: "#7aa2f7"}
+	COrange = lipgloss.AdaptiveColor{Light: "#c2410c", Dark: "#ff9e64"}
+	CTeal   = lipgloss.AdaptiveColor{Light: "#0f766e", Dark: "#73daca"}
 
 	// Upload / Download accent
-	CUpload   = lipgloss.Color("#ff79c6")
-	CDownload = lipgloss.Color("#00ff87")
+	CUpload   = lipgloss.AdaptiveColor{Light: "#be185d", Dark: "#ff79c6"}
+	CDownload = lipgloss.AdaptiveColor{Light: "#047857", Dark: "#00ff87"}
 
 	// 4-tier threshold
-	COk       = lipgloss.Color("#00ff87")
-	CWarn     = lipgloss.Color("#ffd700")
-	CAlert    = lipgloss.Color("#ffaf5f")
-	CCritical = lipgloss.Color("#ff5555")
+	COk       = lipgloss.AdaptiveColor{Light: "#15803d", Dark: "#00ff87"}
+	CWarn     = lipgloss.AdaptiveColor{Light: "#a16207", Dark: "#ffd700"}
+	CAlert    = lipgloss.AdaptiveColor{Light: "#c2410c", Dark: "#ffaf5f"}
+	CCritical = lipgloss.AdaptiveColor{Light: "#b42318", Dark: "#ff5555"}
 
-	CMuted = lipgloss.Color("#6c6c6c")
-	CInfo  = lipgloss.Color("#5fafff")
+	CMuted = lipgloss.AdaptiveColor{Light: "#6b7280", Dark: "#6c6c6c"}
+	CInfo  = lipgloss.AdaptiveColor{Light: "#2563eb", Dark: "#5fafff"}
 
 	// Row background alternating
-	CRowA = lipgloss.Color("#1A1B26")
-	CRowB = lipgloss.Color("#161623")
-	CSel  = lipgloss.Color("#2D4F67")
+	CRowA = lipgloss.AdaptiveColor{Light: "#f8fafc", Dark: "#1a1b26"}
+	CRowB = lipgloss.AdaptiveColor{Light: "#eef2f7", Dark: "#1f2335"}
+	CSel  = lipgloss.AdaptiveColor{Light: "#dbeafe", Dark: "#283457"}
 )
 
 // ── Threshold Helpers ──────────────────────────────────────────────
 
-func ThresholdColor(pct float64) lipgloss.Color {
+func ThresholdColor(pct float64) lipgloss.TerminalColor {
 	switch {
 	case pct >= 90:
 		return CCritical
@@ -72,7 +76,7 @@ var (
 
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(CText)
+			Foreground(CBlue)
 
 	subtleStyle = lipgloss.NewStyle().
 			Foreground(CDim)
@@ -103,12 +107,32 @@ var (
 
 	selectedStyle = lipgloss.NewStyle().
 			Background(CSel).
-			Foreground(CText)
+			Foreground(CText).
+			Bold(true)
 
 	protoTCPStyle  = lipgloss.NewStyle().Foreground(CCyan)
 	protoUDPStyle  = lipgloss.NewStyle().Foreground(CYellow)
 	protoBothStyle = lipgloss.NewStyle().Foreground(CPurple)
 )
+
+// protocolStyle picks the color style for a protocol string (tcp/udp/tcp+udp).
+func protocolStyle(p string) lipgloss.Style {
+	switch p {
+	case "tcp":
+		return protoTCPStyle
+	case "udp":
+		return protoUDPStyle
+	case "tcp+udp":
+		return protoBothStyle
+	default:
+		return valueStyle
+	}
+}
+
+// protocolLabel renders an upper-cased protocol padded to width for column use.
+func protocolLabel(p string) string {
+	return protocolStyle(p).Width(7).Render(strings.ToUpper(p))
+}
 
 // ── Layout Constants ───────────────────────────────────────────────
 
@@ -139,6 +163,13 @@ func detectLayout(width int) layoutMode {
 // calcFullWidth returns the width for a full-width panel.
 func calcFullWidth(totalW int) int {
 	return max(totalW-4, 30)
+}
+
+// panelInnerWidth is the usable content width inside panelStyle. Lip Gloss
+// includes horizontal padding in Style.Width, so content that uses the full
+// style width would wrap by the two padding cells.
+func panelInnerWidth(panelWidth int) int {
+	return max(panelWidth-2, 1)
 }
 
 // calcRowWidths returns (leftW, rightW) for a two-column layout.

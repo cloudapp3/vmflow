@@ -4,7 +4,7 @@ project_name: vmflow
 
 before:
   hooks:
-    - go mod tidy
+    - go mod verify
 
 builds:
   - id: vmflow
@@ -44,10 +44,11 @@ archives:
     files:
       - LICENSE
       - README.md
-      - docs/CHANGELOG.md
-      - docs/API.md
-      - docs/EMBEDDING.md
-      - examples/config.yaml
+      - THIRD_PARTY_NOTICES.md
+      - third_party_licenses/**
+      - src: examples/config.yaml
+        dst: .
+        strip_parent: true
 
 checksum:
   name_template: checksums.txt
@@ -70,25 +71,3 @@ release:
   draft: false
   prerelease: auto
   mode: replace
-
-nfpms:
-  - id: packages
-    package_name: vmflow
-    maintainer: cloudapp3
-    description: L4 forwarding runtime
-    homepage: https://github.com/cloudapp3/vmflow
-    license: MIT
-    formats:
-      - deb
-      - rpm
-    contents:
-      - src: ./LICENSE
-        dst: /usr/share/doc/vmflow/LICENSE
-      - src: ./README.md
-        dst: /usr/share/doc/vmflow/README.md
-      - src: ./packaging/vmflow.service
-        dst: /usr/lib/systemd/system/vmflow.service
-        type: config
-    scripts:
-      postinstall: ./packaging/postinstall
-      preremove: ./packaging/preremove

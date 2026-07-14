@@ -1,9 +1,0 @@
-#!/bin/sh
-# nfpm preremove (maps to deb prerm / rpm %preun).
-# Stop and disable the service before the binary is removed.
-set -e
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl stop vmflow 2>/dev/null || true
-  systemctl disable vmflow 2>/dev/null || true
-fi

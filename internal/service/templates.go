@@ -5,18 +5,26 @@ import (
 	"strings"
 )
 
-// daemonArgs builds the daemon command-line arguments (after the binary path)
-// shared across platforms. logFileFlag controls whether -log-file is appended
-// (macOS uses launchd capture paths instead and omits it).
-func daemonArgs(cfg Config, logFileFlag bool) []string {
-	args := []string{"daemon", "-config", cfg.ConfigPath}
+// foregroundArgs builds the runtime arguments after the binary path. Service
+// managers supervise the foreground process directly. logFileFlag controls
+// whether -log-file is appended (macOS captures stdout/stderr itself).
+func foregroundArgs(cfg Config, logFileFlag bool) []string {
+	args := []string{"-config", cfg.ConfigPath}
 	if logFileFlag {
 		if lp := strings.TrimSpace(cfg.LogFile); lp != "" {
 			args = append(args, "-log-file", lp)
 		}
 	}
-	if ea := strings.TrimSpace(cfg.ExtraArgs); ea != "" {
-		args = append(args, ea)
+	if addr := strings.TrimSpace(cfg.ControlListen); addr != "" {
+		args = append(args, "-control-listen", addr)
+	}
+	if cfg.InsecureAllowRemoteControl {
+		args = append(args, "-insecure-allow-remote-control")
+	}
+	for _, extraArg := range cfg.ExtraArgs {
+		if extraArg = strings.TrimSpace(extraArg); extraArg != "" {
+			args = append(args, extraArg)
+		}
 	}
 	return args
 }
@@ -25,7 +33,7 @@ func daemonArgs(cfg Config, logFileFlag bool) []string {
 // token is double-quoted so paths containing spaces survive systemd's parser.
 func systemdExecStart(cfg Config) string {
 	tokens := []string{shellQuote(cfg.BinaryPath)}
-	for _, a := range daemonArgs(cfg, true) {
+	for _, a := range foregroundArgs(cfg, true) {
 		tokens = append(tokens, shellQuote(a))
 	}
 	return strings.Join(tokens, " ")
@@ -78,7 +86,7 @@ func launchdLabel(cfg Config) string {
 // arrays are already tokenized, so values are NOT quoted.
 func plistProgramArguments(cfg Config) string {
 	var b strings.Builder
-	args := append([]string{cfg.BinaryPath}, daemonArgs(cfg, false)...)
+	args := append([]string{cfg.BinaryPath}, foregroundArgs(cfg, false)...)
 	for _, a := range args {
 		b.WriteString("    <string>")
 		// escape XML special chars
@@ -126,19 +134,4 @@ func launchdPlist(cfg Config) string {
 </dict>
 </plist>
 `, launchdLabel(cfg), plistProgramArguments(cfg), stdout, stderr)
-}
-
-// scBinPath renders the binPath= value for `sc create` on Windows. sc.exe has a
-// peculiar parser: the entire command line is wrapped in outer quotes and inner
-// exe/config paths are escaped with backslash-quotes. This is the documented
-// form that survives spaces in "Program Files".
-func scBinPath(cfg Config) string {
-	cmd := fmt.Sprintf("\\\"%s\\\" daemon -config \\\"%s\\\"", cfg.BinaryPath, cfg.ConfigPath)
-	if lp := strings.TrimSpace(cfg.LogFile); lp != "" {
-		cmd += fmt.Sprintf(" -log-file \\\"%s\\\"", lp)
-	}
-	if ea := strings.TrimSpace(cfg.ExtraArgs); ea != "" {
-		cmd += " " + ea
-	}
-	return "\"" + cmd + "\""
 }

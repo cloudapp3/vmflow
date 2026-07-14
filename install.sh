@@ -3,6 +3,8 @@ set -euo pipefail
 
 REPO="cloudapp3/vmflow"
 BINARY_NAME="vmflow"
+CONFIG_NAME="config.yaml"
+CONFIG_MARKER_NAME=".vmflow-config-owned"
 INSTALL_DIR="${VMFLOW_INSTALL_DIR:-}"
 VERSION=""
 SKIP_VERIFY=0
@@ -27,7 +29,6 @@ Options:
 Examples:
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --dir /usr/local/bin
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash -s -- --version v0.1.0
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --uninstall
 EOF
 }
@@ -40,6 +41,17 @@ die() {
   log "Error: $*"
   exit 1
 }
+
+# create_exclusive_file opens target once with noclobber enabled. This prevents
+# a path inserted after validation from redirecting a privileged write through
+# a symlink or overwriting an operator-created file.
+create_exclusive_file() (
+  target="$1"
+  shift
+  umask 077
+  set -o noclobber
+  "$@" >"$target"
+)
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
@@ -67,25 +79,29 @@ path_has_dir() (
 print_path_hint() {
   local install_dir="$1"
   local target_path="$2"
+  local config_path="$3"
 
   if path_has_dir "$install_dir"; then
     log "Verify the installation with:"
     log "  ${BINARY_NAME} version"
-    return
+  else
+    log "Warning: ${install_dir} is not in your PATH, so running \"${BINARY_NAME}\" may fail."
+    log ""
+    log "You can run it directly with:"
+    log "  \"${target_path}\" version"
+    log ""
+    if [ "$install_dir" != "/usr/local/bin" ]; then
+      log "To make \"${BINARY_NAME}\" available globally, either create a symlink:"
+      log "  sudo ln -sf \"${target_path}\" \"/usr/local/bin/${BINARY_NAME}\""
+      log ""
+    fi
+    log "Or add ${install_dir} to your shell PATH:"
+    log "  export PATH=\"${install_dir}:\$PATH\""
   fi
 
-  log "Warning: ${install_dir} is not in your PATH, so running \"${BINARY_NAME}\" may fail."
   log ""
-  log "You can run it directly with:"
-  log "  \"${target_path}\" version"
-  log ""
-  if [ "$install_dir" != "/usr/local/bin" ]; then
-    log "To make \"${BINARY_NAME}\" available globally, either create a symlink:"
-    log "  sudo ln -sf \"${target_path}\" \"/usr/local/bin/${BINARY_NAME}\""
-    log ""
-  fi
-  log "Or add ${install_dir} to your shell PATH:"
-  log "  export PATH=\"${install_dir}:\$PATH\""
+  log "Start vmflow (loads ${config_path} by default):"
+  log "  \"${target_path}\""
 }
 
 # stop_service best-effort stops and removes the native service (systemd on
@@ -103,8 +119,8 @@ stop_service() {
 }
 
 # do_uninstall removes vmflow. It delegates to `vmflow uninstall` when the
-# installed binary supports it (full cleanup incl. certificates); otherwise it
-# falls back to a shell-level removal of service/binary/config/logs/cache.
+# installed binary supports it; otherwise it falls back to a shell-level
+# removal of service/binary/config/logs/cache.
 do_uninstall() {
   # Locate the installed binary: explicit --dir, then PATH, then common spots.
   TARGET=""
@@ -129,27 +145,40 @@ do_uninstall() {
   log "vmflow binary not found (or too old for self-uninstall) at ${TARGET:-<none>}; cleaning up via shell."
 
   case "$(uname -s)" in
-    Linux)  CFG="/etc/vmflow/config.yaml" ;;
-    Darwin) CFG="/usr/local/etc/vmflow/config.yaml" ;;
-    *)      CFG="" ;;
+    Linux)  SYSTEM_CFG="/etc/vmflow/config.yaml" ;;
+    Darwin) SYSTEM_CFG="/usr/local/etc/vmflow/config.yaml" ;;
+    *)      SYSTEM_CFG="" ;;
   esac
+  COLOCATED_CFG=""
+  COLOCATED_CFG_MARKER=""
+  if [ -n "$TARGET" ]; then
+    COLOCATED_CFG="$(dirname "$TARGET")/${CONFIG_NAME}"
+    COLOCATED_CFG_MARKER="$(dirname "$TARGET")/${CONFIG_MARKER_NAME}"
+  fi
   CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/vmflow"
+  CACHE_FILE="${CACHE_DIR}/update-check.json"
 
   # Build the removal plan (only entries that exist).
-  PLAN=""
-  if [ -n "$TARGET" ] && [ -x "$TARGET" ]; then PLAN="$PLAN $TARGET"; fi
-  if [ -n "$CFG" ] && [ -e "$CFG" ]; then PLAN="$PLAN $CFG"; fi
-  if [ -d /var/log/vmflow ]; then PLAN="$PLAN /var/log/vmflow"; fi
-  if [ -d "$CACHE_DIR" ]; then PLAN="$PLAN $CACHE_DIR"; fi
+  PLAN=()
+  if [ -n "$TARGET" ] && [ -x "$TARGET" ]; then PLAN+=("$TARGET"); fi
+  if [ -n "$COLOCATED_CFG_MARKER" ] && [ -f "$COLOCATED_CFG_MARKER" ] && [ ! -L "$COLOCATED_CFG_MARKER" ]; then
+    if [ -e "$COLOCATED_CFG" ] || [ -L "$COLOCATED_CFG" ]; then PLAN+=("$COLOCATED_CFG"); fi
+    PLAN+=("$COLOCATED_CFG_MARKER")
+  elif [ -n "$COLOCATED_CFG" ] && { [ -e "$COLOCATED_CFG" ] || [ -L "$COLOCATED_CFG" ]; }; then
+    log "Preserving unowned colocated config: $COLOCATED_CFG"
+  fi
+  if [ -n "$SYSTEM_CFG" ] && [ "$SYSTEM_CFG" != "$COLOCATED_CFG" ] && [ -e "$SYSTEM_CFG" ]; then PLAN+=("$SYSTEM_CFG"); fi
+  if [ -d /var/log/vmflow ]; then PLAN+=("/var/log/vmflow"); fi
+  if [ -f "$CACHE_FILE" ]; then PLAN+=("$CACHE_FILE"); fi
 
-  if [ -z "$PLAN" ]; then
+  if [ "${#PLAN[@]}" -eq 0 ]; then
     stop_service
     log "Nothing left to remove."
     exit 0
   fi
 
   log "The following will be removed:"
-  for t in $PLAN; do log "  - $t"; done
+  for t in "${PLAN[@]}"; do log "  - $t"; done
 
   # Confirm only when stdin is a terminal; skip under `curl | bash` pipes.
   if [ -t 0 ]; then
@@ -163,16 +192,36 @@ do_uninstall() {
 
   stop_service
 
-  for t in $PLAN; do
-    if rm -rf -- "$t" 2>/dev/null; then
+  for t in "${PLAN[@]}"; do
+    if [ -n "$COLOCATED_CFG" ] && [ "$t" = "$COLOCATED_CFG" ]; then
+      if [ ! -f "$COLOCATED_CFG_MARKER" ] || [ -L "$COLOCATED_CFG_MARKER" ]; then
+        log "warning: preserving colocated config because its ownership marker changed: $t"
+        continue
+      fi
+    fi
+
+    if [ "$t" = "/var/log/vmflow" ]; then
+      remove_cmd=(rm -rf -- "$t")
+    elif [ -d "$t" ] && [ ! -L "$t" ]; then
+      log "warning: refusing to recursively remove a directory planned as a file: $t"
+      continue
+    else
+      remove_cmd=(rm -f -- "$t")
+    fi
+
+    if "${remove_cmd[@]}" 2>/dev/null; then
       log "removed $t"
     else
       log "warning: could not remove $t (try running with sudo)"
     fi
   done
 
+  # Remove the cache directory only when it is empty. It may live under a
+  # caller-provided XDG_CACHE_HOME and must never be recursively purged.
+  rmdir "$CACHE_DIR" 2>/dev/null || true
+
   log "vmflow uninstalled."
-  log "Note: TLS/ACME certificate files referenced by the config are not purged by this shell path; install the binary and run \`vmflow uninstall\` to remove them too."
+  log "External TLS certificate and key files referenced by the config are preserved."
 }
 
 while [ "$#" -gt 0 ]; do
@@ -325,7 +374,7 @@ fi
 log "Extracting archive..."
 # --no-same-owner: do not restore attacker-controlled uid/gid from the archive
 # when this script runs as root (e.g. curl|sudo bash). Extraction still happens
-# in a private mktemp dir and we only install the single binary by name.
+# in a private mktemp dir and we only install the expected files by name.
 tar --no-same-owner -xzf "$ARCHIVE_PATH" -C "$TMPDIR"
 
 BINARY_PATH="${TMPDIR}/${BINARY_NAME}"
@@ -334,12 +383,33 @@ if [ ! -f "$BINARY_PATH" ]; then
 fi
 [ -n "${BINARY_PATH}" ] && [ -f "$BINARY_PATH" ] || die "failed to find ${BINARY_NAME} in archive"
 
+# Release archives place config.yaml beside the binary.
+CONFIG_SOURCE="${TMPDIR}/${CONFIG_NAME}"
+[ -f "$CONFIG_SOURCE" ] && [ ! -L "$CONFIG_SOURCE" ] \
+  || die "release ${VERSION} is incompatible with this installer: expected a top-level regular ${CONFIG_NAME}"
+
 if [ ! -d "$INSTALL_DIR" ]; then
   mkdir -p "$INSTALL_DIR" 2>/dev/null || die "cannot create install directory: ${INSTALL_DIR}"
 fi
 [ -w "$INSTALL_DIR" ] || die "install directory is not writable: ${INSTALL_DIR}"
 
 TARGET_PATH="${INSTALL_DIR}/${BINARY_NAME}"
+TARGET_CONFIG_PATH="${INSTALL_DIR}/${CONFIG_NAME}"
+TARGET_CONFIG_MARKER="${INSTALL_DIR}/${CONFIG_MARKER_NAME}"
+CONFIG_MARKER_EXISTS=0
+if [ -e "$TARGET_CONFIG_MARKER" ] || [ -L "$TARGET_CONFIG_MARKER" ]; then
+  [ -f "$TARGET_CONFIG_MARKER" ] && [ ! -L "$TARGET_CONFIG_MARKER" ] \
+    || die "existing config ownership marker is not a regular file: ${TARGET_CONFIG_MARKER}"
+  CONFIG_MARKER_EXISTS=1
+fi
+if [ -e "$TARGET_CONFIG_PATH" ] || [ -L "$TARGET_CONFIG_PATH" ]; then
+  [ -f "$TARGET_CONFIG_PATH" ] && [ ! -L "$TARGET_CONFIG_PATH" ] \
+    || die "existing config path is not a regular file: ${TARGET_CONFIG_PATH}"
+  INSTALL_CONFIG=0
+else
+  INSTALL_CONFIG=1
+fi
+
 if command -v install >/dev/null 2>&1; then
   install -m 0755 "$BINARY_PATH" "$TARGET_PATH" \
     || die "failed to install ${BINARY_NAME} to ${TARGET_PATH}"
@@ -350,6 +420,22 @@ else
     || die "failed to chmod ${TARGET_PATH}"
 fi
 
-log "Installed ${BINARY_NAME} ${VERSION} to ${TARGET_PATH}"
+if [ "$INSTALL_CONFIG" -eq 1 ]; then
+  create_exclusive_file "$TARGET_CONFIG_PATH" cat "$CONFIG_SOURCE" \
+    || die "failed to create ${CONFIG_NAME} without overwriting an existing path: ${TARGET_CONFIG_PATH}"
+  if [ "$CONFIG_MARKER_EXISTS" -eq 1 ]; then
+    [ -f "$TARGET_CONFIG_MARKER" ] && [ ! -L "$TARGET_CONFIG_MARKER" ] \
+      || die "config was installed, but its existing ownership marker changed: ${TARGET_CONFIG_MARKER}"
+  elif ! create_exclusive_file "$TARGET_CONFIG_MARKER" printf 'vmflow\n'; then
+    die "config was installed and left in place, but the ownership marker could not be created safely: ${TARGET_CONFIG_MARKER}"
+  fi
+fi
 
-print_path_hint "$INSTALL_DIR" "$TARGET_PATH"
+log "Installed ${BINARY_NAME} ${VERSION} to ${TARGET_PATH}"
+if [ "$INSTALL_CONFIG" -eq 1 ]; then
+  log "Installed default config to ${TARGET_CONFIG_PATH}"
+else
+  log "Preserved existing config at ${TARGET_CONFIG_PATH}"
+fi
+
+print_path_hint "$INSTALL_DIR" "$TARGET_PATH" "$TARGET_CONFIG_PATH"

@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/cloudapp3/vmflow/engine"
+)
 
 func TestParseDefaultsControlListenAddr(t *testing.T) {
 	cfg, err := Parse([]byte(`
@@ -22,6 +26,27 @@ rules:
 	}
 	if cfg.ControlListenAddr != DefaultControlListenAddr {
 		t.Fatalf("expected default control addr %s, got %s", DefaultControlListenAddr, cfg.ControlListenAddr)
+	}
+	if cfg.UDPMaxSessions != engine.DefaultUDPGlobalMaxSessions {
+		t.Fatalf("expected default UDP session limit %d, got %d", engine.DefaultUDPGlobalMaxSessions, cfg.UDPMaxSessions)
+	}
+}
+
+func TestParseUDPMaxSessions(t *testing.T) {
+	cfg, err := Parse([]byte("udp_max_sessions: 2048\nrules: []\n"))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if cfg.UDPMaxSessions != 2048 {
+		t.Fatalf("udp_max_sessions = %d, want 2048", cfg.UDPMaxSessions)
+	}
+}
+
+func TestParseRejectsInvalidUDPMaxSessions(t *testing.T) {
+	for _, value := range []string{"-1", "4097"} {
+		if _, err := Parse([]byte("udp_max_sessions: " + value + "\nrules: []\n")); err == nil {
+			t.Fatalf("expected udp_max_sessions=%s to be rejected", value)
+		}
 	}
 }
 
@@ -105,5 +130,32 @@ rules: []
 `))
 	if err == nil {
 		t.Fatal("expected invalid role error")
+	}
+}
+
+func TestParseRejectsClientCAWithoutServerKeyPair(t *testing.T) {
+	_, err := Parse([]byte(`
+control_tls:
+  client_ca_file: clients-ca.crt
+rules: []
+`))
+	if err == nil {
+		t.Fatal("expected client CA without server cert and key to be rejected")
+	}
+}
+
+func TestParseBotControlToken(t *testing.T) {
+	cfg, err := Parse([]byte(`
+version: 1
+bot_token: "123:abc"
+bot_chat: 111
+bot_control_token: "admin-secret"
+rules: []
+`))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if cfg.BotToken != "123:abc" || cfg.BotChat != 111 || cfg.BotControlToken != "admin-secret" {
+		t.Fatalf("bot fields = %q %d %q", cfg.BotToken, cfg.BotChat, cfg.BotControlToken)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/cloudapp3/vmflow/config"
@@ -16,7 +17,14 @@ import (
 // ClientCAFile enables mutual TLS: every client must present a certificate
 // signed by that CA.
 func BuildServerTLSConfig(cfg config.ControlTLSConfig) (*tls.Config, error) {
+	cfg.CertFile = strings.TrimSpace(cfg.CertFile)
+	cfg.KeyFile = strings.TrimSpace(cfg.KeyFile)
+	cfg.ClientCAFile = strings.TrimSpace(cfg.ClientCAFile)
+	cfg.MinVersion = strings.TrimSpace(cfg.MinVersion)
 	if cfg.CertFile == "" && cfg.KeyFile == "" {
+		if cfg.ClientCAFile != "" {
+			return nil, fmt.Errorf("control_tls: client_ca_file requires cert_file and key_file")
+		}
 		return nil, nil
 	}
 	if cfg.CertFile == "" || cfg.KeyFile == "" {

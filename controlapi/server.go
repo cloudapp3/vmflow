@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudapp3/vmflow/certreview"
@@ -28,7 +30,39 @@ type Runtime struct {
 	PrecheckOptions *precheck.Options
 	CertStore       *certstore.Store
 	CertReviewer    *certreview.Reviewer
-	limiterInst     *ipLimiter
+	// Bot controls the Telegram bot lifecycle at runtime. May be nil when bot
+	// support is disabled; bot config endpoints report unavailable then.
+	Bot BotController
+	// StartupConfig is the normalized file configuration used to start the
+	// daemon. Reload uses it to reject changes to restart-only fields.
+	StartupConfig *config.File
+	limiterInst   *ipLimiter
+	reloadMu      sync.Mutex
+	stateMu       sync.RWMutex
+	degraded      bool
+	degradedCause string
+	configHooks   *configManagementHooks
+}
+
+// RestartRequiredError reports configuration fields that cannot be changed by
+// hot reload without leaving the API response out of sync with the daemon.
+type RestartRequiredError struct {
+	Fields []string `json:"fields"`
+}
+
+func (err *RestartRequiredError) Error() string {
+	return "configuration changes require daemon restart: " + strings.Join(err.Fields, ", ")
+}
+
+type ReloadApplyError struct {
+	Transaction engine.TransactionalApplyResult `json:"transaction"`
+}
+
+func (err *ReloadApplyError) Error() string {
+	if err == nil || err.Transaction.ApplyFailure == nil {
+		return "reload apply failed"
+	}
+	return "reload apply failed: " + err.Transaction.ApplyFailure.Error
 }
 
 func NewHandler(runtime *Runtime) http.Handler {
@@ -36,17 +70,6 @@ func NewHandler(runtime *Runtime) http.Handler {
 		runtime.limiterInst = newIPLimiter()
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"ok":            true,
-			"running_rules": runtime.runningRules(),
-			"time":          time.Now().Unix(),
-		})
-	})
 	mux.HandleFunc("/v1/rules", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -64,6 +87,7 @@ func NewHandler(runtime *Runtime) http.Handler {
 			"items": runtime.snapshots(),
 		})
 	})
+	runtime.registerConfigManagementHandlers(mux)
 	mux.HandleFunc("/v1/precheck", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -108,22 +132,51 @@ func NewHandler(runtime *Runtime) http.Handler {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "reload blocked by precheck", "precheck": precheckErr.Result})
 				return
 			}
+			var restartErr *RestartRequiredError
+			if errors.As(err, &restartErr) {
+				runtime.log(r).Warn("control reload requires daemon restart", "component", "controlapi", "event", "reload_restart_required", "fields", restartErr.Fields)
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error":  "configuration changes require daemon restart",
+					"fields": restartErr.Fields,
+				})
+				return
+			}
+			var applyErr *ReloadApplyError
+			if errors.As(err, &applyErr) {
+				runtime.metrics().ObserveApplyResult(applyErr.Transaction.Apply)
+				status := http.StatusInternalServerError
+				if applyErr.Transaction.Rollback.Failed {
+					status = http.StatusServiceUnavailable
+				}
+				runtime.log(r).Error("control reload transaction failed", "component", "controlapi", "event", "reload_apply_failed", "rollback_failed", applyErr.Transaction.Rollback.Failed)
+				writeJSON(w, status, map[string]any{
+					"error":       "reload applied with rule failures",
+					"transaction": applyErr.Transaction,
+				})
+				return
+			}
+			if result.FailedRules > 0 {
+				runtime.metrics().ObserveApplyResult(result)
+				runtime.log(r).Error("control reload partially failed", "component", "controlapi", "event", "reload_apply_failed", "error", err, "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules, "failed_rules", result.FailedRules)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{
+					"error":  "reload applied with rule failures",
+					"result": result,
+				})
+				return
+			}
 			runtime.log(r).Error("control reload failed", "component", "controlapi", "event", "reload_failed", "error", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "reload failed; see daemon logs"})
 			return
 		}
-		reloadStatus := "ok"
-		if result.FailedRules > 0 {
-			reloadStatus = "failed"
-		}
-		runtime.metrics().ObserveReload(reloadStatus)
+		runtime.metrics().ObserveReload("ok")
 		runtime.metrics().ObserveApplyResult(result)
 		runtime.log(r).Info("control reload completed", "component", "controlapi", "event", "reload", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules, "failed_rules", result.FailedRules)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"config_path":         filepath.Base(strings.TrimSpace(runtime.ConfigPath)),
-			"control_listen_addr": cfg.ControlListenAddr,
-			"rule_count":          len(cfg.Rules),
-			"result":              result,
+			"config_path":      filepath.Base(strings.TrimSpace(runtime.ConfigPath)),
+			"udp_max_sessions": cfg.UDPMaxSessions,
+			"rule_count":       len(cfg.Rules),
+			"applied_fields":   []string{"rules", "udp_max_sessions"},
+			"result":           result,
 		})
 	})
 	return runtime.withMiddleware(mux)
@@ -133,6 +186,9 @@ func (runtime *Runtime) Reload() (config.File, engine.ApplyResult, error) {
 	if runtime == nil || runtime.Manager == nil {
 		return config.File{}, engine.ApplyResult{}, fmt.Errorf("runtime unavailable")
 	}
+	runtime.reloadMu.Lock()
+	defer runtime.reloadMu.Unlock()
+
 	cfg, checkResult, err := runtime.Precheck()
 	if err != nil {
 		return config.File{}, engine.ApplyResult{}, err
@@ -140,8 +196,79 @@ func (runtime *Runtime) Reload() (config.File, engine.ApplyResult, error) {
 	if !checkResult.OK {
 		return cfg, engine.ApplyResult{}, &precheck.Error{Result: checkResult}
 	}
-	result := runtime.Manager.ApplySnapshot(cfg.Rules, engine.ApplySnapshotOptions{ReplaceAll: true})
+	if fields := runtime.restartRequiredFields(cfg); len(fields) > 0 {
+		return cfg, engine.ApplyResult{}, &RestartRequiredError{Fields: fields}
+	}
+	previousLimit, _ := runtime.Manager.UDPMaxSessions()
+	limitLoweredBeforeApply := cfg.UDPMaxSessions < previousLimit
+	if limitLoweredBeforeApply {
+		// Tighten admission before changing rules so a successful reload cannot
+		// create sessions above the new limit during the apply window.
+		runtime.Manager.SetUDPMaxSessions(cfg.UDPMaxSessions)
+	}
+	transaction := runtime.Manager.ApplySnapshotTransactional(cfg.Rules, engine.ApplySnapshotOptions{ReplaceAll: true})
+	result := transaction.Apply
+	if transaction.ApplyFailure != nil {
+		if limitLoweredBeforeApply {
+			runtime.Manager.SetUDPMaxSessions(previousLimit)
+		}
+		if transaction.Rollback.Failed {
+			runtime.markDegraded("reload rule rollback failed")
+		} else {
+			runtime.markDegraded("configuration reload was not applied; previous runtime restored")
+		}
+		return cfg, result, &ReloadApplyError{Transaction: transaction}
+	}
+	if cfg.UDPMaxSessions > previousLimit {
+		// Do not relax admission until every rule was applied successfully.
+		runtime.Manager.SetUDPMaxSessions(cfg.UDPMaxSessions)
+	}
+	runtime.clearDegraded()
 	return cfg, result, nil
+}
+
+func (runtime *Runtime) restartRequiredFields(next config.File) []string {
+	if runtime == nil || runtime.StartupConfig == nil {
+		return nil
+	}
+	current := *runtime.StartupConfig
+	fields := make([]string, 0, 8)
+	if current.ControlListenAddr != next.ControlListenAddr {
+		fields = append(fields, "control_listen_addr")
+	}
+	if !reflect.DeepEqual(current.ControlTLS, next.ControlTLS) {
+		fields = append(fields, "control_tls")
+	}
+	if !reflect.DeepEqual(current.Log, next.Log) {
+		fields = append(fields, "log")
+	}
+	if !reflect.DeepEqual(current.Auth, next.Auth) {
+		fields = append(fields, "auth")
+	}
+	currentBot := botSettingsFromConfig(current)
+	nextBot := botSettingsFromConfig(next)
+	if currentBot.Token != nextBot.Token {
+		fields = append(fields, "bot_token")
+	}
+	if currentBot.ChatID != nextBot.ChatID {
+		fields = append(fields, "bot_chat")
+	}
+	if currentBot.ControlToken != nextBot.ControlToken {
+		fields = append(fields, "bot_control_token")
+	}
+	if current.AcmeChallenge != next.AcmeChallenge ||
+		current.AcmeHTTP01Addr != next.AcmeHTTP01Addr ||
+		current.AcmeCacheDir != next.AcmeCacheDir ||
+		!reflect.DeepEqual(current.AcmeDNS01, next.AcmeDNS01) {
+		fields = append(fields, "acme")
+	}
+	if current.CertCacheDir != next.CertCacheDir {
+		fields = append(fields, "cert_cache_dir")
+	}
+	if !reflect.DeepEqual(current.CertReview, next.CertReview) {
+		fields = append(fields, "cert_review")
+	}
+	return fields
 }
 
 func (runtime *Runtime) Precheck() (config.File, precheck.Result, error) {
@@ -168,13 +295,6 @@ func (runtime *Runtime) rules() []engine.Rule {
 		return nil
 	}
 	return runtime.Manager.RunningRules()
-}
-
-func (runtime *Runtime) runningRules() int {
-	if runtime == nil || runtime.Manager == nil {
-		return 0
-	}
-	return runtime.Manager.RunningCount()
 }
 
 func (runtime *Runtime) snapshots() []engine.TrafficSnapshot {
