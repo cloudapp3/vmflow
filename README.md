@@ -291,45 +291,6 @@ stats := rt.SnapshotAll()
 
 The embedding application owns persistence, auth, UI, audit logs, and business rules. `vmflow` owns only in-process forwarding, rule lifecycle, and real-time counters. See the [embedding guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/library/runtime.md).
 
-## Development
-
-```bash
-make fmt
-make test
-make race
-make vet
-make smoke
-make build
-make bench
-```
-
-Some tests bind local ports. If your sandbox blocks sockets, run them in an environment that permits local listeners.
-Benchmark methodology and the current loopback baseline are documented in
-[`BENCHMARKS.md`](BENCHMARKS.md).
-
-## Release
-
-Tagged releases are built by GoReleaser through GitHub Actions:
-
-```bash
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
-```
-
-The release workflow publishes cross-platform archives and `checksums.txt`. Linux/macOS users can install with [`install.sh`](install.sh) or unpack an archive manually; vmflow does not publish distro-managed `.deb` or `.rpm` packages.
-
-## Project layout
-
-- `engine/` — protocol forwarding engine and in-memory stats
-- `config/` — YAML config loading and validation
-- `controlapi/` — local control API, auth, reload, precheck, metrics wiring
-- `metrics/` — Prometheus text exposition helpers
-- `precheck/` — static checks before applying rules
-- `tui/` — terminal dashboard client
-- `cmd/vmflow/` — primary all-in-one binary
-- `examples/` — runnable and embeddable examples
-- Documentation — [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs) (architecture, API, embedding, roadmap, changelog; not kept in this repo)
-
 ## License
 
 MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled dependency licenses.
