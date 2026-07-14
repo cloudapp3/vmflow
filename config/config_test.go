@@ -159,3 +159,20 @@ rules: []
 		t.Fatalf("bot fields = %q %d %q", cfg.BotToken, cfg.BotChat, cfg.BotControlToken)
 	}
 }
+
+func TestParseStatsConfig(t *testing.T) {
+	cfg, err := Parse([]byte(`
+version: 1
+stats:
+  persist: true
+  path: /var/lib/vmflow/stats.json
+  flush_interval: 30s
+rules: []
+`))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if !cfg.Stats.Persist || cfg.Stats.Path != "/var/lib/vmflow/stats.json" || cfg.Stats.FlushInterval != "30s" {
+		t.Fatalf("stats config = %+v", cfg.Stats)
+	}
+}

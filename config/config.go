@@ -34,7 +34,16 @@ type File struct {
 	AcmeDNS01         DNS01Config      `json:"acme_dns01,omitempty" yaml:"acme_dns01,omitempty"`
 	CertCacheDir      string           `json:"cert_cache_dir,omitempty" yaml:"cert_cache_dir,omitempty"`
 	CertReview        CertReviewConfig `json:"cert_review,omitempty" yaml:"cert_review,omitempty"`
+	Stats             StatsConfig      `json:"stats,omitempty" yaml:"stats,omitempty"`
 	Rules             []engine.Rule    `json:"rules" yaml:"rules"`
+}
+
+// StatsConfig controls optional persistence of cumulative traffic counters so
+// daemon restarts do not lose per-rule upload/download/drop totals.
+type StatsConfig struct {
+	Persist       bool   `json:"persist" yaml:"persist"`
+	Path          string `json:"path,omitempty" yaml:"path,omitempty"`
+	FlushInterval string `json:"flush_interval,omitempty" yaml:"flush_interval,omitempty"`
 }
 
 // CertReviewConfig controls certificate review thresholds.

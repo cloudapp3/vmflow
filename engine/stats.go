@@ -154,6 +154,24 @@ func (collector *Collector) SnapshotAll() []TrafficSnapshot {
 	return result
 }
 
+// Restore seeds cumulative counters from persisted snapshots. Call before any
+// forwarding starts. Conns (live connection count) is intentionally not
+// restored: a freshly started daemon has zero connections, and restoring the
+// old value would show a bogus active-connection count.
+func (collector *Collector) Restore(snapshots []TrafficSnapshot) {
+	if collector == nil {
+		return
+	}
+	for _, s := range snapshots {
+		counter := collector.getCounter(stringsTrim(s.RuleID))
+		counter.uploadTotal.Store(s.UploadBytes)
+		counter.downloadTotal.Store(s.DownloadBytes)
+		counter.udpSessionRejected.Store(s.UDPSessionRejected)
+		counter.udpPacketsDropped.Store(s.UDPPacketsDropped)
+		counter.updatedAtUnix.Store(time.Now().Unix())
+	}
+}
+
 func (collector *Collector) bindRule(ruleID string) boundRuleStats {
 	if collector == nil {
 		return boundRuleStats{}

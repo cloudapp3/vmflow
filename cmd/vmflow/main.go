@@ -25,6 +25,7 @@ import (
 	"github.com/cloudapp3/vmflow/engine"
 	"github.com/cloudapp3/vmflow/internal/logging"
 	"github.com/cloudapp3/vmflow/internal/service"
+	"github.com/cloudapp3/vmflow/internal/statsstore"
 	"github.com/cloudapp3/vmflow/internal/updater"
 	"github.com/cloudapp3/vmflow/metrics"
 	"github.com/cloudapp3/vmflow/tui"
@@ -249,6 +250,17 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 	collector := engine.NewCollector()
 	manager := engine.NewManagerWithOptions(collector, engine.ManagerOptions{UDPMaxSessions: cfg.UDPMaxSessions})
 
+	var statsStore *statsstore.Store
+	if cfg.Stats.Persist {
+		statsStore = statsstore.New(statsFilePath(cfg, configPath))
+		if snapshots, err := statsStore.Load(); err != nil {
+			logger.Warn("stats load failed; starting from zero", "component", "stats", "error", err)
+		} else if len(snapshots) > 0 {
+			collector.Restore(snapshots)
+			logger.Info("restored traffic stats", "component", "stats", "rules", len(snapshots))
+		}
+	}
+
 	metricsCollector := metrics.New(manager)
 	result := manager.ApplySnapshot(cfg.Rules, engine.ApplySnapshotOptions{ReplaceAll: true})
 	metricsCollector.ObserveApplyResult(result)
@@ -296,6 +308,9 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 	if err := botMgr.Apply(controlapi.BotSettings{Token: cfg.BotToken, ChatID: cfg.BotChat, ControlToken: cfg.BotControlToken}); err != nil {
 		logger.Error("bot start failed", "component", "bot", "event", "init_failed", "error", err)
 	}
+	if statsStore != nil {
+		go flushStats(ctx, statsStore, manager, statsFlushInterval(cfg, logger), logger)
+	}
 	reportReady(nil)
 
 	// Block until shutdown is requested (ctx) or the server exits on its own.
@@ -310,6 +325,11 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 		}
 	}
 
+	if statsStore != nil {
+		if err := statsStore.Save(manager.SnapshotAll()); err != nil {
+			logger.Warn("stats shutdown flush failed", "component", "stats", "error", err)
+		}
+	}
 	botMgr.Stop()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -317,6 +337,46 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 	manager.StopAll()
 	logger.Info("vmflow stopped", "component", "daemon", "event", "stopped")
 	return serverErr
+}
+
+// statsFilePath resolves the persistence path: explicit config value, else
+// stats.json beside the config file.
+func statsFilePath(cfg config.File, configPath string) string {
+	if p := strings.TrimSpace(cfg.Stats.Path); p != "" {
+		return p
+	}
+	return filepath.Join(filepath.Dir(configPath), "stats.json")
+}
+
+// statsFlushInterval parses stats.flush_interval (default 60s, minimum 1s).
+func statsFlushInterval(cfg config.File, logger *slog.Logger) time.Duration {
+	if s := strings.TrimSpace(cfg.Stats.FlushInterval); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d >= time.Second {
+			return d
+		}
+		if logger != nil {
+			logger.Warn("invalid stats.flush_interval; using default 60s", "component", "stats", "value", s)
+		}
+	}
+	return 60 * time.Second
+}
+
+// flushStats periodically persists cumulative counters until ctx is cancelled.
+// The final flush on shutdown is performed synchronously by the caller so it
+// runs before rules are stopped and their counters torn down.
+func flushStats(ctx context.Context, store *statsstore.Store, manager *engine.Manager, interval time.Duration, logger *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := store.Save(manager.SnapshotAll()); err != nil {
+				logger.Warn("stats flush failed", "component", "stats", "error", err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // newBotControlFn builds an in-process control client. Requests still pass
