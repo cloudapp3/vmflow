@@ -239,7 +239,7 @@ exclusively owned by vmflow and contains a `.vmflow-owned` marker; use
 
 ## Control API
 
-Documented in the [HTTP API guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/api.md). Main endpoints:
+The control API is an **internal, loopback-only** interface (`127.0.0.1:19090`) used by the local CLI/TUI (`vmflow ctl`, `vmflow tui`) — not a public/external API. Interact via the CLI/TUI; the HTTP endpoints below are reference for local tooling and integrations. Documented in the [HTTP API guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/api.md). Main endpoints:
 
 - `GET /v1/rules`
 - `GET /v1/stats`
