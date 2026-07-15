@@ -53,7 +53,7 @@ func TestRouteCLI(t *testing.T) {
 
 func TestParseForegroundOptionsUsesExplicitConfigWithoutResolver(t *testing.T) {
 	resolverCalled := false
-	opts, err := parseForegroundOptions([]string{"-config", " /custom/config.yaml ", "-control-listen", " 127.0.0.1:9999 "}, func() (string, error) {
+	opts, err := parseForegroundOptions([]string{"-config", " /custom/config.yaml ", "-control-port", "9999"}, func() (string, error) {
 		resolverCalled = true
 		return "", os.ErrNotExist
 	}, io.Discard)
@@ -63,8 +63,19 @@ func TestParseForegroundOptionsUsesExplicitConfigWithoutResolver(t *testing.T) {
 	if resolverCalled {
 		t.Fatal("default config resolver was called for an explicit -config")
 	}
-	if opts.configPath != "/custom/config.yaml" || opts.controlListen != "127.0.0.1:9999" {
+	if opts.configPath != "/custom/config.yaml" || opts.controlPort != 9999 {
 		t.Fatalf("unexpected options: %+v", opts)
+	}
+}
+
+func TestParseForegroundOptionsRejectsInvalidControlPort(t *testing.T) {
+	for _, value := range []string{"-1", "65536"} {
+		_, err := parseForegroundOptions([]string{"-config", "/custom/config.yaml", "-control-port", value}, func() (string, error) {
+			return "", os.ErrNotExist
+		}, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "control-port") {
+			t.Fatalf("control-port=%s error = %v, want validation error", value, err)
+		}
 	}
 }
 
@@ -90,7 +101,7 @@ func TestParseForegroundOptionsUsesDefaultAndRejectsPositionals(t *testing.T) {
 	}
 }
 
-func TestForegroundReportsRuntimeFailure(t *testing.T) {
+func TestForegroundRejectsLegacyRemoteControlListener(t *testing.T) {
 	const helperEnv = "VMFLOW_TEST_FOREGROUND_FAILURE"
 	if os.Getenv(helperEnv) == "1" {
 		runForeground([]string{"-config", os.Getenv("VMFLOW_TEST_CONFIG")})
@@ -103,14 +114,14 @@ func TestForegroundReportsRuntimeFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestForegroundReportsRuntimeFailure$")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestForegroundRejectsLegacyRemoteControlListener$")
 	cmd.Env = append(os.Environ(), helperEnv+"=1", "VMFLOW_TEST_CONFIG="+configPath)
 	output, err := cmd.CombinedOutput()
 	exitErr, ok := err.(*exec.ExitError)
 	if !ok || exitErr.ExitCode() != 1 {
 		t.Fatalf("foreground exit error = %v, output = %s", err, output)
 	}
-	for _, want := range []string{"vmflow failed: control api:", "without authentication"} {
+	for _, want := range []string{"load config failed:", "no longer accepts non-loopback addresses"} {
 		if !strings.Contains(string(output), want) {
 			t.Fatalf("foreground output missing %q: %s", want, output)
 		}
@@ -177,11 +188,11 @@ func TestConfiguredStatsDropsUnconfiguredRules(t *testing.T) {
 func TestRunForwardingRejectsStatsConfigPathCollision(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	cfg := config.File{
-		ControlListenAddr: "127.0.0.1:0",
-		Stats:             config.StatsConfig{Persist: true, Path: configPath},
+		ControlPort: 0,
+		Stats:       config.StatsConfig{Persist: true, Path: configPath},
 	}
 	ready := make(chan error, 1)
-	err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), false, ready)
+	err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), ready)
 	if err == nil || !strings.Contains(err.Error(), "must differ from config path") {
 		t.Fatalf("run error = %v, want stats/config collision", err)
 	}
@@ -198,11 +209,11 @@ func TestRunForwardingFailsBeforeReadyWhenStatsCannotBeSaved(t *testing.T) {
 	}
 	configPath := filepath.Join(dir, "config.yaml")
 	cfg := config.File{
-		ControlListenAddr: "127.0.0.1:0",
-		Stats:             config.StatsConfig{Persist: true, Path: target},
+		ControlPort: 0,
+		Stats:       config.StatsConfig{Persist: true, Path: target},
 	}
 	ready := make(chan error, 1)
-	err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), false, ready)
+	err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), ready)
 	if err == nil || !strings.Contains(err.Error(), "initialize stats persistence") {
 		t.Fatalf("run error = %v, want stats initialization failure", err)
 	}
@@ -250,10 +261,10 @@ func TestRunForwardingReportsReadyAfterBindingControlListener(t *testing.T) {
 	defer cancel()
 	ready := make(chan error, 1)
 	done := make(chan error, 1)
-	cfg := config.File{ControlListenAddr: "127.0.0.1:0"}
+	cfg := config.File{ControlPort: 0}
 
 	go func() {
-		done <- runForwardingWithReady(ctx, cfg, cfg, "test-config.yaml", testLogger(), false, ready)
+		done <- runForwardingWithReady(ctx, cfg, cfg, "test-config.yaml", testLogger(), ready)
 	}()
 
 	select {
@@ -285,9 +296,9 @@ func TestRunForwardingReportsListenFailureBeforeReady(t *testing.T) {
 
 	ready := make(chan error, 1)
 	done := make(chan error, 1)
-	cfg := config.File{ControlListenAddr: occupied.Addr().String()}
+	cfg := config.File{ControlPort: occupied.Addr().(*net.TCPAddr).Port}
 	go func() {
-		done <- runForwardingWithReady(context.Background(), cfg, cfg, "test-config.yaml", testLogger(), false, ready)
+		done <- runForwardingWithReady(context.Background(), cfg, cfg, "test-config.yaml", testLogger(), ready)
 	}()
 
 	select {

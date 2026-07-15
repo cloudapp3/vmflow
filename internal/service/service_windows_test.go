@@ -20,8 +20,7 @@ func TestWindowsServiceCommandLineRoundTrip(t *testing.T) {
 		ExtraArgs: []string{
 			`-future-header=value with spaces and "quotes"`,
 		},
-		ControlListen:              "127.0.0.1:19090",
-		InsecureAllowRemoteControl: true,
+		ControlPort: 19123,
 	}
 	want := append([]string{cfg.BinaryPath}, windowsServiceArgs(cfg)...)
 	commandLine := windows.ComposeCommandLine(want)

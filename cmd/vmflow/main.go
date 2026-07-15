@@ -41,15 +41,15 @@ var (
 const usageText = `vmflow - L4 port forwarding engine
 
 Usage:
-  vmflow               [-config path] [-control-listen addr]             Start forwarding in foreground
-                       [-insecure-allow-remote-control]                  Default config: config.yaml beside vmflow
-  vmflow ctl           [-addr url] [-token token] <rules|stats|metrics|precheck|reload>    Query running vmflow
-  vmflow tui           [-addr url] [-token token]                      Terminal UI dashboard
+  vmflow               [-config path] [-control-port port]              Start forwarding in foreground
+                                                                       Default config: config.yaml beside vmflow
+  vmflow ctl           [-token token] <rules|stats|metrics|precheck|reload>    Query running vmflow
+  vmflow tui           [-token token]                                  Terminal UI dashboard
   vmflow version       [-json]                                         Show version info
   vmflow update        [--check] [--version tag]                       Self-update vmflow binary
   vmflow service       (install|uninstall|status) [--config path]      Register as a native OS service
                        [--user name] [--log-file path] [--binary path] (systemd / launchd / Windows Service)
-                       [--control-listen addr] [--insecure-allow-remote-control]
+                       [--control-port port]
                        [--extra-arg=-future-flag=value]...
   vmflow uninstall     [--dry-run]                                    Uninstall vmflow: remove service, binary,
                                                                        owned config/cache, logs, and update cache
@@ -103,11 +103,10 @@ func routeCLI(args []string) (string, []string) {
 // ── foreground runtime ──────────────────────────────────────────────
 
 type foregroundOptions struct {
-	configPath          string
-	controlListen       string
-	insecureAllowRemote bool
-	logFile             string
-	serviceName         string
+	configPath  string
+	controlPort int
+	logFile     string
+	serviceName string
 }
 
 func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, error), output io.Writer) (foregroundOptions, error) {
@@ -118,9 +117,7 @@ func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, 
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "config file path (default: config.yaml beside vmflow)")
-	controlListen := fs.String("control-listen", "", "override control listen addr")
-	insecureAllowRemote := fs.Bool("insecure-allow-remote-control", false,
-		"DANGEROUS: allow binding the control API on a non-loopback address without auth")
+	controlPort := fs.Int("control-port", 0, "override the local management port (0 uses config)")
 	logFile := fs.String("log-file", "", "write logs to this file instead of stdout (useful under a service manager)")
 	serviceName := fs.String("service-name", service.DefaultServiceName, "[Windows SCM] registered service name")
 	if err := fs.Parse(args); err != nil {
@@ -128,6 +125,9 @@ func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, 
 	}
 	if extra := fs.Args(); len(extra) != 0 {
 		return foregroundOptions{}, fmt.Errorf("unexpected argument(s): %v", extra)
+	}
+	if *controlPort < 0 || *controlPort > 65535 {
+		return foregroundOptions{}, fmt.Errorf("control-port must be 0 (use config) or between 1 and 65535")
 	}
 
 	resolvedConfig := strings.TrimSpace(*configPath)
@@ -139,11 +139,10 @@ func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, 
 		}
 	}
 	return foregroundOptions{
-		configPath:          resolvedConfig,
-		controlListen:       strings.TrimSpace(*controlListen),
-		insecureAllowRemote: *insecureAllowRemote,
-		logFile:             *logFile,
-		serviceName:         *serviceName,
+		configPath:  resolvedConfig,
+		controlPort: *controlPort,
+		logFile:     *logFile,
+		serviceName: *serviceName,
 	}, nil
 }
 
@@ -187,8 +186,8 @@ func runForeground(args []string) {
 		os.Exit(1)
 	}
 	startupConfig := cfg
-	if opts.controlListen != "" {
-		cfg.ControlListenAddr = opts.controlListen
+	if opts.controlPort != 0 {
+		cfg.ControlPort = opts.controlPort
 	}
 
 	logger, err := newLogger(cfg.Log, opts.logFile)
@@ -197,10 +196,13 @@ func runForeground(args []string) {
 		os.Exit(1)
 	}
 	slog.SetDefault(logger)
+	if cfg.UsedDeprecatedControlListenAddr {
+		logger.Warn("control_listen_addr is deprecated; replace it with control_port", "component", "config", "control_port", cfg.ControlPort)
+	}
 
 	// On Windows, when launched by the Service Control Manager, hand off to a
 	// native service runner instead of the foreground loop. No-op elsewhere.
-	if maybeRunAsService(cfg, startupConfig, opts.configPath, logger, opts.insecureAllowRemote, opts.serviceName) {
+	if maybeRunAsService(cfg, startupConfig, opts.configPath, logger, opts.serviceName) {
 		return
 	}
 
@@ -208,7 +210,7 @@ func runForeground(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := runForwarding(ctx, cfg, startupConfig, opts.configPath, logger, opts.insecureAllowRemote); err != nil {
+	if err := runForwarding(ctx, cfg, startupConfig, opts.configPath, logger); err != nil {
 		fmt.Fprintf(os.Stderr, "vmflow failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -218,15 +220,15 @@ func runForeground(args []string) {
 // an already-parsed config, then blocks until ctx is cancelled (SIGINT/SIGTERM,
 // or an SCM stop) or the control server fails. It performs graceful shutdown
 // before returning. Shared by the foreground daemon and the Windows SCM runner.
-func runForwarding(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, insecureAllowRemote bool) error {
-	return runForwardingWithReady(ctx, cfg, startupConfig, configPath, logger, insecureAllowRemote, nil)
+func runForwarding(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger) error {
+	return runForwardingWithReady(ctx, cfg, startupConfig, configPath, logger, nil)
 }
 
 // runForwardingWithReady reports initialization success only after rules are
 // active and the control listener is bound. Initialization failures are sent to
 // ready before the function returns, allowing the Windows SCM runner to avoid a
 // transient false Running state.
-func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, insecureAllowRemote bool, ready chan<- error) (runErr error) {
+func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, ready chan<- error) (runErr error) {
 	readyReported := false
 	reportReady := func(err error) {
 		if readyReported {
@@ -238,10 +240,6 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 		}
 	}
 	defer func() { reportReady(runErr) }()
-
-	if err := controlapi.EnsureSafeControlBinding(cfg, insecureAllowRemote, logger); err != nil {
-		return fmt.Errorf("control api: %w", err)
-	}
 
 	tlsCfg, err := controlapi.BuildServerTLSConfig(cfg.ControlTLS)
 	if err != nil {
@@ -301,7 +299,7 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 	botMgr := bot.NewManager(manager, newBotControlFn(handler, logger), logger)
 	runtime.Bot = botMgr
 	server := &http.Server{
-		Addr:              cfg.ControlListenAddr,
+		Addr:              cfg.ControlListenAddress(),
 		Handler:           handler,
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -547,15 +545,15 @@ func newLogger(logCfg config.LogConfig, logFile string) (*slog.Logger, error) {
 
 func runCtl(args []string) {
 	fs := flag.NewFlagSet("ctl", flag.ExitOnError)
-	addr := fs.String("addr", "http://127.0.0.1:19090", "control api base url")
-	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "control api bearer token (or VMFLOW_CONTROL_TOKEN)")
+	addr := fs.String("addr", "http://127.0.0.1:19090", "daemon management address")
+	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "daemon management token (or VMFLOW_CONTROL_TOKEN)")
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
 	fs.Parse(args)
 
 	cmdArgs := fs.Args()
 	if len(cmdArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: vmflow ctl [-addr url] [-token token] <rules|stats|metrics|precheck|reload>")
+		fmt.Fprintln(os.Stderr, "usage: vmflow ctl [-token token] <rules|stats|metrics|precheck|reload>")
 		os.Exit(1)
 	}
 
@@ -632,8 +630,8 @@ func doRequest(baseURL, token string, tlsOpts controlapi.ClientTLSOptions, heade
 
 func runTUI(args []string) {
 	fs := flag.NewFlagSet("tui", flag.ExitOnError)
-	addr := fs.String("addr", "http://127.0.0.1:19090", "relayd control API address")
-	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "control api bearer token (or VMFLOW_CONTROL_TOKEN)")
+	addr := fs.String("addr", "http://127.0.0.1:19090", "daemon management address")
+	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "daemon management token (or VMFLOW_CONTROL_TOKEN)")
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
 	fs.Parse(args)
@@ -851,8 +849,7 @@ func runService(args []string) {
 	configPath := fs.String("config", "", "config file path the service runs with (default: platform system path)")
 	user := fs.String("user", "", "[systemd] run as this user; created if missing (default: root)")
 	logFile := fs.String("log-file", "", "override daemon log destination (Windows default: C:\\ProgramData\\vmflow\\logs\\vmflow.log)")
-	controlListen := fs.String("control-listen", "", "override the daemon control listen address")
-	insecureAllowRemote := fs.Bool("insecure-allow-remote-control", false, "DANGEROUS: allow a non-loopback control API without auth")
+	controlPort := fs.Int("control-port", 0, "override the daemon local management port")
 	var extraArgs serviceArgList
 	fs.Var(&extraArgs, "extra-arg", "append a future daemon flag as --extra-arg=-flag=value (repeatable; existing flags have dedicated options)")
 	binaryPath := fs.String("binary", "", "path to the vmflow binary (default: this executable; install requires a trusted root/admin-owned absolute path)")
@@ -869,19 +866,22 @@ func runService(args []string) {
 		os.Exit(1)
 	}
 	fs.Parse(args[1:])
+	if *controlPort < 0 || *controlPort > 65535 {
+		fmt.Fprintln(os.Stderr, "control-port must be 0 (use config) or between 1 and 65535")
+		os.Exit(2)
+	}
 	if extra := fs.Args(); len(extra) != 0 {
 		fmt.Fprintf(os.Stderr, "unexpected argument(s): %v\n", extra)
 		os.Exit(1)
 	}
 
 	cfg := service.Config{
-		BinaryPath:                 *binaryPath,
-		ConfigPath:                 *configPath,
-		User:                       *user,
-		LogFile:                    *logFile,
-		ControlListen:              *controlListen,
-		InsecureAllowRemoteControl: *insecureAllowRemote,
-		ExtraArgs:                  []string(extraArgs),
+		BinaryPath:  *binaryPath,
+		ConfigPath:  *configPath,
+		User:        *user,
+		LogFile:     *logFile,
+		ControlPort: *controlPort,
+		ExtraArgs:   []string(extraArgs),
 	}
 
 	var err error

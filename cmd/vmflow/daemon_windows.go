@@ -20,7 +20,7 @@ import (
 // service — reporting state to the SCM and handling Stop/Shutdown controls —
 // and blocks until the service stops, then returns true. Otherwise it returns
 // false and the caller runs the daemon in the foreground as usual.
-func maybeRunAsService(cfg, startupConfig config.File, configPath string, logger *slog.Logger, insecure bool, serviceName string) bool {
+func maybeRunAsService(cfg, startupConfig config.File, configPath string, logger *slog.Logger, serviceName string) bool {
 	isSvc, err := svc.IsWindowsService()
 	if err != nil {
 		logger.Error("cannot determine if running as a Windows service", "component", "service", "error", err)
@@ -33,7 +33,7 @@ func maybeRunAsService(cfg, startupConfig config.File, configPath string, logger
 	if serviceName == "" {
 		serviceName = service.DefaultServiceName
 	}
-	if err := svc.Run(serviceName, &vmflowService{cfg: cfg, startupConfig: startupConfig, configPath: configPath, logger: logger, insecure: insecure}); err != nil {
+	if err := svc.Run(serviceName, &vmflowService{cfg: cfg, startupConfig: startupConfig, configPath: configPath, logger: logger}); err != nil {
 		logger.Error("service runner failed", "component", "service", "error", err)
 		os.Exit(1)
 	}
@@ -47,7 +47,6 @@ type vmflowService struct {
 	startupConfig config.File
 	configPath    string
 	logger        *slog.Logger
-	insecure      bool
 }
 
 // Execute is invoked by the SCM. It reports StartPending -> Running, starts the
@@ -64,7 +63,7 @@ func (m *vmflowService) Execute(_ []string, changes <-chan svc.ChangeRequest, st
 	readyCh := make(chan error, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runForwardingWithReady(ctx, m.cfg, m.startupConfig, m.configPath, m.logger, m.insecure, readyCh)
+		errCh <- runForwardingWithReady(ctx, m.cfg, m.startupConfig, m.configPath, m.logger, readyCh)
 	}()
 
 	if err := <-readyCh; err != nil {

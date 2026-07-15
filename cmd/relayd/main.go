@@ -23,14 +23,16 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "config file path")
-	controlListen := flag.String("control-listen", "", "override control listen addr")
-	insecureAllowRemote := flag.Bool("insecure-allow-remote-control", false,
-		"DANGEROUS: allow binding the control API on a non-loopback address without auth")
+	controlPort := flag.Int("control-port", 0, "override the local management port")
 	flag.Parse()
 
 	if strings.TrimSpace(*configPath) == "" {
 		fmt.Fprintln(os.Stderr, "missing -config")
 		os.Exit(1)
+	}
+	if *controlPort < 0 || *controlPort > 65535 {
+		fmt.Fprintln(os.Stderr, "control-port must be 0 (use config) or between 1 and 65535")
+		os.Exit(2)
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -39,8 +41,8 @@ func main() {
 		os.Exit(1)
 	}
 	startupConfig := cfg
-	if strings.TrimSpace(*controlListen) != "" {
-		cfg.ControlListenAddr = strings.TrimSpace(*controlListen)
+	if *controlPort != 0 {
+		cfg.ControlPort = *controlPort
 	}
 
 	logger, err := logging.New(cfg.Log)
@@ -49,9 +51,8 @@ func main() {
 		os.Exit(1)
 	}
 	slog.SetDefault(logger)
-	if err := controlapi.EnsureSafeControlBinding(cfg, *insecureAllowRemote, logger); err != nil {
-		fmt.Fprintf(os.Stderr, "control api: %v\n", err)
-		os.Exit(1)
+	if cfg.UsedDeprecatedControlListenAddr {
+		logger.Warn("control_listen_addr is deprecated; replace it with control_port", "component", "config", "control_port", cfg.ControlPort)
 	}
 
 	tlsCfg, err := controlapi.BuildServerTLSConfig(cfg.ControlTLS)
@@ -81,7 +82,7 @@ func main() {
 		StartupConfig: &startupConfig,
 	}
 	server := &http.Server{
-		Addr:              cfg.ControlListenAddr,
+		Addr:              cfg.ControlListenAddress(),
 		Handler:           controlapi.NewHandler(runtime),
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -94,7 +95,7 @@ func main() {
 			scheme = "https"
 			listen = func() error { return server.ListenAndServeTLS("", "") }
 		}
-		logger.Info("relayd control server listening", "component", "daemon", "event", "control_listen", "addr", cfg.ControlListenAddr, "scheme", scheme, "mtls", tlsCfg != nil && tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert)
+		logger.Info("relayd control server listening", "component", "daemon", "event", "control_listen", "addr", cfg.ControlListenAddress(), "scheme", scheme, "mtls", tlsCfg != nil && tlsCfg.ClientAuth == tls.RequireAndVerifyClientCert)
 		errCh <- listen()
 	}()
 

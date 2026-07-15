@@ -21,7 +21,7 @@ type ClientTLSFlags struct {
 // Each flag falls back to its VMFLOW_TLS_* environment variable.
 func AddClientTLSFlags(fs *flag.FlagSet) *ClientTLSFlags {
 	return &ClientTLSFlags{
-		ca:       fs.String("tls-ca-file", os.Getenv("VMFLOW_TLS_CA_FILE"), "CA bundle to verify the control API server certificate (for private/self-signed CAs)"),
+		ca:       fs.String("tls-ca-file", os.Getenv("VMFLOW_TLS_CA_FILE"), "CA bundle to verify the daemon management certificate (for private/self-signed CAs)"),
 		cert:     fs.String("tls-client-cert", os.Getenv("VMFLOW_TLS_CLIENT_CERT"), "client certificate for mTLS (required when the server sets control_tls.client_ca_file)"),
 		key:      fs.String("tls-client-key", os.Getenv("VMFLOW_TLS_CLIENT_KEY"), "client key for mTLS (required together with -tls-client-cert)"),
 		insecure: fs.Bool("tls-skip-verify", strings.EqualFold(strings.TrimSpace(os.Getenv("VMFLOW_TLS_INSECURE")), "1") || os.Getenv("VMFLOW_TLS_INSECURE") == "true", "skip server certificate verification (dangerous, debug only)"),

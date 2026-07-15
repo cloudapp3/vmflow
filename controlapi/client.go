@@ -37,9 +37,9 @@ type RulesResponse struct {
 }
 
 type ReloadResponse struct {
-	ConfigPath        string `json:"config_path"`
-	ControlListenAddr string `json:"control_listen_addr"`
-	RuleCount         int    `json:"rule_count"`
+	ConfigPath  string `json:"config_path"`
+	ControlPort int    `json:"control_port"`
+	RuleCount   int    `json:"rule_count"`
 }
 
 type SessionCapabilities struct {
@@ -120,7 +120,7 @@ func (e *APIError) Error() string {
 	if e.Message != "" {
 		return e.Message
 	}
-	return fmt.Sprintf("control API returned HTTP %d", e.StatusCode)
+	return fmt.Sprintf("daemon management request returned HTTP %d", e.StatusCode)
 }
 
 // APIStatus returns the HTTP status embedded in err, or 0 if err is not an
@@ -132,8 +132,8 @@ func APIStatus(err error) int {
 	return 0
 }
 
-// Client calls one local or remote vmflow control API. Shared by the TUI,
-// vmflow ctl, and the Telegram bot.
+// Client calls vmflow's internal daemon management transport. It is shared by
+// the bundled TUI, CLI, and Telegram bot.
 type Client struct {
 	baseURL string
 	token   string
@@ -141,8 +141,8 @@ type Client struct {
 	http    *http.Client
 }
 
-// NewClient returns a control API client for baseURL with the given bearer
-// token. The token may be empty for read-only access.
+// NewClient returns an internal management client for baseURL with the given
+// bearer token. The token may be empty for read-only access.
 func NewClient(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
@@ -156,7 +156,7 @@ func (c *Client) HasToken() bool {
 	return c != nil && c.token != ""
 }
 
-// SetHTTPClient replaces the HTTP client used for control API requests. Pass
+// SetHTTPClient replaces the HTTP client used for management requests. Pass
 // nil to keep the default; otherwise the caller controls TLS and timeouts.
 func (c *Client) SetHTTPClient(h *http.Client) {
 	if c != nil && h != nil {
@@ -164,15 +164,14 @@ func (c *Client) SetHTTPClient(h *http.Client) {
 	}
 }
 
-// SetHeaders sets extra headers (for example Cloudflare Access credentials)
-// applied to every request. nil clears them.
+// SetHeaders sets extra headers applied to every request. nil clears them.
 func (c *Client) SetHeaders(h http.Header) {
 	if c != nil {
 		c.headers = h
 	}
 }
 
-// BaseURL returns the control API base URL the client was configured with.
+// BaseURL returns the internal management base URL configured for the client.
 func (c *Client) BaseURL() string {
 	if c == nil {
 		return ""

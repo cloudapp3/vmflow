@@ -21,6 +21,6 @@ remediation window before publishing details.
 
 ## Scope
 
-Reports about the forwarding engine, control API, authentication, TLS, service
+Reports about the forwarding engine, internal management channel, authentication, TLS, service
 installation, self-update, release artifacts, and installer are in scope.
 General support requests and configuration questions should use GitHub Issues.

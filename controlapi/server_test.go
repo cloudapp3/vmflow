@@ -240,6 +240,31 @@ func TestReloadRejectsStatsConfigChanges(t *testing.T) {
 	}
 }
 
+func TestReloadRejectsControlPortChanges(t *testing.T) {
+	startup, err := config.Parse([]byte("version: 1\ncontrol_port: 19090\nrules: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(configPath, []byte("version: 1\ncontrol_port: 19091\nrules: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.StartupConfig = &startup
+	runtime.ConfigPath = configPath
+	opts := precheck.Options{}
+	runtime.PrecheckOptions = &opts
+
+	_, _, err = runtime.Reload()
+	var restartErr *RestartRequiredError
+	if !errors.As(err, &restartErr) {
+		t.Fatalf("reload error = %v, want RestartRequiredError", err)
+	}
+	if len(restartErr.Fields) != 1 || restartErr.Fields[0] != "control_port" {
+		t.Fatalf("restart-required fields = %v, want [control_port]", restartErr.Fields)
+	}
+}
+
 func TestReloadEndpointReturnsConflictForRestartOnlyChanges(t *testing.T) {
 	startup, err := config.Parse([]byte("version: 1\nrules: []\n"))
 	if err != nil {

@@ -173,6 +173,7 @@ func NewHandler(runtime *Runtime) http.Handler {
 		runtime.log(r).Info("control reload completed", "component", "controlapi", "event", "reload", "rule_count", len(cfg.Rules), "applied_rules", result.AppliedRules, "stopped_rules", result.StoppedRules, "failed_rules", result.FailedRules)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"config_path":      filepath.Base(strings.TrimSpace(runtime.ConfigPath)),
+			"control_port":     cfg.ControlPort,
 			"udp_max_sessions": cfg.UDPMaxSessions,
 			"rule_count":       len(cfg.Rules),
 			"applied_fields":   []string{"rules", "udp_max_sessions"},
@@ -233,8 +234,8 @@ func (runtime *Runtime) restartRequiredFields(next config.File) []string {
 	}
 	current := *runtime.StartupConfig
 	fields := make([]string, 0, 8)
-	if current.ControlListenAddr != next.ControlListenAddr {
-		fields = append(fields, "control_listen_addr")
+	if current.ControlPort != next.ControlPort {
+		fields = append(fields, "control_port")
 	}
 	if !reflect.DeepEqual(current.ControlTLS, next.ControlTLS) {
 		fields = append(fields, "control_tls")

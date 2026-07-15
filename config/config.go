@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,6 +12,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const DefaultControlHost = "127.0.0.1"
+const DefaultControlPort = 19090
 const DefaultControlListenAddr = "127.0.0.1:19090"
 const DefaultLogLevel = "info"
 const DefaultLogFormat = "text"
@@ -20,23 +24,31 @@ const (
 )
 
 type File struct {
-	Version           int              `json:"version" yaml:"version"`
-	ControlListenAddr string           `json:"control_listen_addr" yaml:"control_listen_addr"`
-	UDPMaxSessions    int              `json:"udp_max_sessions,omitempty" yaml:"udp_max_sessions,omitempty"`
-	ControlTLS        ControlTLSConfig `json:"control_tls,omitempty" yaml:"control_tls,omitempty"`
-	Log               LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
-	Auth              AuthConfig       `json:"auth,omitempty" yaml:"auth,omitempty"`
-	BotToken          string           `json:"bot_token,omitempty" yaml:"bot_token,omitempty"`
-	BotChat           int64            `json:"bot_chat,omitempty" yaml:"bot_chat,omitempty"`
-	BotControlToken   string           `json:"bot_control_token,omitempty" yaml:"bot_control_token,omitempty"`
-	AcmeChallenge     string           `json:"acme_challenge,omitempty" yaml:"acme_challenge,omitempty"`
-	AcmeHTTP01Addr    string           `json:"acme_http01_addr,omitempty" yaml:"acme_http01_addr,omitempty"`
-	AcmeCacheDir      string           `json:"acme_cache_dir,omitempty" yaml:"acme_cache_dir,omitempty"`
-	AcmeDNS01         DNS01Config      `json:"acme_dns01,omitempty" yaml:"acme_dns01,omitempty"`
-	CertCacheDir      string           `json:"cert_cache_dir,omitempty" yaml:"cert_cache_dir,omitempty"`
-	CertReview        CertReviewConfig `json:"cert_review,omitempty" yaml:"cert_review,omitempty"`
-	Stats             StatsConfig      `json:"stats,omitempty" yaml:"stats,omitempty"`
-	Rules             []engine.Rule    `json:"rules" yaml:"rules"`
+	Version                         int              `json:"version" yaml:"version"`
+	ControlPort                     int              `json:"control_port" yaml:"control_port"`
+	DeprecatedControlListenAddr     string           `json:"-" yaml:"control_listen_addr,omitempty"`
+	UsedDeprecatedControlListenAddr bool             `json:"-" yaml:"-"`
+	UDPMaxSessions                  int              `json:"udp_max_sessions,omitempty" yaml:"udp_max_sessions,omitempty"`
+	ControlTLS                      ControlTLSConfig `json:"control_tls,omitempty" yaml:"control_tls,omitempty"`
+	Log                             LogConfig        `json:"log,omitempty" yaml:"log,omitempty"`
+	Auth                            AuthConfig       `json:"auth,omitempty" yaml:"auth,omitempty"`
+	BotToken                        string           `json:"bot_token,omitempty" yaml:"bot_token,omitempty"`
+	BotChat                         int64            `json:"bot_chat,omitempty" yaml:"bot_chat,omitempty"`
+	BotControlToken                 string           `json:"bot_control_token,omitempty" yaml:"bot_control_token,omitempty"`
+	AcmeChallenge                   string           `json:"acme_challenge,omitempty" yaml:"acme_challenge,omitempty"`
+	AcmeHTTP01Addr                  string           `json:"acme_http01_addr,omitempty" yaml:"acme_http01_addr,omitempty"`
+	AcmeCacheDir                    string           `json:"acme_cache_dir,omitempty" yaml:"acme_cache_dir,omitempty"`
+	AcmeDNS01                       DNS01Config      `json:"acme_dns01,omitempty" yaml:"acme_dns01,omitempty"`
+	CertCacheDir                    string           `json:"cert_cache_dir,omitempty" yaml:"cert_cache_dir,omitempty"`
+	CertReview                      CertReviewConfig `json:"cert_review,omitempty" yaml:"cert_review,omitempty"`
+	Stats                           StatsConfig      `json:"stats,omitempty" yaml:"stats,omitempty"`
+	Rules                           []engine.Rule    `json:"rules" yaml:"rules"`
+}
+
+// ControlListenAddress returns the internal management listener. The host is
+// intentionally fixed so configuration can change only the local port.
+func (f File) ControlListenAddress() string {
+	return net.JoinHostPort(DefaultControlHost, strconv.Itoa(f.ControlPort))
 }
 
 // StatsConfig controls optional persistence of cumulative traffic counters so
@@ -124,9 +136,8 @@ func Parse(raw []byte) (File, error) {
 	if cfg.Version != 1 {
 		return File{}, fmt.Errorf("unsupported config version: %d", cfg.Version)
 	}
-	cfg.ControlListenAddr = strings.TrimSpace(cfg.ControlListenAddr)
-	if cfg.ControlListenAddr == "" {
-		cfg.ControlListenAddr = DefaultControlListenAddr
+	if err := normalizeControlPort(&cfg); err != nil {
+		return File{}, err
 	}
 	if cfg.UDPMaxSessions == 0 {
 		cfg.UDPMaxSessions = engine.DefaultUDPGlobalMaxSessions
@@ -161,6 +172,45 @@ func Parse(raw []byte) (File, error) {
 		cfg.Rules[index] = rule
 	}
 	return cfg, nil
+}
+
+func normalizeControlPort(cfg *File) error {
+	legacyAddr := strings.TrimSpace(cfg.DeprecatedControlListenAddr)
+	if legacyAddr != "" {
+		if cfg.ControlPort != 0 {
+			return fmt.Errorf("control_port and deprecated control_listen_addr cannot both be set")
+		}
+		host, portText, err := net.SplitHostPort(legacyAddr)
+		if err != nil {
+			return fmt.Errorf("deprecated control_listen_addr %q is invalid: %w", legacyAddr, err)
+		}
+		if !isLoopbackHost(host) {
+			return fmt.Errorf("control_listen_addr no longer accepts non-loopback addresses; use control_port and an SSH tunnel for remote management")
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("deprecated control_listen_addr port must be between 1 and 65535")
+		}
+		cfg.ControlPort = port
+		cfg.UsedDeprecatedControlListenAddr = true
+		cfg.DeprecatedControlListenAddr = ""
+	}
+	if cfg.ControlPort == 0 {
+		cfg.ControlPort = DefaultControlPort
+	}
+	if cfg.ControlPort < 1 || cfg.ControlPort > 65535 {
+		return fmt.Errorf("control_port must be 0 (default) or between 1 and 65535")
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func normalizeStats(stats StatsConfig) (StatsConfig, error) {

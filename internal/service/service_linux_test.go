@@ -62,17 +62,17 @@ func TestSystemdUnitUserLine(t *testing.T) {
 }
 
 func TestSystemdExecStartQuotesAndFlags(t *testing.T) {
-	got := systemdExecStart(Config{BinaryPath: "/usr/local/bin/vmflow", ConfigPath: "/etc/vmflow/config.yaml", LogFile: "/var/log/vmflow/v.log", ControlListen: "0.0.0.0:19090"})
+	got := systemdExecStart(Config{BinaryPath: "/usr/local/bin/vmflow", ConfigPath: "/etc/vmflow/config.yaml", LogFile: "/var/log/vmflow/v.log", ControlPort: 19123})
 	if !strings.Contains(got, `"/usr/local/bin/vmflow"`) {
 		t.Errorf("binary path should be quoted: %s", got)
 	}
 	if !strings.Contains(got, "-log-file") {
 		t.Errorf("expected -log-file when LogFile set: %s", got)
 	}
-	if !strings.Contains(got, "0.0.0.0:19090") {
-		t.Errorf("expected extra-arg passthrough: %s", got)
+	if !strings.Contains(got, "19123") {
+		t.Errorf("expected control port override: %s", got)
 	}
-	if !strings.Contains(got, `"-control-listen" "0.0.0.0:19090"`) {
+	if !strings.Contains(got, `"-control-port" "19123"`) {
 		t.Errorf("extra arguments must remain separate tokens: %s", got)
 	}
 }

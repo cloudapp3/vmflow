@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -15,11 +16,8 @@ func foregroundArgs(cfg Config, logFileFlag bool) []string {
 			args = append(args, "-log-file", lp)
 		}
 	}
-	if addr := strings.TrimSpace(cfg.ControlListen); addr != "" {
-		args = append(args, "-control-listen", addr)
-	}
-	if cfg.InsecureAllowRemoteControl {
-		args = append(args, "-insecure-allow-remote-control")
+	if cfg.ControlPort != 0 {
+		args = append(args, "-control-port", strconv.Itoa(cfg.ControlPort))
 	}
 	for _, extraArg := range cfg.ExtraArgs {
 		if extraArg = strings.TrimSpace(extraArg); extraArg != "" {

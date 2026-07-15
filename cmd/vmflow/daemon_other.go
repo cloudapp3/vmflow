@@ -12,6 +12,6 @@ import (
 // in the foreground and is supervised by the OS service manager (systemd /
 // launchd) directly via signals. Returns false so the caller proceeds to
 // runForwarding.
-func maybeRunAsService(_, _ config.File, _ string, _ *slog.Logger, _ bool, _ string) bool {
+func maybeRunAsService(_, _ config.File, _ string, _ *slog.Logger, _ string) bool {
 	return false
 }

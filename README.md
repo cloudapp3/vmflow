@@ -12,9 +12,9 @@ rules, a terminal UI, and Prometheus metrics.
 [![Go Reference](https://pkg.go.dev/badge/github.com/cloudapp3/vmflow.svg)](https://pkg.go.dev/github.com/cloudapp3/vmflow)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/index.md) · [中文说明](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/zh/index.md) · [HTTP API](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/api.md) · [Docs source](https://github.com/cloudapp3/vmdocs)
+Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/index.md) · [中文说明](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/zh/index.md) · [Docs source](https://github.com/cloudapp3/vmdocs)
 
-> **完整使用指南:** [中文文档源码](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs/zh) —— 覆盖安装、配置、运维、远程访问(TLS/mTLS/Cloudflare)、安全加固与排错。English quick reference is below; the deep guide is in the [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs).
+> **完整使用指南:** [中文文档源码](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs/zh) —— 覆盖安装、配置、运维、安全加固与排错。English quick reference is below; the deep guide is in the [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs).
 
 ## TCP/UDP port forwarding features
 
@@ -22,7 +22,7 @@ Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmf
 - Configurable TCP connection limits and bounded UDP sessions, with rejection/drop counters
 - Rule lifecycle management: start, stop, restart, and full snapshot apply
 - Config-driven foreground process with hot reload
-- Local control API for rules, stats, precheck, reload, and metrics
+- Local CLI/TUI management for rules, stats, precheck, reload, and metrics
 - Bearer-token auth with viewer/admin roles
 - Structured logs in text or JSON format
 - Prometheus-compatible `/metrics`
@@ -103,13 +103,8 @@ See [`examples/config.yaml`](examples/config.yaml):
 
 ```yaml
 version: 1
-control_listen_addr: 127.0.0.1:19090
+control_port: 19090                  # management always binds to 127.0.0.1
 udp_max_sessions: 256              # all UDP sessions in this process
-# control_tls:                       # enable TLS on the control API
-#   cert_file: /etc/vmflow/control.crt
-#   key_file: /etc/vmflow/control.key
-#   client_ca_file: clients-ca.crt   # optional: require client certs (mTLS)
-#   min_version: "1.2"               # "1.2" (default) | "1.3"
 
 log:
   level: info
@@ -157,13 +152,16 @@ config. The installed Linux systemd unit uses its managed state directory
 An explicit relative `stats.path` is resolved beside the config file. vmflow
 refuses to start if the stats path aliases the config file or cannot be written.
 
-Hot reload applies only `rules` and `udp_max_sessions`. Changes to the control
-listen address, auth, TLS, logging, bot, ACME, certificate cache, or certificate
-review or stats persistence settings return HTTP `409` and require a vmflow
-process restart; they are never reported as successfully applied while the old
-runtime settings remain active.
+Hot reload applies only `rules` and `udp_max_sessions`. Changes to the local
+management port, auth, TLS, logging, bot, ACME, certificate cache, certificate
+review, or stats persistence require a vmflow process restart and are rejected
+by reload while the old runtime settings remain active.
 
-Security note: vmflow **refuses to start** if the control API is bound to a non-loopback address without auth. Keep it on `127.0.0.1` (the default), or enable `auth` before exposing it. To bind remotely without auth anyway, pass `--insecure-allow-remote-control` (not recommended — put it behind a TLS-terminating reverse proxy instead).
+The management listener always binds to `127.0.0.1`; `control_port` changes only
+its port. Use an SSH tunnel when CLI/TUI access is needed from another host.
+Existing `control_listen_addr` values that name a loopback address are accepted
+for one migration release with a deprecation warning. Non-loopback legacy values
+are rejected; replace the field with `control_port` before upgrading.
 
 ### TUI rule management
 
@@ -181,13 +179,13 @@ require editing YAML and restarting vmflow.
 ## Commands
 
 ```bash
-vmflow               [-config path] [-control-listen 127.0.0.1:19090] [-insecure-allow-remote-control]
-vmflow ctl           [-addr http://127.0.0.1:19090] [-token TOKEN] <rules|stats|metrics|precheck|reload>
-vmflow tui           [-addr http://127.0.0.1:19090] [-token TOKEN]
+vmflow               [-config path] [-control-port 19090]
+vmflow ctl           [-token TOKEN] <rules|stats|metrics|precheck|reload>
+vmflow tui           [-token TOKEN]
 vmflow version       [-json]
 vmflow update        [--check] [--version tag]
 vmflow service       (install|uninstall|status) [--config path] [--binary path] [--user name] [--log-file path]
-                     [--control-listen addr] [--insecure-allow-remote-control] [--extra-arg value]...
+                     [--control-port port] [--extra-arg value]...
 vmflow uninstall     [--dry-run]
 ```
 
@@ -237,46 +235,25 @@ certificate cache directories are left in place unless the directory is
 exclusively owned by vmflow and contains a `.vmflow-owned` marker; use
 `--dry-run` to inspect the plan without changing the system.
 
-## Control API
+## Local management
 
-The control API is an **internal, loopback-only** interface (`127.0.0.1:19090`) used by the local CLI/TUI (`vmflow ctl`, `vmflow tui`) — not a public/external API. Interact via the CLI/TUI; the HTTP endpoints below are reference for local tooling and integrations. Documented in the [HTTP API guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/api.md). Main endpoints:
+The supported management interfaces are `vmflow ctl` and `vmflow tui`. The
+daemon uses an internal loopback-only control channel to implement them; that
+transport is not a public integration API and carries no compatibility promise.
+`control_port` changes the local port without making it externally reachable.
 
-- `GET /v1/rules`
-- `GET /v1/stats`
-- `GET /v1/session`
-- `GET /v1/config/rules`
-- `POST /v1/config/rules/precheck`
-- `PUT /v1/config/rules` (admin token and `If-Match` required)
-- `GET|PUT /v1/config/bot` (admin token; PUT requires `If-Match`)
-- `POST /v1/bot/start`, `POST /v1/bot/stop` (admin token)
-- `GET|POST /v1/precheck`
-- `POST /v1/reload`
-- `GET /metrics`
+For remote administration, forward the loopback port over SSH and continue to
+use the CLI/TUI locally:
+
+```bash
+ssh -N -L 19090:127.0.0.1:19090 user@server
+vmflow ctl rules
+```
 
 UDP admission-attempt failures and rate-limit queue-capacity drops are exposed in rule stats and
 as `vmflow_udp_session_rejected_total` and
 `vmflow_udp_packets_dropped_total` metrics. Manager-wide usage is exposed as
 `vmflow_udp_sessions_active` and `vmflow_udp_sessions_limit`.
-
-## Control API TLS
-
-The control API is plain HTTP by default. Serve it over TLS by setting `control_tls.cert_file` and `key_file`:
-
-```yaml
-control_tls:
-  cert_file: /etc/vmflow/control.crt
-  key_file: /etc/vmflow/control.key
-  client_ca_file: /etc/vmflow/clients-ca.crt   # optional → mTLS (clients must present a cert)
-  min_version: "1.2"   # "1.2" (default) | "1.3"
-```
-
-Clients then use `https://` for `-addr`. For a private/self-signed CA pass `--tls-ca-file` (or `VMFLOW_TLS_CA_FILE`); for mTLS also pass `--tls-client-cert` / `--tls-client-key` (or `VMFLOW_TLS_CLIENT_*`):
-
-```bash
-vmflow ctl -addr https://host:19090 -tls-ca-file ca.crt rules
-```
-
-With `cert_file`, `key_file`, and `client_ca_file` set (mTLS), the control API counts as authenticated for the non-loopback fail-closed rule, so it can be exposed without bearer auth. For public exposure, binding loopback behind a TLS-terminating reverse proxy (Caddy/Nginx + ACME) is usually simpler. To expose it with zero inbound ports (and optional SSO), see the [deployment guide](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/guide/deployment.md); the client `-H` flag carries Access service tokens.
 
 ## Telegram Bot
 
@@ -294,9 +271,12 @@ Commands:
 
 - `/status`, `/rules`, `/detail <id>` — read-only queries
 - `/reload` — reload configuration from disk
-- `/stop <id>`, `/start_rule <id>`, `/toggle <id>` — disable / enable / toggle a rule (persists to `config.yaml` via the control API, with precheck + optimistic locking)
+- `/stop <id>`, `/start_rule <id>`, `/toggle <id>` — disable / enable / toggle a rule (persists to `config.yaml` with precheck + optimistic locking)
 
-Write commands go through the same authenticated control handler as the TUI and `vmflow ctl`, so they get precheck, transactional apply with rollback, optimistic concurrency (`If-Match`), and audit logging. Conflicts (HTTP 412, e.g. someone edited the config concurrently) are reported to the chat with a retry hint. Bot requests stay in-process; external control API TLS and mTLS policy remains enforced for network clients without requiring a separate client certificate for the embedded bot.
+Write commands use the same authenticated internal control path as the TUI and
+`vmflow ctl`, so they get precheck, transactional apply with rollback,
+optimistic concurrency, and audit logging. Concurrent configuration edits are
+reported to the chat with a retry hint. Bot requests stay in-process.
 
 ### Configuring the bot from the TUI
 
@@ -307,7 +287,10 @@ You can also configure and control the bot at runtime from the TUI without editi
 - `s` / `x` start / stop the bot at runtime (not persisted; a daemon restart restores from config).
 - `r` refreshes.
 
-Bot configuration changes go through `GET/PUT /v1/config/bot` (admin, `If-Match` optimistic locking), so they are conflict-aware just like rule edits. A rejected token leaves the existing bot and file untouched; a file commit failure restores the previous runtime bot. Daemon restart is **not** required and forwarding is **not** interrupted.
+Bot configuration changes use the same conflict-aware persistence path as rule
+edits. A rejected token leaves the existing bot and file untouched; a file
+commit failure restores the previous runtime bot. Daemon restart is **not**
+required and forwarding is **not** interrupted.
 
 ## Embedding vmflow
 

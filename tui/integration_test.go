@@ -16,7 +16,7 @@ import (
 func TestClientAgainstControlAPIManagementHandler(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	raw := []byte(`version: 1
-control_listen_addr: 127.0.0.1:19090
+control_port: 19090
 udp_max_sessions: 256
 auth:
   enabled: true

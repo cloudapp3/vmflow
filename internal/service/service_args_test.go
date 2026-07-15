@@ -8,7 +8,7 @@ import (
 func TestValidateServiceExtraArgsRejectsReservedAndPositionalTokens(t *testing.T) {
 	tests := []string{
 		"-config", "--config=other.yaml",
-		"-log-file=other.log", "--control-listen", "-insecure-allow-remote-control=true",
+		"-log-file=other.log", "--control-port", "--control-listen", "-insecure-allow-remote-control=true",
 		"--service-name=other", "--", "positional",
 	}
 	for _, arg := range tests {

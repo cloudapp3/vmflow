@@ -95,7 +95,7 @@ func (f *fakeBotController) Running() bool {
 
 func botConfigYAML(token string, chat int64, control string) string {
 	return fmt.Sprintf(`version: 1
-control_listen_addr: 127.0.0.1:19090
+control_port: 19090
 auth:
   enabled: true
   tokens:

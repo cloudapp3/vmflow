@@ -1,7 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/cloudapp3/vmflow/engine"
@@ -25,7 +28,7 @@ func TestBundledConfigStartsWithoutForwarding(t *testing.T) {
 	}
 }
 
-func TestParseDefaultsControlListenAddr(t *testing.T) {
+func TestParseDefaultsControlPort(t *testing.T) {
 	cfg, err := Parse([]byte(`
 rules:
   - rule_id: r1
@@ -43,11 +46,83 @@ rules:
 	if cfg.Version != 1 {
 		t.Fatalf("expected version 1, got %d", cfg.Version)
 	}
-	if cfg.ControlListenAddr != DefaultControlListenAddr {
-		t.Fatalf("expected default control addr %s, got %s", DefaultControlListenAddr, cfg.ControlListenAddr)
+	if cfg.ControlPort != DefaultControlPort {
+		t.Fatalf("expected default control port %d, got %d", DefaultControlPort, cfg.ControlPort)
+	}
+	if cfg.ControlListenAddress() != DefaultControlListenAddr {
+		t.Fatalf("expected default control addr %s, got %s", DefaultControlListenAddr, cfg.ControlListenAddress())
 	}
 	if cfg.UDPMaxSessions != engine.DefaultUDPGlobalMaxSessions {
 		t.Fatalf("expected default UDP session limit %d, got %d", engine.DefaultUDPGlobalMaxSessions, cfg.UDPMaxSessions)
+	}
+}
+
+func TestParseRejectsUnsupportedVersion(t *testing.T) {
+	if _, err := Parse([]byte("version: 99\nrules: []\n")); err == nil || !strings.Contains(err.Error(), "unsupported config version") {
+		t.Fatalf("expected unsupported version error, got %v", err)
+	}
+}
+
+func TestParseControlPort(t *testing.T) {
+	cfg, err := Parse([]byte("control_port: 19123\nrules: []\n"))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if cfg.ControlPort != 19123 || cfg.ControlListenAddress() != "127.0.0.1:19123" {
+		t.Fatalf("unexpected control listener: port=%d addr=%q", cfg.ControlPort, cfg.ControlListenAddress())
+	}
+}
+
+func TestParseRejectsInvalidControlPort(t *testing.T) {
+	for _, value := range []string{"-1", "65536"} {
+		if _, err := Parse([]byte("control_port: " + value + "\nrules: []\n")); err == nil || !strings.Contains(err.Error(), "control_port") {
+			t.Fatalf("control_port=%s error = %v, want validation error", value, err)
+		}
+	}
+}
+
+func TestParseMigratesLoopbackControlListenAddr(t *testing.T) {
+	tests := []struct {
+		addr string
+		port int
+	}{
+		{addr: "127.0.0.1:19123", port: 19123},
+		{addr: "localhost:19124", port: 19124},
+		{addr: "[::1]:19125", port: 19125},
+	}
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			cfg, err := Parse([]byte("control_listen_addr: '" + tt.addr + "'\nrules: []\n"))
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			if !cfg.UsedDeprecatedControlListenAddr {
+				t.Fatal("legacy field usage was not recorded")
+			}
+			if cfg.ControlPort != tt.port || cfg.ControlListenAddress() != "127.0.0.1:"+strconv.Itoa(tt.port) {
+				t.Fatalf("legacy address was not mapped to fixed loopback: %q", cfg.ControlListenAddress())
+			}
+			encoded, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), "control_listen_addr") {
+				t.Fatalf("legacy field leaked into JSON: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestParseRejectsRemoteOrConflictingLegacyControlListenAddr(t *testing.T) {
+	tests := []string{
+		"control_listen_addr: 0.0.0.0:19090\nrules: []\n",
+		"control_listen_addr: ':19090'\nrules: []\n",
+		"control_port: 19090\ncontrol_listen_addr: 127.0.0.1:19090\nrules: []\n",
+	}
+	for _, raw := range tests {
+		if _, err := Parse([]byte(raw)); err == nil {
+			t.Fatalf("Parse(%q) succeeded, want rejection", raw)
+		}
 	}
 }
 
@@ -71,7 +146,6 @@ func TestParseRejectsInvalidUDPMaxSessions(t *testing.T) {
 
 func TestParseRejectsDuplicateRuleID(t *testing.T) {
 	_, err := Parse([]byte(`
-version: 1
 rules:
   - rule_id: dup
     name: a
@@ -97,7 +171,6 @@ rules:
 
 func TestParseAuthAndLogDefaults(t *testing.T) {
 	cfg, err := Parse([]byte(`
-version: 1
 log:
   format: json
 auth:
@@ -165,7 +238,6 @@ rules: []
 
 func TestParseBotControlToken(t *testing.T) {
 	cfg, err := Parse([]byte(`
-version: 1
 bot_token: "123:abc"
 bot_chat: 111
 bot_control_token: "admin-secret"
@@ -181,7 +253,6 @@ rules: []
 
 func TestParseStatsConfig(t *testing.T) {
 	cfg, err := Parse([]byte(`
-version: 1
 stats:
   persist: true
   path: " /var/lib/vmflow/stats.json "

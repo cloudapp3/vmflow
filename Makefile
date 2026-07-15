@@ -4,6 +4,7 @@ BINARY ?= vmflow
 CONFIG ?= ./examples/config.yaml
 GOCACHE ?= /tmp/vmflow-gocache
 GO_FILES := $(shell git ls-files '*.go' 2>/dev/null || find . -name '*.go' -not -path './.git/*' -not -path './.agents/*' -not -path './.claude/*' -not -path './.codex/*' -not -path './.lingma/*')
+GO_FILES := $(wildcard $(GO_FILES))
 
 build:
 	GOCACHE=$(GOCACHE) go build -buildvcs=false -trimpath -o $(BINARY) ./cmd/vmflow

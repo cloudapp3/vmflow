@@ -49,11 +49,9 @@ type Config struct {
 	// via -log-file; on macOS it sets the launchd capture paths. Windows defaults
 	// to a durable path under ProgramData because the SCM provides no stdout.
 	LogFile string
-	// ControlListen overrides the daemon control API listen address.
-	ControlListen string
-	// InsecureAllowRemoteControl permits an unauthenticated non-loopback control
-	// API. Callers should prefer configuring authentication instead.
-	InsecureAllowRemoteControl bool
+	// ControlPort overrides the daemon's loopback-only management port. Zero
+	// keeps the value from the config file.
+	ControlPort int
 	// ExtraArgs are individual extra arguments appended to the daemon command
 	// line for future daemon flags. Existing daemon flags have dedicated Config
 	// fields and are rejected here to prevent overriding validated paths.
@@ -88,6 +86,9 @@ func validateInstall(cfg Config) (Config, error) {
 	if err := validateServiceExtraArgs(cfg.ExtraArgs); err != nil {
 		return cfg, err
 	}
+	if cfg.ControlPort < 0 || cfg.ControlPort > 65535 {
+		return cfg, fmt.Errorf("control port must be 0 (use config) or between 1 and 65535")
+	}
 	binaryPath, err := trustedServiceBinaryPath(cfg.BinaryPath)
 	if err != nil {
 		return cfg, err
@@ -118,7 +119,7 @@ func validateServiceExtraArgs(args []string) error {
 			name = before
 		}
 		switch name {
-		case "config", "log-file", "control-listen", "insecure-allow-remote-control", "service-name":
+		case "config", "log-file", "control-port", "control-listen", "insecure-allow-remote-control", "service-name":
 			return fmt.Errorf("service extra argument %q overrides reserved daemon flag -%s; use the dedicated service option", raw, name)
 		}
 	}
