@@ -25,9 +25,11 @@ const (
 )
 
 type udpRunner struct {
-	rule   Rule
-	stats  boundRuleStats
-	target *net.UDPAddr
+	rule      Rule
+	stats     boundRuleStats
+	target    *net.UDPAddr
+	ipMatcher *sourceIPMatcher
+	policyErr error
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -86,20 +88,26 @@ func newUDPRunner(rule Rule, collector *Collector) Runner {
 
 func newUDPRunnerWithBudget(rule Rule, collector *Collector, budget *udpSessionBudget) Runner {
 	ctx, cancel := context.WithCancel(context.Background())
+	matcher, policyErr := compileSourceIPMatcher(rule.SourceIPMode, rule.SourceIPs)
 	if budget == nil {
 		budget = newUDPSessionBudget(DefaultUDPGlobalMaxSessions)
 	}
 	return &udpRunner{
-		rule:     rule,
-		stats:    collector.bindRule(rule.RuleID),
-		ctx:      ctx,
-		cancel:   cancel,
-		sessions: make(map[netip.AddrPort]*udpSession),
-		budget:   budget,
+		rule:      rule,
+		stats:     collector.bindRule(rule.RuleID),
+		ipMatcher: matcher,
+		policyErr: policyErr,
+		ctx:       ctx,
+		cancel:    cancel,
+		sessions:  make(map[netip.AddrPort]*udpSession),
+		budget:    budget,
 	}
 }
 
 func (runner *udpRunner) Start() error {
+	if runner.policyErr != nil {
+		return runner.policyErr
+	}
 	listenAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(runner.rule.ListenAddr), strconv.Itoa(runner.rule.ListenPort)))
 	if err != nil {
 		return err
@@ -153,6 +161,10 @@ func (runner *udpRunner) readLoop() {
 
 func (runner *udpRunner) handlePacket(clientAddr netip.AddrPort, payload []byte) {
 	if !clientAddr.IsValid() {
+		return
+	}
+	if runner.ipMatcher != nil && !runner.ipMatcher.allows(clientAddr.Addr()) {
+		runner.stats.incSourceIPDenied()
 		return
 	}
 	key := clientAddr

@@ -20,8 +20,10 @@ import (
 const DefaultTCPIdleTimeout = 5 * time.Minute
 
 type tcpRunner struct {
-	rule  Rule
-	stats boundRuleStats
+	rule      Rule
+	stats     boundRuleStats
+	ipMatcher *sourceIPMatcher
+	policyErr error
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -35,16 +37,22 @@ type tcpRunner struct {
 
 func newTCPRunner(rule Rule, collector *Collector) Runner {
 	ctx, cancel := context.WithCancel(context.Background())
+	matcher, policyErr := compileSourceIPMatcher(rule.SourceIPMode, rule.SourceIPs)
 	return &tcpRunner{
-		rule:   rule,
-		stats:  collector.bindRule(rule.RuleID),
-		ctx:    ctx,
-		cancel: cancel,
-		conns:  make(map[net.Conn]struct{}),
+		rule:      rule,
+		stats:     collector.bindRule(rule.RuleID),
+		ipMatcher: matcher,
+		policyErr: policyErr,
+		ctx:       ctx,
+		cancel:    cancel,
+		conns:     make(map[net.Conn]struct{}),
 	}
 }
 
 func (runner *tcpRunner) Start() error {
+	if runner.policyErr != nil {
+		return runner.policyErr
+	}
 	listenAddr := net.JoinHostPort(strings.TrimSpace(runner.rule.ListenAddr), strconv.Itoa(runner.rule.ListenPort))
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -78,6 +86,15 @@ func (runner *tcpRunner) acceptLoop() {
 				return
 			default:
 				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+
+		if runner.ipMatcher != nil {
+			clientIP, valid := sourceIPFromNetAddr(conn.RemoteAddr())
+			if !valid || !runner.ipMatcher.allows(clientIP) {
+				runner.stats.incSourceIPDenied()
+				_ = conn.Close()
 				continue
 			}
 		}

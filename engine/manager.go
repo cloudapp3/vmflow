@@ -253,7 +253,10 @@ func (manager *Manager) RunningRules() []Rule {
 	defer manager.mu.RUnlock()
 	rules := make([]Rule, 0, len(manager.running))
 	for _, item := range manager.running {
-		rules = append(rules, item.rule)
+		rule := item.rule
+		rule.Domains = append([]string(nil), item.rule.Domains...)
+		rule.SourceIPs = append([]string(nil), item.rule.SourceIPs...)
+		rules = append(rules, rule)
 	}
 	sort.Slice(rules, func(i, j int) bool { return rules[i].RuleID < rules[j].RuleID })
 	return rules
@@ -698,6 +701,7 @@ type ruleCounterState struct {
 	counter            *ruleCounter
 	uploadTotal        int64
 	downloadTotal      int64
+	sourceIPDenied     int64
 	udpSessionRejected int64
 	udpPacketsDropped  int64
 }
@@ -722,6 +726,7 @@ func snapshotCollectorState(collector *Collector) collectorStateSnapshot {
 			counter:            counter,
 			uploadTotal:        counter.uploadTotal.Load(),
 			downloadTotal:      counter.downloadTotal.Load(),
+			sourceIPDenied:     counter.sourceIPDenied.Load(),
 			udpSessionRejected: counter.udpSessionRejected.Load(),
 			udpPacketsDropped:  counter.udpPacketsDropped.Load(),
 		}
@@ -763,6 +768,7 @@ func restoreCollectorState(collector *Collector, snapshot collectorStateSnapshot
 		// timestamp must not be overwritten after the listener is active.
 		counter.uploadTotal.Add(state.uploadTotal)
 		counter.downloadTotal.Add(state.downloadTotal)
+		counter.sourceIPDenied.Add(state.sourceIPDenied)
 		counter.udpSessionRejected.Add(state.udpSessionRejected)
 		counter.udpPacketsDropped.Add(state.udpPacketsDropped)
 	}

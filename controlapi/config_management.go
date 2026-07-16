@@ -25,9 +25,15 @@ type sessionCapabilities struct {
 }
 
 type sessionResponse struct {
-	Actor        string              `json:"actor"`
-	Role         string              `json:"role"`
-	Capabilities sessionCapabilities `json:"capabilities"`
+	Actor         string              `json:"actor"`
+	Role          string              `json:"role"`
+	Capabilities  sessionCapabilities `json:"capabilities"`
+	APIVersion    string              `json:"api_version"`
+	ServerVersion string              `json:"server_version,omitempty"`
+	Commit        string              `json:"commit,omitempty"`
+	StartedTime   int64               `json:"started_time,omitempty"`
+	Degraded      bool                `json:"degraded"`
+	DegradedCause string              `json:"degraded_cause,omitempty"`
 }
 
 type rulesConfigRequest struct {
@@ -100,9 +106,20 @@ func (runtime *Runtime) handleSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writable := runtime.authenticator().Enabled() && info.canWrite()
+	degraded, degradedCause := runtime.degradedState()
+	var startedTime int64
+	if !runtime.StartedAt.IsZero() {
+		startedTime = runtime.StartedAt.Unix()
+	}
 	writeJSON(w, http.StatusOK, sessionResponse{
-		Actor: info.Name,
-		Role:  info.Role,
+		Actor:         info.Name,
+		Role:          info.Role,
+		APIVersion:    ManagementAPIVersion,
+		ServerVersion: strings.TrimSpace(runtime.ServerVersion),
+		Commit:        strings.TrimSpace(runtime.Commit),
+		StartedTime:   startedTime,
+		Degraded:      degraded,
+		DegradedCause: degradedCause,
 		Capabilities: sessionCapabilities{
 			RulesWrite: writable,
 		},

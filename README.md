@@ -19,10 +19,12 @@ Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmf
 ## TCP/UDP port forwarding features
 
 - TCP, UDP, and `tcp+udp` port forwarding
+- Per-rule IPv4/IPv6 source allowlists and denylists with CIDR support
 - Configurable TCP connection limits and bounded UDP sessions, with rejection/drop counters
 - Rule lifecycle management: start, stop, restart, and full snapshot apply
 - Config-driven foreground process with hot reload
 - Local CLI/TUI management for rules, stats, precheck, reload, and metrics
+- Read-only stdio MCP server for local AI-assisted diagnostics
 - Bearer-token auth with viewer/admin roles
 - Structured logs in text or JSON format
 - Prometheus-compatible `/metrics`
@@ -36,6 +38,7 @@ Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmf
 - Forward TCP services such as SSH, databases, and internal APIs between hosts.
 - Relay UDP services with bounded sessions, queues, idle cleanup, and drop metrics.
 - Run a self-hosted Layer 4 proxy on Linux, macOS, or Windows as a native service.
+- Inspect forwarding state and traffic from a local MCP client without exposing a new network service.
 - Embed TCP/UDP forwarding into a Go application, VPS panel, or network control plane.
 
 ## Quick start
@@ -132,7 +135,29 @@ rules:
     target_port: 22
     enabled: false
     max_conn: 0                     # TCP: unlimited; UDP: default of 256
+    source_ip_mode: allowlist       # off, allowlist, or denylist
+    source_ips:                     # literal IPv4/IPv6 or CIDR; max 256
+      - 203.0.113.8
+      - 198.51.100.0/24
+      - 2001:db8:100::/48
 ```
+
+`source_ip_mode` controls admission independently for each forwarding rule.
+With `allowlist`, only peers matching `source_ips` are accepted; with
+`denylist`, matching peers are rejected. Omit the fields or use `off` to allow
+all peers. A configured allowlist or denylist must contain at least one entry.
+Invalid modes, hostnames, malformed addresses, empty entries, and lists larger
+than 256 are rejected during startup and precheck. TCP is checked before the
+connection consumes `max_conn` or dials the target. UDP is checked before a
+session consumes per-rule or manager-wide capacity. Updating a source IP policy
+restarts that rule and closes its established TCP connections and UDP sessions
+so the new policy takes effect immediately.
+
+The policy matches the socket peer address. Behind NAT or a Layer 4 proxy that
+address may be the gateway or proxy rather than the original client. vmflow
+does not trust forwarded HTTP headers or PROXY protocol metadata. This is an
+application-level admission control and does not replace a cloud firewall,
+security group, or host firewall for volumetric attack filtering.
 
 `udp_max_sessions` limits active UDP sessions across every rule owned by the
 process (default `256`, maximum `4096`) and can be changed by config reload.
@@ -144,10 +169,11 @@ connections and UDP sessions; UDP sessions also consume the process-wide limit.
 Each UDP session owns a socket, a receive goroutine, and a 64 KiB receive
 buffer. Check available memory and open-file limits before raising either cap.
 
-Set `stats.persist: true` to preserve per-rule upload/download byte totals and
-UDP rejection/drop counters across restarts. Active connection counts and rates
-remain process-local. The foreground default is `stats.json` beside the loaded
-config. The installed Linux systemd unit uses its managed state directory
+Set `stats.persist: true` to preserve per-rule upload/download byte totals,
+source-IP denial totals, and UDP rejection/drop counters across restarts. Active
+connection counts and rates remain process-local. The foreground default is
+`stats.json` beside the loaded config. The installed Linux systemd unit uses its
+managed state directory
 (`/var/lib/vmflow/stats.json`), including when running with `--user vmflow`.
 An explicit relative `stats.path` is resolved beside the config file. vmflow
 refuses to start if the stats path aliases the config file or cannot be written.
@@ -170,6 +196,7 @@ auth is enabled and the token has the `admin` role. Viewer tokens and sessions
 with auth disabled are read-only. In the Rules view use `n`/`e`/`c` to create,
 edit, or copy, `space` to toggle, `d` to delete, `g` for the global UDP limit,
 `P` to precheck, `A` to apply, and `u` to discard the draft.
+The rule editor's Source IPs / CIDRs field accepts comma-separated entries.
 
 Apply writes the validated draft to the config loaded by the running process,
 which is the `config.yaml` beside the resolved vmflow binary by default (or the
@@ -182,6 +209,7 @@ require editing YAML and restarting vmflow.
 vmflow               [-config path] [-control-port 19090]
 vmflow ctl           [-token TOKEN] <rules|stats|metrics|precheck|reload>
 vmflow tui           [-token TOKEN]
+vmflow mcp           [-token TOKEN]
 vmflow version       [-json]
 vmflow update        [--check] [--version tag]
 vmflow service       (install|uninstall|status) [--config path] [--binary path] [--user name] [--log-file path]
@@ -237,10 +265,11 @@ exclusively owned by vmflow and contains a `.vmflow-owned` marker; use
 
 ## Local management
 
-The supported management interfaces are `vmflow ctl` and `vmflow tui`. The
-daemon uses an internal loopback-only control channel to implement them; that
-transport is not a public integration API and carries no compatibility promise.
-`control_port` changes the local port without making it externally reachable.
+The supported management interfaces are `vmflow ctl`, `vmflow tui`, and the
+read-only `vmflow mcp` adapter. The daemon uses an internal loopback-only
+control channel to implement them; that transport is not a public integration
+API and carries no compatibility promise. `control_port` changes the local port
+without making it externally reachable.
 
 For remote administration, forward the loopback port over SSH and continue to
 use the CLI/TUI locally:
@@ -250,10 +279,81 @@ ssh -N -L 19090:127.0.0.1:19090 user@server
 vmflow ctl rules
 ```
 
-UDP admission-attempt failures and rate-limit queue-capacity drops are exposed in rule stats and
-as `vmflow_udp_session_rejected_total` and
+Source-IP policy denials are exposed in rule stats and as
+`vmflow_rule_source_ip_denied_total`; the counter represents denied TCP
+connections or UDP datagrams according to the rule protocol. UDP
+admission-attempt failures and rate-limit queue-capacity drops are exposed as
+`vmflow_udp_session_rejected_total` and
 `vmflow_udp_packets_dropped_total` metrics. Manager-wide usage is exposed as
 `vmflow_udp_sessions_active` and `vmflow_udp_sessions_limit`.
+
+## MCP server
+
+`vmflow mcp` starts a foreground, tools-only MCP server over stdio. It connects
+to an already running local vmflow daemon and exits when the MCP client
+disconnects. It does not start forwarding, listen on an MCP network port, or
+modify the daemon configuration.
+
+Available tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `get_vmflow_status` | Connection, version, authorization, rule-count, traffic, and degraded-state summary |
+| `list_forwarding_rules` | Filtered rule summaries without endpoint or source-policy details |
+| `get_forwarding_rule` | Full configuration, running state, and statistics for one rule |
+| `get_traffic_stats` | Filtered and sorted per-rule counters plus aggregate totals |
+| `run_config_precheck` | Read-only validation of the daemon's current persisted configuration |
+
+Use a dedicated viewer token when daemon authentication is enabled. Prefer the
+`VMFLOW_CONTROL_TOKEN` environment variable so the token is not visible in the
+process command line:
+
+```yaml
+auth:
+  enabled: true
+  tokens:
+    - name: mcp-viewer
+      token: replace-with-a-long-random-token
+      role: viewer
+```
+
+Claude Desktop configuration:
+
+```json
+{
+  "mcpServers": {
+    "vmflow": {
+      "command": "/usr/local/bin/vmflow",
+      "args": ["mcp"],
+      "env": {
+        "VMFLOW_CONTROL_TOKEN": "replace-with-a-long-random-token"
+      }
+    }
+  }
+}
+```
+
+Codex configuration:
+
+```toml
+[mcp_servers.vmflow]
+command = "/usr/local/bin/vmflow"
+args = ["mcp"]
+env = { VMFLOW_CONTROL_TOKEN = "replace-with-a-long-random-token" }
+```
+
+If `control_port` is not `19090`, add `"-addr",
+"http://127.0.0.1:PORT"` to the client arguments. MCP management addresses are
+restricted to localhost and loopback IPs. For a remote daemon, run `vmflow mcp`
+on that host (for example through SSH) rather than exposing its management
+listener.
+
+Rule details contain target addresses, source IP policies, domains, and remarks;
+traffic and precheck results can also reveal local network topology. Tool
+results are sent to the model configured by the MCP client. The server exposes
+no write tools, raw configuration, bot tokens, certificate private keys, shell
+execution, file access, prompts, or resources. Precheck may resolve the targets
+already present in the daemon configuration.
 
 ## Telegram Bot
 

@@ -77,6 +77,59 @@ func TestStopAllPreservesCumulativeCounters(t *testing.T) {
 	}
 }
 
+func TestManagerSourceIPPolicySnapshotIsolation(t *testing.T) {
+	manager := newScriptedManager(NewCollector(), &scriptedRunnerFactory{startErrors: make(map[string][]error)})
+	defer manager.StopAll()
+	rule := transactionRule("isolated", "isolated", 21000)
+	rule.SourceIPMode = SourceIPModeAllowlist
+	rule.SourceIPs = []string{"192.0.2.1"}
+	if err := manager.StartRule(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	rule.SourceIPs[0] = "198.51.100.1"
+	first := manager.RunningRules()
+	if got := first[0].SourceIPs[0]; got != "192.0.2.1" {
+		t.Fatalf("caller mutation changed managed policy to %q", got)
+	}
+	first[0].SourceIPs[0] = "203.0.113.1"
+	if got := manager.RunningRules()[0].SourceIPs[0]; got != "192.0.2.1" {
+		t.Fatalf("snapshot mutation changed managed policy to %q", got)
+	}
+}
+
+func TestManagerRestartsOnlyForSemanticSourceIPPolicyChanges(t *testing.T) {
+	script := &scriptedRunnerFactory{startErrors: make(map[string][]error)}
+	manager := newScriptedManager(NewCollector(), script)
+	defer manager.StopAll()
+	rule := transactionRule("policy", "policy", 21000)
+	rule.SourceIPMode = SourceIPModeAllowlist
+	rule.SourceIPs = []string{"192.0.2.0/24", "2001:db8::/32"}
+	if err := manager.StartRule(rule); err != nil {
+		t.Fatal(err)
+	}
+
+	equivalent := rule
+	equivalent.SourceIPs = []string{"2001:db8::/32", "192.0.2.42/24", "192.0.2.0/24"}
+	result := manager.ApplySnapshot([]Rule{equivalent}, ApplySnapshotOptions{ReplaceAll: true})
+	if result.FailedRules != 0 || len(result.Items) != 1 || result.Items[0].Action != ApplyActionUnchanged {
+		t.Fatalf("equivalent policy apply = %+v", result)
+	}
+	if got := append([]string(nil), script.events...); !reflect.DeepEqual(got, []string{"start:policy"}) {
+		t.Fatalf("equivalent policy restarted runner: %v", got)
+	}
+
+	changed := equivalent
+	changed.SourceIPs = []string{"198.51.100.0/24"}
+	result = manager.ApplySnapshot([]Rule{changed}, ApplySnapshotOptions{ReplaceAll: true})
+	if result.FailedRules != 0 || len(result.Items) != 1 || result.Items[0].Action != ApplyActionRestarted {
+		t.Fatalf("changed policy apply = %+v", result)
+	}
+	if got := script.events; !reflect.DeepEqual(got, []string{"start:policy", "stop:policy", "start:policy"}) {
+		t.Fatalf("changed policy lifecycle = %v", got)
+	}
+}
+
 func TestApplySnapshotTransactionalPrevalidatesEntireBatch(t *testing.T) {
 	collector := NewCollector()
 	script := &scriptedRunnerFactory{startErrors: make(map[string][]error)}
@@ -122,6 +175,7 @@ func TestApplySnapshotTransactionalUpdateFailureRestoresOldRuleAndCounters(t *te
 	}
 	collector.AddUpload("a", 11)
 	collector.AddDownload("a", 22)
+	collector.IncSourceIPDenied("a")
 	collector.SetConns("a", 3)
 	counterBefore := manager.Snapshot("a")
 	protocolsBefore := manager.RuleProtocols()
@@ -143,7 +197,7 @@ func TestApplySnapshotTransactionalUpdateFailureRestoresOldRuleAndCounters(t *te
 		t.Fatalf("old rule was not restored: %+v", got)
 	}
 	gotCounter := manager.Snapshot("a")
-	if gotCounter.UploadBytes != counterBefore.UploadBytes || gotCounter.DownloadBytes != counterBefore.DownloadBytes || gotCounter.UDPSessionRejected != counterBefore.UDPSessionRejected || gotCounter.UDPPacketsDropped != counterBefore.UDPPacketsDropped {
+	if gotCounter.UploadBytes != counterBefore.UploadBytes || gotCounter.DownloadBytes != counterBefore.DownloadBytes || gotCounter.SourceIPDenied != counterBefore.SourceIPDenied || gotCounter.UDPSessionRejected != counterBefore.UDPSessionRejected || gotCounter.UDPPacketsDropped != counterBefore.UDPPacketsDropped {
 		t.Fatalf("cumulative counters after rollback = %+v, want values from %+v", gotCounter, counterBefore)
 	}
 	if gotCounter.Conns != 0 {

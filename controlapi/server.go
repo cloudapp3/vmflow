@@ -21,8 +21,14 @@ import (
 	"github.com/cloudapp3/vmflow/precheck"
 )
 
+// ManagementAPIVersion identifies the internal daemon management contract.
+const ManagementAPIVersion = "1"
+
 type Runtime struct {
 	ConfigPath      string
+	ServerVersion   string
+	Commit          string
+	StartedAt       time.Time
 	Manager         *engine.Manager
 	Logger          *slog.Logger
 	Auth            *Authenticator

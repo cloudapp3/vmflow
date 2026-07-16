@@ -28,6 +28,7 @@ func TestWriteMetrics(t *testing.T) {
 	collector.ObserveControlRequest("GET", "/v1/rules", 200, 10*time.Millisecond)
 	collector.ObserveReload("ok")
 	collector.ObserveApplyResult(result)
+	traffic.IncSourceIPDenied("disabled")
 	traffic.IncUDPSessionRejected("disabled")
 	traffic.IncUDPPacketsDropped("disabled")
 
@@ -41,6 +42,7 @@ func TestWriteMetrics(t *testing.T) {
 		"vmflow_udp_sessions_limit 256",
 		"vmflow_udp_sessions_active 0",
 		`vmflow_rule_connections{rule_id="disabled",protocol="udp"} 0`,
+		`vmflow_rule_source_ip_denied_total{rule_id="disabled",protocol="udp"} 1`,
 		`vmflow_udp_session_rejected_total{rule_id="disabled",protocol="udp"} 1`,
 		`vmflow_udp_packets_dropped_total{rule_id="disabled",protocol="udp"} 1`,
 		`vmflow_control_requests_total{method="GET",path="/v1/rules",status="200"} 1`,

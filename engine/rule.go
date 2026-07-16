@@ -16,22 +16,24 @@ const (
 )
 
 type Rule struct {
-	RuleID      string   `json:"rule_id" yaml:"rule_id"`
-	Name        string   `json:"name" yaml:"name"`
-	Protocol    Protocol `json:"protocol" yaml:"protocol"`
-	ListenAddr  string   `json:"listen_addr" yaml:"listen_addr"`
-	ListenPort  int      `json:"listen_port" yaml:"listen_port"`
-	TargetAddr  string   `json:"target_addr" yaml:"target_addr"`
-	TargetPort  int      `json:"target_port" yaml:"target_port"`
-	Enabled     bool     `json:"enabled" yaml:"enabled"`
-	SpeedLimit  int64    `json:"speed_limit" yaml:"speed_limit"`
-	MaxConn     int      `json:"max_conn" yaml:"max_conn"`
-	IdleTimeout int      `json:"idle_timeout,omitempty" yaml:"idle_timeout,omitempty"`
-	Domains     []string `json:"domains,omitempty" yaml:"domains,omitempty"`
-	Remark      string   `json:"remark,omitempty" yaml:"remark,omitempty"`
-	Revision    int64    `json:"revision,omitempty" yaml:"revision,omitempty"`
-	CreatedTime int64    `json:"created_time,omitempty" yaml:"created_time,omitempty"`
-	UpdatedTime int64    `json:"updated_time,omitempty" yaml:"updated_time,omitempty"`
+	RuleID       string       `json:"rule_id" yaml:"rule_id"`
+	Name         string       `json:"name" yaml:"name"`
+	Protocol     Protocol     `json:"protocol" yaml:"protocol"`
+	ListenAddr   string       `json:"listen_addr" yaml:"listen_addr"`
+	ListenPort   int          `json:"listen_port" yaml:"listen_port"`
+	TargetAddr   string       `json:"target_addr" yaml:"target_addr"`
+	TargetPort   int          `json:"target_port" yaml:"target_port"`
+	Enabled      bool         `json:"enabled" yaml:"enabled"`
+	SpeedLimit   int64        `json:"speed_limit" yaml:"speed_limit"`
+	MaxConn      int          `json:"max_conn" yaml:"max_conn"`
+	IdleTimeout  int          `json:"idle_timeout,omitempty" yaml:"idle_timeout,omitempty"`
+	SourceIPMode SourceIPMode `json:"source_ip_mode,omitempty" yaml:"source_ip_mode,omitempty"`
+	SourceIPs    []string     `json:"source_ips,omitempty" yaml:"source_ips,omitempty"`
+	Domains      []string     `json:"domains,omitempty" yaml:"domains,omitempty"`
+	Remark       string       `json:"remark,omitempty" yaml:"remark,omitempty"`
+	Revision     int64        `json:"revision,omitempty" yaml:"revision,omitempty"`
+	CreatedTime  int64        `json:"created_time,omitempty" yaml:"created_time,omitempty"`
+	UpdatedTime  int64        `json:"updated_time,omitempty" yaml:"updated_time,omitempty"`
 }
 
 func (rule Rule) Standardize() Rule {
@@ -40,6 +42,12 @@ func (rule Rule) Standardize() Rule {
 	rule.Protocol = standardizeProtocol(rule.Protocol)
 	rule.ListenAddr = strings.TrimSpace(rule.ListenAddr)
 	rule.TargetAddr = strings.TrimSpace(rule.TargetAddr)
+	rule.SourceIPMode = normalizeSourceIPMode(rule.SourceIPMode)
+	rule.SourceIPs = append([]string(nil), rule.SourceIPs...)
+	for index := range rule.SourceIPs {
+		rule.SourceIPs[index] = strings.TrimSpace(rule.SourceIPs[index])
+	}
+	rule.Domains = append([]string(nil), rule.Domains...)
 	rule.Remark = strings.TrimSpace(rule.Remark)
 	return rule
 }
@@ -89,6 +97,9 @@ func (rule Rule) Validate() error {
 	if rule.IdleTimeout < 0 {
 		return fmt.Errorf("idle_timeout must be >= 0")
 	}
+	if _, err := compileSourceIPMatcher(rule.SourceIPMode, rule.SourceIPs); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -103,7 +114,8 @@ func (rule Rule) RuntimeEqual(other Rule) bool {
 		left.Enabled == right.Enabled &&
 		left.SpeedLimit == right.SpeedLimit &&
 		runtimeMaxConn(left) == runtimeMaxConn(right) &&
-		left.IdleTimeout == right.IdleTimeout
+		left.IdleTimeout == right.IdleTimeout &&
+		sourceIPPoliciesEqual(left, right)
 }
 
 func runtimeMaxConn(rule Rule) int {
@@ -181,6 +193,7 @@ type TrafficSnapshot struct {
 	UploadBytes        int64  `json:"upload_bytes"`
 	DownloadBytes      int64  `json:"download_bytes"`
 	Conns              int64  `json:"conns"`
+	SourceIPDenied     int64  `json:"source_ip_denied_total,omitempty"`
 	UDPSessionRejected int64  `json:"udp_session_rejected_total,omitempty"`
 	UDPPacketsDropped  int64  `json:"udp_packets_dropped_total,omitempty"`
 	UpdatedTime        int64  `json:"updated_time"`

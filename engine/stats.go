@@ -12,6 +12,7 @@ type ruleCounter struct {
 	uploadTotal        atomic.Int64
 	downloadTotal      atomic.Int64
 	conns              atomic.Int64
+	sourceIPDenied     atomic.Int64
 	udpSessionRejected atomic.Int64
 	udpPacketsDropped  atomic.Int64
 	updatedAtUnix      atomic.Int64
@@ -118,6 +119,10 @@ func (collector *Collector) IncUDPSessionRejected(ruleID string) {
 	collector.bindRule(ruleID).incUDPSessionRejected()
 }
 
+func (collector *Collector) IncSourceIPDenied(ruleID string) {
+	collector.bindRule(ruleID).incSourceIPDenied()
+}
+
 func (collector *Collector) IncUDPPacketsDropped(ruleID string) {
 	collector.bindRule(ruleID).incUDPPacketsDropped()
 }
@@ -166,6 +171,7 @@ func (collector *Collector) Restore(snapshots []TrafficSnapshot) {
 		counter := collector.getCounter(stringsTrim(s.RuleID))
 		counter.uploadTotal.Store(s.UploadBytes)
 		counter.downloadTotal.Store(s.DownloadBytes)
+		counter.sourceIPDenied.Store(s.SourceIPDenied)
 		counter.udpSessionRejected.Store(s.UDPSessionRejected)
 		counter.udpPacketsDropped.Store(s.UDPPacketsDropped)
 		counter.updatedAtUnix.Store(time.Now().Unix())
@@ -261,6 +267,14 @@ func (stats boundRuleStats) incUDPSessionRejected() {
 	stats.touch()
 }
 
+func (stats boundRuleStats) incSourceIPDenied() {
+	if stats.counter == nil {
+		return
+	}
+	stats.counter.sourceIPDenied.Add(1)
+	stats.touch()
+}
+
 func (stats boundRuleStats) incUDPPacketsDropped() {
 	if stats.counter == nil {
 		return
@@ -282,6 +296,7 @@ func snapshotCounter(ruleID string, counter *ruleCounter) TrafficSnapshot {
 		UploadBytes:        counter.uploadTotal.Load(),
 		DownloadBytes:      counter.downloadTotal.Load(),
 		Conns:              counter.conns.Load(),
+		SourceIPDenied:     counter.sourceIPDenied.Load(),
 		UDPSessionRejected: counter.udpSessionRejected.Load(),
 		UDPPacketsDropped:  counter.udpPacketsDropped.Load(),
 		UpdatedTime:        counter.updatedAtUnix.Load(),

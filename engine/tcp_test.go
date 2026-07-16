@@ -147,6 +147,55 @@ func TestTCPMaxConnBurstNeverExceedsLimit(t *testing.T) {
 	}
 }
 
+func TestTCPSourceIPDenyBeforeConnectionAdmission(t *testing.T) {
+	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetLn.Close()
+	var targetAccepted atomic.Int64
+	go func() {
+		for {
+			conn, err := targetLn.Accept()
+			if err != nil {
+				return
+			}
+			targetAccepted.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	targetHost, targetPort := mustSplitHostPort(t, targetLn.Addr().String())
+
+	collector := NewCollector()
+	runner := newTCPRunner(Rule{
+		RuleID: "source-deny", Name: "source-deny", Protocol: ProtocolTCP,
+		ListenAddr: "127.0.0.1", ListenPort: 0, TargetAddr: targetHost, TargetPort: targetPort,
+		SourceIPMode: SourceIPModeDenylist, SourceIPs: []string{"127.0.0.0/8"},
+	}, collector).(*tcpRunner)
+	if err := runner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer runner.Stop()
+
+	client, err := net.DialTimeout("tcp", runner.ln.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = client.Close()
+	deadline := time.Now().Add(time.Second)
+	for collector.Snapshot("source-deny").SourceIPDenied == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	snapshot := collector.Snapshot("source-deny")
+	if snapshot.SourceIPDenied != 1 || snapshot.Conns != 0 || runner.activeConn.Load() != 0 {
+		t.Fatalf("denied connection consumed admission state: snapshot=%+v active=%d", snapshot, runner.activeConn.Load())
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := targetAccepted.Load(); got != 0 {
+		t.Fatalf("target accepted %d denied connections", got)
+	}
+}
+
 func TestTCPSingleDirectionActivityKeepsReversePathAlive(t *testing.T) {
 	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

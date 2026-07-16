@@ -45,6 +45,7 @@ Usage:
                                                                        Default config: config.yaml beside vmflow
   vmflow ctl           [-token token] <rules|stats|metrics|precheck|reload>    Query running vmflow
   vmflow tui           [-token token]                                  Terminal UI dashboard
+  vmflow mcp           [-token token]                                  Read-only MCP server over stdio
   vmflow version       [-json]                                         Show version info
   vmflow update        [--check] [--version tag]                       Self-update vmflow binary
   vmflow service       (install|uninstall|status) [--config path]      Register as a native OS service
@@ -68,6 +69,8 @@ func main() {
 		runCtl(args)
 	case "tui", "t":
 		runTUI(args)
+	case "mcp":
+		runMCP(args)
 	case "version", "v":
 		runVersion(args)
 	case "update", "u":
@@ -90,7 +93,7 @@ func routeCLI(args []string) (string, []string) {
 	switch args[0] {
 	case "-h", "--help", "help":
 		return "help", args[1:]
-	case "ctl", "c", "tui", "t", "version", "v", "update", "u", "service", "svc", "uninstall", "remove", "rm":
+	case "ctl", "c", "tui", "t", "mcp", "version", "v", "update", "u", "service", "svc", "uninstall", "remove", "rm":
 		return args[0], args[1:]
 	default:
 		if strings.HasPrefix(args[0], "-") {
@@ -289,6 +292,9 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 
 	runtime := &controlapi.Runtime{
 		ConfigPath:    configPath,
+		ServerVersion: strings.TrimSpace(version),
+		Commit:        optionalField(commit, "none"),
+		StartedAt:     time.Now(),
 		Manager:       manager,
 		Logger:        logger,
 		Auth:          controlapi.NewAuthenticator(cfg.Auth),

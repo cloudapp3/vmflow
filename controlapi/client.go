@@ -22,11 +22,14 @@ type StatsResponse struct {
 }
 
 type TrafficSnapshot struct {
-	RuleID        string `json:"rule_id"`
-	UploadBytes   int64  `json:"upload_bytes"`
-	DownloadBytes int64  `json:"download_bytes"`
-	Conns         int64  `json:"conns"`
-	UpdatedTime   int64  `json:"updated_time"`
+	RuleID             string `json:"rule_id"`
+	UploadBytes        int64  `json:"upload_bytes"`
+	DownloadBytes      int64  `json:"download_bytes"`
+	Conns              int64  `json:"conns"`
+	SourceIPDenied     int64  `json:"source_ip_denied_total,omitempty"`
+	UDPSessionRejected int64  `json:"udp_session_rejected_total,omitempty"`
+	UDPPacketsDropped  int64  `json:"udp_packets_dropped_total,omitempty"`
+	UpdatedTime        int64  `json:"updated_time"`
 }
 
 // RulesResponse is the legacy runtime-only rule endpoint. ConfigRulesResponse
@@ -47,9 +50,15 @@ type SessionCapabilities struct {
 }
 
 type SessionResponse struct {
-	Actor        string              `json:"actor"`
-	Role         string              `json:"role"`
-	Capabilities SessionCapabilities `json:"capabilities"`
+	Actor         string              `json:"actor"`
+	Role          string              `json:"role"`
+	Capabilities  SessionCapabilities `json:"capabilities"`
+	APIVersion    string              `json:"api_version,omitempty"`
+	ServerVersion string              `json:"server_version,omitempty"`
+	Commit        string              `json:"commit,omitempty"`
+	StartedTime   int64               `json:"started_time,omitempty"`
+	Degraded      bool                `json:"degraded"`
+	DegradedCause string              `json:"degraded_cause,omitempty"`
 }
 
 // ConfigRulesResponse is the GET /v1/config/rules payload. ETag is populated
@@ -79,6 +88,16 @@ type PrecheckResponse struct {
 	UDPMaxSessionsChanged bool             `json:"udp_max_sessions_changed"`
 	Diff                  []ConfigRuleDiff `json:"diff"`
 	Precheck              precheck.Result  `json:"precheck"`
+}
+
+// CurrentPrecheckResponse is the GET /v1/precheck payload for the daemon's
+// current on-disk configuration. A non-empty Error reports a configuration
+// load failure; Result still contains the corresponding structured finding.
+type CurrentPrecheckResponse struct {
+	ConfigPath string          `json:"config_path,omitempty"`
+	RuleCount  int             `json:"rule_count,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	Result     precheck.Result `json:"result"`
 }
 
 // ApplyResponse is the PUT /v1/config/rules success payload.
@@ -198,6 +217,17 @@ func (c *Client) Rules(ctx context.Context) (*RulesResponse, error) {
 func (c *Client) Session(ctx context.Context) (*SessionResponse, error) {
 	resp := new(SessionResponse)
 	if _, err := c.doJSON(ctx, http.MethodGet, "/v1/session", "", nil, resp, http.StatusOK); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// CurrentPrecheck validates the daemon's current on-disk configuration. HTTP
+// 400 is a structured precheck result rather than a transport error.
+func (c *Client) CurrentPrecheck(ctx context.Context) (*CurrentPrecheckResponse, error) {
+	resp := new(CurrentPrecheckResponse)
+	if _, err := c.doJSON(ctx, http.MethodGet, "/v1/precheck", "", nil, resp,
+		http.StatusOK, http.StatusBadRequest); err != nil {
 		return nil, err
 	}
 	return resp, nil
@@ -401,7 +431,7 @@ func responseETag(header http.Header, revision string) string {
 	return NormalizeETag(revision)
 }
 
-// CloneRules deep-copies a rule slice including each rule's Domains.
+// CloneRules deep-copies a rule slice including nested string slices.
 func CloneRules(rules []engine.Rule) []engine.Rule {
 	if rules == nil {
 		return nil
@@ -410,6 +440,7 @@ func CloneRules(rules []engine.Rule) []engine.Rule {
 	copy(result, rules)
 	for index := range result {
 		result[index].Domains = append([]string(nil), rules[index].Domains...)
+		result[index].SourceIPs = append([]string(nil), rules[index].SourceIPs...)
 	}
 	return result
 }

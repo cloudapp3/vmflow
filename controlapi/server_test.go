@@ -1,6 +1,7 @@
 package controlapi
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -138,6 +139,35 @@ rules:
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var response CurrentPrecheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		t.Fatalf("decode precheck response: %v", err)
+	}
+	if !response.Result.OK || response.RuleCount != 1 || response.ConfigPath != "config.yaml" {
+		t.Fatalf("precheck response = %+v", response)
+	}
+}
+
+func TestPrecheckEndpointReportsConfigLoadFailureAsFinding(t *testing.T) {
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.ConfigPath = t.TempDir() + "/missing.yaml"
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/precheck", nil)
+	NewHandler(runtime).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("precheck status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response CurrentPrecheckResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode precheck response: %v", err)
+	}
+	if response.Error != "configuration could not be loaded" || response.Result.OK || response.Result.ErrorCount != 1 {
+		t.Fatalf("precheck response = %+v", response)
+	}
+	if len(response.Result.Items) != 1 || response.Result.Items[0].Check != "config_load" {
+		t.Fatalf("precheck findings = %+v", response.Result.Items)
 	}
 }
 

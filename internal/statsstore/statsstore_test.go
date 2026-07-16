@@ -12,7 +12,7 @@ import (
 func TestSaveLoadRoundTrip(t *testing.T) {
 	store := New(filepath.Join(t.TempDir(), "stats.json"))
 	in := []engine.TrafficSnapshot{
-		{RuleID: "r1", UploadBytes: 100, DownloadBytes: 200, UDPSessionRejected: 3, UDPPacketsDropped: 5, Conns: 9},
+		{RuleID: "r1", UploadBytes: 100, DownloadBytes: 200, SourceIPDenied: 2, UDPSessionRejected: 3, UDPPacketsDropped: 5, Conns: 9},
 		{RuleID: "r2", UploadBytes: 50},
 	}
 	if err := store.Save(in); err != nil {
@@ -26,7 +26,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("len = %d, want 2: %+v", len(out), out)
 	}
 	got := out[0]
-	if got.RuleID != "r1" || got.UploadBytes != 100 || got.DownloadBytes != 200 || got.UDPSessionRejected != 3 || got.UDPPacketsDropped != 5 {
+	if got.RuleID != "r1" || got.UploadBytes != 100 || got.DownloadBytes != 200 || got.SourceIPDenied != 2 || got.UDPSessionRejected != 3 || got.UDPPacketsDropped != 5 {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
 	if got.Conns != 0 {

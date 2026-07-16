@@ -1,6 +1,7 @@
 package controlapi
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/engine"
@@ -28,6 +30,35 @@ func TestSessionReportsReadOnlyWithoutAuthentication(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), `"actor": "anonymous"`) ||
 		!strings.Contains(recorder.Body.String(), `"rules_write": false`) {
 		t.Fatalf("unexpected session response: %s", recorder.Body.String())
+	}
+}
+
+func TestSessionReportsServerMetadataAndDegradedState(t *testing.T) {
+	startedAt := time.Unix(1_721_234_567, 987_000_000).UTC()
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.ServerVersion = "v1.2.3"
+	runtime.Commit = "abcdef123456"
+	runtime.StartedAt = startedAt
+	runtime.markDegraded("configuration durability could not be confirmed")
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/session", nil)
+	NewHandler(runtime).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("session status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response SessionResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode session response: %v", err)
+	}
+	if response.APIVersion != ManagementAPIVersion || response.ServerVersion != "v1.2.3" || response.Commit != "abcdef123456" {
+		t.Fatalf("session metadata = %+v", response)
+	}
+	if response.StartedTime != startedAt.Unix() {
+		t.Fatalf("started_time = %d, want %d", response.StartedTime, startedAt.Unix())
+	}
+	if !response.Degraded || response.DegradedCause != "configuration durability could not be confirmed" {
+		t.Fatalf("degraded state = (%v, %q)", response.Degraded, response.DegradedCause)
 	}
 }
 
@@ -122,7 +153,7 @@ func TestRulesConfigPutPersistsAndReturnsNewRevision(t *testing.T) {
 	runtime, handler, configPath := newManagementTestHandler(t, managementConfig("old-rule"))
 	defer runtime.Manager.StopAll()
 	get := authenticatedManagementRequest(t, handler, http.MethodGet, "/v1/config/rules", "", "")
-	body := `{"udp_max_sessions":128,"rules":[{"rule_id":"new-rule","name":"new rule","protocol":"udp","listen_addr":"127.0.0.1","listen_port":24002,"target_addr":"127.0.0.1","target_port":53,"enabled":false,"remark":"managed"}]}`
+	body := `{"udp_max_sessions":128,"rules":[{"rule_id":"new-rule","name":"new rule","protocol":"udp","listen_addr":"127.0.0.1","listen_port":24002,"target_addr":"127.0.0.1","target_port":53,"enabled":false,"source_ip_mode":"allowlist","source_ips":["127.0.0.1","2001:db8::/32"],"remark":"managed"}]}`
 	put := authenticatedManagementRequest(t, handler, http.MethodPut, "/v1/config/rules", body, get.Header().Get("ETag"))
 	if put.Code != http.StatusOK {
 		t.Fatalf("put status = %d, want 200; body=%s", put.Code, put.Body.String())
@@ -137,6 +168,9 @@ func TestRulesConfigPutPersistsAndReturnsNewRevision(t *testing.T) {
 	if loaded.UDPMaxSessions != 128 || len(loaded.Rules) != 1 || loaded.Rules[0].RuleID != "new-rule" {
 		t.Fatalf("persisted configuration = %+v", loaded)
 	}
+	if loaded.Rules[0].SourceIPMode != engine.SourceIPModeAllowlist || len(loaded.Rules[0].SourceIPs) != 2 {
+		t.Fatalf("persisted source IP policy = %+v", loaded.Rules[0])
+	}
 	if loaded.Rules[0].Revision != 1 || loaded.Rules[0].CreatedTime == 0 || loaded.Rules[0].UpdatedTime == 0 {
 		t.Fatalf("server metadata was not assigned: %+v", loaded.Rules[0])
 	}
@@ -146,6 +180,15 @@ func TestRulesConfigPutPersistsAndReturnsNewRevision(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "custom_unknown: preserved") || !strings.Contains(string(raw), "# preserve this comment") {
 		t.Fatalf("managed write discarded unmanaged YAML content:\n%s", raw)
+	}
+}
+
+func TestCloneRulesDeepCopiesSourceIPs(t *testing.T) {
+	original := []engine.Rule{{RuleID: "one", SourceIPs: []string{"192.0.2.1"}}}
+	cloned := CloneRules(original)
+	cloned[0].SourceIPs[0] = "198.51.100.1"
+	if original[0].SourceIPs[0] != "192.0.2.1" {
+		t.Fatalf("CloneRules shared source IP storage: %+v", original)
 	}
 }
 

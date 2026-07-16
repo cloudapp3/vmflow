@@ -189,6 +189,61 @@ func TestDetailHidesZeroOnlyRateHistory(t *testing.T) {
 	}
 }
 
+func TestDetailShowsSourceIPPolicyAndDenials(t *testing.T) {
+	m := managedTestModel()
+	m.width = 90
+	m.height = 30
+	m.view = viewDetail
+	for index := range m.config.Rules {
+		if m.config.Rules[index].RuleID == m.selectedRuleID {
+			m.config.Rules[index].SourceIPMode = engine.SourceIPModeDenylist
+			m.config.Rules[index].SourceIPs = []string{"192.0.2.0/24"}
+		}
+	}
+	m.stats = &StatsResponse{Items: []TrafficSnapshot{{RuleID: m.selectedRuleID, SourceIPDenied: 7}}}
+	output := ansi.Strip(m.renderDetail())
+	for _, want := range []string{"IP Access", "denylist", "192.0.2.0/24", "IP Denied", "7"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("detail omitted %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestWideRulesShowSourceIPPolicySummary(t *testing.T) {
+	m := managedTestModel()
+	m.width = 160
+	m.height = 30
+	m.view = viewRules
+	for index := range m.config.Rules {
+		if m.config.Rules[index].RuleID == "running" {
+			m.config.Rules[index].SourceIPMode = engine.SourceIPModeAllowlist
+			m.config.Rules[index].SourceIPs = []string{"127.0.0.1", "192.0.2.0/24"}
+		}
+	}
+	output := ansi.Strip(m.renderRules())
+	if !strings.Contains(output, "ACCESS") || !strings.Contains(output, "ALLOW 2") {
+		t.Fatalf("wide rules omitted source policy summary:\n%s", output)
+	}
+}
+
+func TestCompactSourceIPPolicyDetailStaysInBounds(t *testing.T) {
+	m := managedTestModel()
+	m.width = 40
+	m.height = 12
+	m.view = viewDetail
+	for index := range m.config.Rules {
+		if m.config.Rules[index].RuleID == m.selectedRuleID {
+			m.config.Rules[index].SourceIPMode = engine.SourceIPModeAllowlist
+			m.config.Rules[index].SourceIPs = []string{"2001:db8:100::/48", "192.0.2.0/24"}
+		}
+	}
+	output := m.View()
+	if !strings.Contains(ansi.Strip(output), m.selectedRuleID) {
+		t.Fatalf("compact detail lost selected rule:\n%s", output)
+	}
+	assertRenderBounds(t, output, m.width, m.height)
+}
+
 func TestCompactPrecheckKeepsFindingsVisible(t *testing.T) {
 	m := managedTestModel()
 	m.width = 40

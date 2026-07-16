@@ -321,6 +321,29 @@ func TestEditorValidationAndProtocolCycle(t *testing.T) {
 	}
 }
 
+func TestEditorSourceIPPolicyAndCopy(t *testing.T) {
+	rule := testRule("protected", true, 2201)
+	editor := newRuleEditor(editorEdit, rule, []RuleInfo{rule})
+	for index := range editor.fields {
+		switch editor.fields[index].key {
+		case fieldSourceIPMode:
+			editor.fields[index].choice = string(engine.SourceIPModeAllowlist)
+		case fieldSourceIPs:
+			editor.fields[index].input.SetValue("192.0.2.1, 2001:db8::/32")
+		}
+	}
+	parsed, ok := editor.rule()
+	if !ok || parsed.SourceIPMode != engine.SourceIPModeAllowlist || len(parsed.SourceIPs) != 2 {
+		t.Fatalf("source policy edit = %+v errors=%+v", parsed, editor.errors)
+	}
+
+	copied := copyRule(parsed, []RuleInfo{parsed})
+	copied.SourceIPs[0] = "198.51.100.1"
+	if parsed.SourceIPs[0] != "192.0.2.1" {
+		t.Fatalf("copied rule shared source IP storage: %+v", parsed.SourceIPs)
+	}
+}
+
 func TestViewSmokeAtCommonSizes(t *testing.T) {
 	for _, size := range []struct{ width, height int }{{60, 20}, {100, 30}, {160, 45}} {
 		m := managedTestModel()

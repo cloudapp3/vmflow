@@ -6,7 +6,7 @@ log:
   level: info
   format: text # text or json
 
-# Optional persistence for cumulative per-rule traffic/drop counters. Live
+# Optional persistence for cumulative per-rule traffic/denial/drop counters. Live
 # connection counts and rates are never restored. Under the installed systemd
 # service the default is /var/lib/vmflow/stats.json; otherwise it is stats.json
 # beside this config. Relative path values are resolved beside this config.
@@ -51,4 +51,11 @@ rules:
     speed_limit: 0
     max_conn: 0        # TCP: unlimited; UDP: default 256 sessions
     idle_timeout: 300  # seconds; 0 = default 5 min. Reaps silent connections.
+    # Source IP policy: off (default), allowlist, or denylist. Entries are
+    # literal IPv4/IPv6 addresses or CIDRs; maximum 256 entries per rule.
+    # source_ip_mode: allowlist
+    # source_ips:
+    #   - 203.0.113.8
+    #   - 198.51.100.0/24
+    #   - 2001:db8:100::/48
     remark: example

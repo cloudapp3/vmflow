@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/cloudapp3/vmflow/engine"
 )
 
 func (m Model) View() string {
@@ -596,8 +597,8 @@ func (m Model) renderRules() string {
 	case m.width < 50:
 		b.WriteString(fmt.Sprintf("%-12s %-8s %-7s\n", "NAME", "STATE", "PROTO"))
 	case layout >= layoutWide:
-		b.WriteString(fmt.Sprintf("%-16s %-9s %-9s %-7s %-20s %-20s %6s %9s %9s\n",
-			"NAME", "STATE", "CHANGE", "PROTO", "LISTEN", "TARGET", "CONNS", "UP/S", "DOWN/S"))
+		b.WriteString(fmt.Sprintf("%-16s %-9s %-9s %-7s %-20s %-20s %-10s %6s %9s %9s\n",
+			"NAME", "STATE", "CHANGE", "PROTO", "LISTEN", "TARGET", "ACCESS", "CONNS", "UP/S", "DOWN/S"))
 	case layout >= layoutMedium:
 		b.WriteString(fmt.Sprintf("%-16s %-9s %-9s %-7s %-18s %-18s %6s\n",
 			"NAME", "STATE", "CHANGE", "PROTO", "LISTEN", "TARGET", "CONNS"))
@@ -638,9 +639,9 @@ func (m Model) renderRules() string {
 			name := marker + " " + cellColumn(rule.Name, 10)
 			line = fmt.Sprintf("%s %s %s", name, cellColumn(state, 8), protocolLabel(string(rule.Protocol)))
 		case layout >= layoutWide:
-			line = fmt.Sprintf("%s %s %s %s %s %s %6d %9s %9s",
+			line = fmt.Sprintf("%s %s %s %s %s %s %s %6d %9s %9s",
 				cellColumn(rule.Name, 16), cellColumn(state, 9), cellColumn(change, 9), protocolLabel(string(rule.Protocol)),
-				cellColumn(listen, 20), cellColumn(target, 20), snapshot.Conns,
+				cellColumn(listen, 20), cellColumn(target, 20), cellColumn(sourceIPPolicySummary(rule), 10), snapshot.Conns,
 				formatRate(rate.UploadRate), formatRate(rate.DownloadRate))
 		case layout >= layoutMedium:
 			line = fmt.Sprintf("%s %s %s %s %s %s %6d",
@@ -721,6 +722,10 @@ func (m Model) renderDetail() string {
 	b.WriteString(kvWrapped("Speed Limit", speedLimitStr(rule.SpeedLimit), innerWidth))
 	b.WriteString(kvWrapped("Max Conns", maxConnStr(rule.MaxConn), innerWidth))
 	b.WriteString(kvWrapped("Idle Timeout", fmt.Sprintf("%ds", rule.IdleTimeout), innerWidth))
+	b.WriteString(kvWrapped("IP Access", sourceIPModeLabel(rule.SourceIPMode), innerWidth))
+	if len(rule.SourceIPs) > 0 {
+		b.WriteString(kvWrapped("Source IPs", strings.Join(rule.SourceIPs, ", "), innerWidth))
+	}
 	if rule.Remark != "" {
 		b.WriteString(kvWrapped("Remark", rule.Remark, innerWidth))
 	}
@@ -732,6 +737,7 @@ func (m Model) renderDetail() string {
 	b.WriteString(kvWrapped("Upload", fmt.Sprintf("%s (%s)", formatBytes(stats.UploadBytes), formatRate(rate.UploadRate)), innerWidth))
 	b.WriteString(kvWrapped("Download", fmt.Sprintf("%s (%s)", formatBytes(stats.DownloadBytes), formatRate(rate.DownloadRate)), innerWidth))
 	b.WriteString(kvWrapped("Connections", fmt.Sprintf("%d", stats.Conns), innerWidth))
+	b.WriteString(kvWrapped("IP Denied", fmt.Sprintf("%d", stats.SourceIPDenied), innerWidth))
 	if history := m.history[rule.RuleID]; history != nil && len(history.uploadRates) > 1 && m.height >= 24 && historyHasTraffic(history) {
 		b.WriteString("\n")
 		b.WriteString(subtleStyle.Render("Upload rate"))
@@ -785,7 +791,7 @@ func (m Model) renderEditor() string {
 			value = badgeOfflineStyle.Render(truncate(message, inputWidth))
 		} else {
 			switch field.kind {
-			case editorProtocol:
+			case editorProtocol, editorSourceIPMode:
 				value = "< " + strings.ToUpper(field.choice) + " >"
 			case editorToggle:
 				if field.enabled {
@@ -1708,6 +1714,26 @@ func maxConnStr(value int) string {
 		return "protocol default"
 	}
 	return fmt.Sprintf("%d", value)
+}
+
+func sourceIPModeLabel(mode engine.SourceIPMode) string {
+	mode = engine.SourceIPMode(strings.ToLower(strings.TrimSpace(string(mode))))
+	if mode == "" {
+		return "off"
+	}
+	return string(mode)
+}
+
+func sourceIPPolicySummary(rule RuleInfo) string {
+	mode := sourceIPModeLabel(rule.SourceIPMode)
+	switch mode {
+	case string(engine.SourceIPModeAllowlist):
+		return fmt.Sprintf("ALLOW %d", len(rule.SourceIPs))
+	case string(engine.SourceIPModeDenylist):
+		return fmt.Sprintf("DENY %d", len(rule.SourceIPs))
+	default:
+		return "OPEN"
+	}
 }
 
 func timeSince(value time.Time) time.Duration {

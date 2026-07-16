@@ -26,6 +26,19 @@ func TestCheckConfigOK(t *testing.T) {
 	}
 }
 
+func TestCheckConfigWarnsAboutDuplicateAndRedundantSourceIPs(t *testing.T) {
+	rule := testForwardRule("source-policy", engine.ProtocolTCP, "127.0.0.1", 2201)
+	rule.SourceIPMode = engine.SourceIPModeAllowlist
+	rule.SourceIPs = []string{"192.0.2.0/24", "192.0.2.1", "192.0.2.42/24"}
+	result := CheckConfig(config.File{Rules: []engine.Rule{rule}}, nil, Options{})
+	if !result.OK || result.WarningCount != 2 {
+		t.Fatalf("source policy warnings = %+v", result)
+	}
+	if !hasCheck(result.Items, "source_ip_duplicate") || !hasCheck(result.Items, "source_ip_redundant") {
+		t.Fatalf("missing source policy warnings: %+v", result.Items)
+	}
+}
+
 func TestCheckConfigListenConflict(t *testing.T) {
 	port := 2201
 	cfg := config.File{Rules: []engine.Rule{

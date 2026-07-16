@@ -8,6 +8,7 @@ func TestBoundRuleStatsUpdatesSnapshot(t *testing.T) {
 	stats.addUpload(10)
 	stats.addDownload(20)
 	stats.incConns()
+	stats.incSourceIPDenied()
 	stats.incUDPSessionRejected()
 	stats.incUDPPacketsDropped()
 
@@ -15,7 +16,7 @@ func TestBoundRuleStatsUpdatesSnapshot(t *testing.T) {
 	if snapshot.UploadBytes != 10 || snapshot.DownloadBytes != 20 || snapshot.Conns != 1 {
 		t.Fatalf("unexpected traffic snapshot: %+v", snapshot)
 	}
-	if snapshot.UDPSessionRejected != 1 || snapshot.UDPPacketsDropped != 1 {
+	if snapshot.SourceIPDenied != 1 || snapshot.UDPSessionRejected != 1 || snapshot.UDPPacketsDropped != 1 {
 		t.Fatalf("unexpected UDP protection counters: %+v", snapshot)
 	}
 }
@@ -62,6 +63,7 @@ func TestNilCollectorStatsAreNoop(t *testing.T) {
 	collector.IncConns("rule")
 	collector.DecConns("rule")
 	collector.SetConns("rule", 0)
+	collector.IncSourceIPDenied("rule")
 	collector.IncUDPSessionRejected("rule")
 	collector.IncUDPPacketsDropped("rule")
 }

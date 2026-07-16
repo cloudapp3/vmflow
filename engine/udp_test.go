@@ -36,6 +36,27 @@ func TestUDPDefaultRuleSessionLimitRejectsOverflow(t *testing.T) {
 	}
 }
 
+func TestUDPSourceIPDenyBeforeSessionAdmission(t *testing.T) {
+	collector := NewCollector()
+	budget := newUDPSessionBudget(1)
+	runner := newUDPRunnerWithBudget(Rule{
+		RuleID: "udp-source-deny", SourceIPMode: SourceIPModeAllowlist,
+		SourceIPs: []string{"192.0.2.0/24"},
+	}, collector, budget).(*udpRunner)
+	defer runner.cancel()
+
+	runner.handlePacket(netip.MustParseAddrPort("127.0.0.1:12001"), []byte("denied"))
+	if got := len(runner.sessions); got != 0 {
+		t.Fatalf("denied UDP packet created %d sessions", got)
+	}
+	if _, active := budget.snapshot(); active != 0 {
+		t.Fatalf("denied UDP packet consumed budget: %d", active)
+	}
+	if got := collector.Snapshot("udp-source-deny").SourceIPDenied; got != 1 {
+		t.Fatalf("source IP denied counter = %d, want 1", got)
+	}
+}
+
 func TestUDPRunnerBudgetPairsSessionCreateAndClose(t *testing.T) {
 	target, stopTarget := startUDPSink(t)
 	defer stopTarget()

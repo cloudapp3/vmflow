@@ -172,6 +172,16 @@ func (c *Collector) Write(w io.Writer) error {
 		}
 	}
 
+	if _, err := fmt.Fprint(w, "# HELP vmflow_rule_source_ip_denied_total Total TCP connections or UDP datagrams denied by a rule's source IP policy.\n# TYPE vmflow_rule_source_ip_denied_total counter\n"); err != nil {
+		return err
+	}
+	for _, sample := range snapshots {
+		protocol := protocolForRule(protocols, sample.RuleID)
+		if _, err := fmt.Fprintf(w, "vmflow_rule_source_ip_denied_total{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.SourceIPDenied); err != nil {
+			return err
+		}
+	}
+
 	if _, err := fmt.Fprint(w, "# HELP vmflow_udp_session_rejected_total Total UDP session admission attempts rejected by rule or manager limits.\n# TYPE vmflow_udp_session_rejected_total counter\n"); err != nil {
 		return err
 	}

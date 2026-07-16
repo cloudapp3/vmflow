@@ -33,6 +33,7 @@ func TestRouteCLI(t *testing.T) {
 		{name: "ctl", input: []string{"ctl", "rules"}, wantCommand: "ctl", wantArgs: []string{"rules"}},
 		{name: "ctl alias", input: []string{"c", "rules"}, wantCommand: "c", wantArgs: []string{"rules"}},
 		{name: "tui", input: []string{"tui", "-addr", "http://localhost"}, wantCommand: "tui", wantArgs: []string{"-addr", "http://localhost"}},
+		{name: "mcp", input: []string{"mcp", "-addr", "http://127.0.0.1:19090"}, wantCommand: "mcp", wantArgs: []string{"-addr", "http://127.0.0.1:19090"}},
 		{name: "version", input: []string{"version", "-json"}, wantCommand: "version", wantArgs: []string{"-json"}},
 		{name: "update", input: []string{"update", "--check"}, wantCommand: "update", wantArgs: []string{"--check"}},
 		{name: "service", input: []string{"service", "status"}, wantCommand: "service", wantArgs: []string{"status"}},

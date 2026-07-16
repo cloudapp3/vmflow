@@ -57,6 +57,50 @@ rules:
 	}
 }
 
+func TestParseSourceIPPolicy(t *testing.T) {
+	cfg, err := Parse([]byte(`
+rules:
+  - rule_id: protected
+    name: protected
+    protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: 2201
+    target_addr: 127.0.0.1
+    target_port: 22
+    enabled: false
+    source_ip_mode: allowlist
+    source_ips:
+      - 192.0.2.1
+      - 2001:db8::/32
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule := cfg.Rules[0]
+	if rule.SourceIPMode != engine.SourceIPModeAllowlist || len(rule.SourceIPs) != 2 {
+		t.Fatalf("source IP policy = %+v", rule)
+	}
+}
+
+func TestParseRejectsInvalidSourceIPPolicy(t *testing.T) {
+	_, err := Parse([]byte(`
+rules:
+  - rule_id: invalid
+    name: invalid
+    protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: 2201
+    target_addr: 127.0.0.1
+    target_port: 22
+    enabled: false
+    source_ip_mode: allowlist
+    source_ips: [example.com]
+`))
+	if err == nil || !strings.Contains(err.Error(), "source_ips[0]") {
+		t.Fatalf("invalid source IP policy error = %v", err)
+	}
+}
+
 func TestParseRejectsUnsupportedVersion(t *testing.T) {
 	if _, err := Parse([]byte("version: 99\nrules: []\n")); err == nil || !strings.Contains(err.Error(), "unsupported config version") {
 		t.Fatalf("expected unsupported version error, got %v", err)

@@ -3,6 +3,7 @@ package precheck
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -142,6 +143,7 @@ func (c *checker) checkRules() {
 			c.addError("rule_validate", rule.RuleID, err.Error())
 			continue
 		}
+		c.checkSourceIPPolicy(rule)
 
 		if rule.ListenPort > 0 && rule.ListenPort < 1024 && rule.Enabled {
 			c.addWarning("privileged_port", rule.RuleID, fmt.Sprintf("listen_port %d may require elevated privileges", rule.ListenPort))
@@ -160,6 +162,38 @@ func (c *checker) checkRules() {
 
 		if c.opts.CheckTargetResolve && rule.Enabled {
 			c.checkTargetResolve(rule)
+		}
+	}
+}
+
+func (c *checker) checkSourceIPPolicy(rule engine.Rule) {
+	type sourceEntry struct {
+		index  int
+		prefix netip.Prefix
+	}
+	entries := make([]sourceEntry, 0, len(rule.SourceIPs))
+	seen := make(map[netip.Prefix]int, len(rule.SourceIPs))
+	for index, raw := range rule.SourceIPs {
+		prefix, err := engine.ParseSourceIPPrefix(raw)
+		if err != nil {
+			continue
+		}
+		if previous, ok := seen[prefix]; ok {
+			c.addWarning("source_ip_duplicate", rule.RuleID, fmt.Sprintf("source_ips[%d] duplicates source_ips[%d] (%s)", index, previous, prefix))
+			continue
+		}
+		seen[prefix] = index
+		entries = append(entries, sourceEntry{index: index, prefix: prefix})
+	}
+	for _, candidate := range entries {
+		for _, covering := range entries {
+			if candidate.index == covering.index || candidate.prefix.Addr().BitLen() != covering.prefix.Addr().BitLen() {
+				continue
+			}
+			if covering.prefix.Bits() < candidate.prefix.Bits() && covering.prefix.Contains(candidate.prefix.Addr()) {
+				c.addWarning("source_ip_redundant", rule.RuleID, fmt.Sprintf("source_ips[%d] (%s) is covered by source_ips[%d] (%s)", candidate.index, candidate.prefix, covering.index, covering.prefix))
+				break
+			}
 		}
 	}
 }

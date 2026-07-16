@@ -1,7 +1,7 @@
 // Package statsstore persists per-rule cumulative traffic counters to a JSON
-// file with atomic writes, so daemon restarts do not lose upload/download/drop
-// totals. It only stores cumulative values — live connection counts and rates
-// are not persisted.
+// file with atomic writes, so daemon restarts do not lose upload, download,
+// source-IP denial, or UDP protection totals. It only stores cumulative values;
+// live connection counts and rates are not persisted.
 package statsstore
 
 import (
@@ -112,6 +112,7 @@ type record struct {
 	RuleID             string `json:"rule_id"`
 	UploadBytes        int64  `json:"upload_bytes"`
 	DownloadBytes      int64  `json:"download_bytes"`
+	SourceIPDenied     int64  `json:"source_ip_denied,omitempty"`
 	UDPSessionRejected int64  `json:"udp_session_rejected,omitempty"`
 	UDPPacketsDropped  int64  `json:"udp_packets_dropped,omitempty"`
 }
@@ -129,6 +130,7 @@ func toRecords(snapshots []engine.TrafficSnapshot) []record {
 			RuleID:             s.RuleID,
 			UploadBytes:        s.UploadBytes,
 			DownloadBytes:      s.DownloadBytes,
+			SourceIPDenied:     s.SourceIPDenied,
 			UDPSessionRejected: s.UDPSessionRejected,
 			UDPPacketsDropped:  s.UDPPacketsDropped,
 		})
@@ -143,6 +145,7 @@ func fromRecords(records []record) []engine.TrafficSnapshot {
 			RuleID:             r.RuleID,
 			UploadBytes:        r.UploadBytes,
 			DownloadBytes:      r.DownloadBytes,
+			SourceIPDenied:     r.SourceIPDenied,
 			UDPSessionRejected: r.UDPSessionRejected,
 			UDPPacketsDropped:  r.UDPPacketsDropped,
 		})
