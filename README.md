@@ -7,14 +7,20 @@ pure Go. Run it as a single-binary network proxy or embed the forwarding runtime
 in your own Go control plane, with explicit resource limits, hot-reloadable
 rules, a terminal UI, and Prometheus metrics.
 
-[![Docs](https://img.shields.io/badge/docs-source-14b8a6)](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs)
+[![Docs](https://img.shields.io/badge/docs-vmflow.bestcheapvps.org-14b8a6)](https://vmflow.bestcheapvps.org/)
 [![CI](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml/badge.svg)](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cloudapp3/vmflow.svg)](https://pkg.go.dev/github.com/cloudapp3/vmflow)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/index.md) · [中文说明](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/zh/index.md) · [Docs source](https://github.com/cloudapp3/vmdocs)
+Documentation: [Website](https://vmflow.bestcheapvps.org/) · [中文](https://vmflow.bestcheapvps.org/zh/) · [Docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs)
 
 > **完整使用指南:** [中文文档源码](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs/zh) —— 覆盖安装、配置、运维、安全加固与排错。English quick reference is below; the deep guide is in the [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs).
+
+<p align="center">
+  <img src="assets/vmflow-demo.gif" width="960" alt="vmflow TUI dashboard, rules, and precheck views">
+</p>
+
+<p align="center"><sub>Real TUI output from the current vmflow build.</sub></p>
 
 ## TCP/UDP port forwarding features
 
@@ -43,12 +49,16 @@ Documentation: [English](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmf
 
 ## Quick start
 
-Install the latest prebuilt binary and a colocated config (Linux/macOS):
+Install the current MCP-enabled prerelease and a colocated config (Linux/macOS):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-  | bash -s -- --dir "$HOME/.local/bin"
+  | bash -s -- --version v0.2.0-rc.3 --dir "$HOME/.local/bin"
 ```
+
+Omit `--version v0.2.0-rc.3` to follow the latest stable release instead. The
+unversioned installer currently resolves to `v0.1.1`, which predates the MCP
+and Source IP policy features documented on this branch.
 
 The first install creates `~/.local/bin/config.yaml` with mode `0600`. Reinstalling
 or upgrading replaces only the binary and preserves the existing config. Running
@@ -85,7 +95,8 @@ Open the terminal UI or show build metadata:
 For a root-owned system installation, put both files in `/usr/local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --dir /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
+  | sudo bash -s -- --version v0.2.0-rc.3 --dir /usr/local/bin
 ```
 
 The installer downloads GitHub Release archives, verifies `checksums.txt` with SHA-256 by default, and auto-detects an install directory (`/usr/local/bin` → `~/.local/bin` → `~/bin`) when `--dir` is omitted. It installs `vmflow` and, only when absent, `config.yaml` in that directory. You can override the directory with `--dir PATH` or `VMFLOW_INSTALL_DIR`, and skip checksum verification with `--skip-verify` if needed. For private releases or higher GitHub API limits, set `GITHUB_TOKEN` or `GH_TOKEN`.
