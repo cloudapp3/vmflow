@@ -155,6 +155,306 @@ ln -s "$FAKE_INSTALL_RACE_VICTIM" "$FAKE_INSTALL_RACE_TARGET"
 	}
 }
 
+func TestInstallScriptAutoUserInstallUpdatesZshPathOnce(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installFakeUID(t, fixture.fakeBin, "1000")
+	sudoLog := filepath.Join(t.TempDir(), "sudo.log")
+	installFakeSudo(t, fixture.fakeBin)
+	t.Setenv("FAKE_SUDO_LOG", sudoLog)
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	args := []string{"--version", "v" + testInstallVersion}
+	out := runInstallScriptArgs(t, fixture, true, args...)
+	installDir := filepath.Join(home, ".local", "bin")
+	assertFileContent(t, filepath.Join(installDir, "vmflow"), "test-binary\n")
+	assertFileContent(t, filepath.Join(installDir, "config.yaml"), "version: 1\nrules: []\n")
+	if !strings.Contains(out, "Added "+installDir+" to "+filepath.Join(home, ".zshrc")) {
+		t.Fatalf("installer did not report the persistent PATH update:\n%s", out)
+	}
+
+	runInstallScriptArgs(t, fixture, true, args...)
+	rc, err := os.ReadFile(filepath.Join(home, ".zshrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathLine := `export PATH=` + installDir + `:$PATH`
+	if count := strings.Count(string(rc), pathLine); count != 1 {
+		t.Fatalf("PATH line count = %d, want 1:\n%s", count, rc)
+	}
+	if _, err := os.Lstat(sudoLog); !os.IsNotExist(err) {
+		t.Fatalf("automatic user install unexpectedly invoked sudo: %v", err)
+	}
+}
+
+func TestInstallScriptReadmeExportMakesBinaryResolvable(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	const script = `
+VMFLOW_BIN_DIR="$(
+  bash install.sh --version "$1" --print-install-dir
+)" \
+  && [ -n "$VMFLOW_BIN_DIR" ] \
+  && [ "${VMFLOW_BIN_DIR#/}" != "$VMFLOW_BIN_DIR" ] \
+  && [ -x "$VMFLOW_BIN_DIR/vmflow" ] \
+  && export PATH="$VMFLOW_BIN_DIR:$PATH" \
+  && command -v vmflow
+`
+	cmd := exec.Command("bash", "-c", script, "vmflow-readme-test", "v"+testInstallVersion)
+	cmd.Env = append(os.Environ(),
+		"PATH="+fixture.fakeBin+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"FAKE_ARCHIVE="+fixture.archive,
+		"FAKE_CHECKSUMS="+fixture.checksums,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("README PATH integration failed: %v\n%s", err, out)
+	}
+	want := filepath.Join(home, ".local", "bin", "vmflow")
+	if !strings.Contains(string(out), want+"\n") {
+		t.Fatalf("current shell did not resolve the installed binary %q:\n%s", want, out)
+	}
+}
+
+func TestInstallScriptAutoUserInstallPrefersUserBinInPath(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	userBin := filepath.Join(home, "bin")
+	if err := os.Mkdir(userBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", userBin+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	out := runInstallScriptArgs(t, fixture, true, "--version", "v"+testInstallVersion)
+	assertFileContent(t, filepath.Join(userBin, "vmflow"), "test-binary\n")
+	if !strings.Contains(out, "Verify the installation with:\n  vmflow version") {
+		t.Fatalf("installer did not report an immediately runnable command:\n%s", out)
+	}
+	if _, err := os.Lstat(filepath.Join(home, ".zshrc")); !os.IsNotExist(err) {
+		t.Fatalf("installer unexpectedly modified shell startup file: %v", err)
+	}
+}
+
+func TestInstallScriptExplicitDirDoesNotModifyShellPath(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	installDir := filepath.Join(home, "custom", "bin")
+	runInstallScript(t, fixture, installDir, true)
+	if _, err := os.Lstat(filepath.Join(home, ".zshrc")); !os.IsNotExist(err) {
+		t.Fatalf("explicit --dir unexpectedly modified shell startup file: %v", err)
+	}
+}
+
+func TestInstallScriptNoModifyPathLeavesShellFilesUntouched(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	out := runInstallScriptArgs(t, fixture, true,
+		"--version", "v"+testInstallVersion,
+		"--no-modify-path",
+	)
+	if _, err := os.Lstat(filepath.Join(home, ".zshrc")); !os.IsNotExist(err) {
+		t.Fatalf("--no-modify-path unexpectedly modified shell startup file: %v", err)
+	}
+	if !strings.Contains(out, "is not in your PATH") {
+		t.Fatalf("installer did not retain the PATH warning:\n%s", out)
+	}
+}
+
+func TestInstallScriptSystemModeUsesSudoForTargetWrites(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	installFakeUID(t, fixture.fakeBin, "1000")
+	sudoLog := filepath.Join(t.TempDir(), "sudo.log")
+	sudoPath := installFakeSudo(t, fixture.fakeBin)
+	t.Setenv("FAKE_SUDO_LOG", sudoLog)
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	installDir := filepath.Join(t.TempDir(), "system", "bin")
+	out := runInstallScriptArgs(t, fixture, true,
+		"--version", "v"+testInstallVersion,
+		"--system",
+		"--dir", installDir,
+	)
+	assertFileContent(t, filepath.Join(installDir, "vmflow"), "test-binary\n")
+	assertFileContent(t, filepath.Join(installDir, "config.yaml"), "version: 1\nrules: []\n")
+	assertFileContent(t, filepath.Join(installDir, testConfigMarker), "vmflow\n")
+
+	raw, err := os.ReadFile(sudoLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logOutput := string(raw)
+	for _, want := range []string{"-n -v", "mkdir -p " + installDir, "install -m 0755", "sh -c"} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("sudo log does not contain %q:\n%s", want, logOutput)
+		}
+	}
+
+	targetPath := filepath.Join(installDir, "vmflow")
+	privilegedCommand := `"` + sudoPath + `" "` + targetPath + `"`
+	if !strings.Contains(out, "Verify the root-owned system installation with:\n  "+privilegedCommand+" version") ||
+		!strings.Contains(out, "Start vmflow as root") || !strings.Contains(out, "\n  "+privilegedCommand+"\n") {
+		t.Fatalf("system install did not report root startup commands:\n%s", out)
+	}
+}
+
+func TestInstallScriptSystemModeRequiresSudoBeforeDownload(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("VMFLOW_SUDO", filepath.Join(t.TempDir(), "missing-sudo"))
+	curlMarker := filepath.Join(t.TempDir(), "curl-called")
+	t.Setenv("FAKE_CURL_MARKER", curlMarker)
+	writeExecutable(t, filepath.Join(fixture.fakeBin, "curl"), `#!/bin/sh
+set -eu
+: >"$FAKE_CURL_MARKER"
+exit 99
+`)
+
+	out := runInstallScriptArgs(t, fixture, false,
+		"--version", "v"+testInstallVersion,
+		"--system",
+	)
+	if !strings.Contains(out, "configured sudo command is not executable") {
+		t.Fatalf("unexpected missing-sudo failure:\n%s", out)
+	}
+	if _, err := os.Lstat(curlMarker); !os.IsNotExist(err) {
+		t.Fatalf("installer reached the download before rejecting sudo: %v", err)
+	}
+}
+
+func TestInstallScriptRootSystemModeDoesNotUseSudo(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	installFakeUID(t, fixture.fakeBin, "0")
+	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("VMFLOW_SUDO", filepath.Join(t.TempDir(), "missing-sudo"))
+	installDir := filepath.Join(t.TempDir(), "system", "bin")
+
+	out := runInstallScriptArgs(t, fixture, true,
+		"--version", "v"+testInstallVersion,
+		"--system",
+		"--dir", installDir,
+	)
+	targetPath := filepath.Join(installDir, "vmflow")
+	assertFileContent(t, targetPath, "test-binary\n")
+	if strings.Contains(out, "root-owned system installation") ||
+		!strings.Contains(out, "Start vmflow (loads ") || !strings.Contains(out, "\n  \""+targetPath+"\"\n") {
+		t.Fatalf("root system install did not report a direct startup command:\n%s", out)
+	}
+}
+
+func TestInstallScriptRootUpgradeReusesExistingUserInstall(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(installDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(installDir, "vmflow"), "old-binary\n")
+	const existingConfig = "version: 1\n# existing root rules\nrules: []\n"
+	if err := os.WriteFile(filepath.Join(installDir, "config.yaml"), []byte(existingConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(installDir, testConfigMarker), []byte("vmflow\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installFakeUID(t, fixture.fakeBin, "0")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	out := runInstallScriptArgs(t, fixture, true, "--version", "v"+testInstallVersion)
+	assertFileContent(t, filepath.Join(installDir, "vmflow"), "test-binary\n")
+	assertFileContent(t, filepath.Join(installDir, "config.yaml"), existingConfig)
+	if !strings.Contains(out, "Using existing installation directory: "+installDir) {
+		t.Fatalf("installer did not reuse the existing root install:\n%s", out)
+	}
+	assertFileContentContains(t, filepath.Join(home, ".zshrc"), "export PATH="+installDir+":$PATH")
+}
+
+func TestInstallScriptReusesActiveConventionalInstallBeforeStaleCopy(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	staleDir := filepath.Join(home, ".local", "bin")
+	activeDir := filepath.Join(home, "bin")
+	for _, dir := range []string{staleDir, activeDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("version: 1\nrules: []\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExecutable(t, filepath.Join(staleDir, "vmflow"), "stale-binary\n")
+	writeExecutable(t, filepath.Join(activeDir, "vmflow"), "active-binary\n")
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", activeDir+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	out := runInstallScriptArgs(t, fixture, true, "--version", "v"+testInstallVersion)
+	assertFileContent(t, filepath.Join(activeDir, "vmflow"), "test-binary\n")
+	assertFileContent(t, filepath.Join(staleDir, "vmflow"), "stale-binary\n")
+	if !strings.Contains(out, "Using existing installation directory: "+activeDir) {
+		t.Fatalf("installer did not reuse the active install:\n%s", out)
+	}
+}
+
+func TestInstallScriptUnsupportedShellDoesNotWriteProfile(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/usr/bin/fish")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	out := runInstallScriptArgs(t, fixture, true, "--version", "v"+testInstallVersion)
+	if _, err := os.Lstat(filepath.Join(home, ".profile")); !os.IsNotExist(err) {
+		t.Fatalf("unsupported shell unexpectedly modified .profile: %v", err)
+	}
+	if !strings.Contains(out, "unsupported shell fish") {
+		t.Fatalf("installer did not warn about the unsupported shell:\n%s", out)
+	}
+}
+
+func TestInstallScriptPrintInstallDirUsesStdoutOnly(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	installDir := filepath.Join(t.TempDir(), "install dir")
+	cmd := installScriptCommand(t, fixture,
+		"--version", "v"+testInstallVersion,
+		"--dir", installDir,
+		"--print-install-dir",
+	)
+	stdout, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("installer failed: %v", err)
+	}
+	if got, want := string(stdout), installDir+"\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
 type installFixture struct {
 	archive   string
 	checksums string
@@ -255,12 +555,15 @@ func writeInstallArchive(t *testing.T, path, configEntry string) {
 
 func runInstallScript(t *testing.T, fixture installFixture, installDir string, wantSuccess bool) string {
 	t.Helper()
-	cmd := exec.Command("bash", "install.sh", "--version", "v"+testInstallVersion, "--dir", installDir)
-	cmd.Env = append(os.Environ(),
-		"PATH="+fixture.fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"FAKE_ARCHIVE="+fixture.archive,
-		"FAKE_CHECKSUMS="+fixture.checksums,
+	return runInstallScriptArgs(t, fixture, wantSuccess,
+		"--version", "v"+testInstallVersion,
+		"--dir", installDir,
 	)
+}
+
+func runInstallScriptArgs(t *testing.T, fixture installFixture, wantSuccess bool, args ...string) string {
+	t.Helper()
+	cmd := installScriptCommand(t, fixture, args...)
 	out, err := cmd.CombinedOutput()
 	if wantSuccess && err != nil {
 		t.Fatalf("installer failed: %v\n%s", err, out)
@@ -271,6 +574,56 @@ func runInstallScript(t *testing.T, fixture installFixture, installDir string, w
 	return string(out)
 }
 
+func installScriptCommand(t *testing.T, fixture installFixture, args ...string) *exec.Cmd {
+	t.Helper()
+	cmdArgs := append([]string{"install.sh"}, args...)
+	cmd := exec.Command("bash", cmdArgs...)
+	cmd.Env = append(os.Environ(),
+		"PATH="+fixture.fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"FAKE_ARCHIVE="+fixture.archive,
+		"FAKE_CHECKSUMS="+fixture.checksums,
+	)
+	return cmd
+}
+
+func installFakeUID(t *testing.T, fakeBin, uid string) {
+	t.Helper()
+	t.Setenv("FAKE_UID", uid)
+	writeExecutable(t, filepath.Join(fakeBin, "id"), `#!/bin/sh
+set -eu
+if [ "${1:-}" = "-u" ]; then
+  printf '%s\n' "$FAKE_UID"
+  exit 0
+fi
+exec /usr/bin/id "$@"
+`)
+}
+
+func installFakeSudo(t *testing.T, fakeBin string) string {
+	t.Helper()
+	sudoPath := filepath.Join(fakeBin, "sudo")
+	t.Setenv("VMFLOW_SUDO", sudoPath)
+	writeExecutable(t, sudoPath, `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$FAKE_SUDO_LOG"
+if [ "${1:-}" = "-n" ] && [ "${2:-}" = "-v" ]; then
+  exit 0
+fi
+if [ "${1:-}" = "-v" ]; then
+  exit 0
+fi
+exec "$@"
+`)
+	return sudoPath
+}
+
+func writeExecutable(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertFileContent(t *testing.T, path, want string) {
 	t.Helper()
 	raw, err := os.ReadFile(path)
@@ -279,6 +632,17 @@ func assertFileContent(t *testing.T, path, want string) {
 	}
 	if string(raw) != want {
 		t.Fatalf("%s content = %q, want %q", path, raw, want)
+	}
+}
+
+func assertFileContentContains(t *testing.T, path, want string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), want) {
+		t.Fatalf("%s does not contain %q: %q", path, want, raw)
 	}
 }
 

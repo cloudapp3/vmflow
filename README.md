@@ -52,17 +52,33 @@ Documentation: [Website](https://vmflow.bestcheapvps.org/) · [中文](https://v
 Install the current MCP-enabled prerelease and a colocated config (Linux/macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-  | bash -s -- --version v0.2.0-rc.3 --dir "$HOME/.local/bin"
+VMFLOW_BIN_DIR="$(
+  curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
+    | bash -s -- --version v0.2.0-rc.3 --print-install-dir
+)" \
+  && [ -n "$VMFLOW_BIN_DIR" ] \
+  && [ "${VMFLOW_BIN_DIR#/}" != "$VMFLOW_BIN_DIR" ] \
+  && [ -x "$VMFLOW_BIN_DIR/vmflow" ] \
+  && export PATH="$VMFLOW_BIN_DIR:$PATH"
 ```
 
 Omit `--version v0.2.0-rc.3` to follow the latest stable release instead. The
 unversioned installer currently resolves to `v0.1.1`, which predates the MCP
 and Source IP policy features documented on this branch.
 
-The first install creates `~/.local/bin/config.yaml` with mode `0600`. Reinstalling
-or upgrading replaces only the binary and preserves the existing config. Running
-`vmflow` uses the `config.yaml` beside the resolved binary by default; `-config`
+Without an explicit `--dir`, the installer first reuses a conventional existing
+vmflow installation so upgrades keep its colocated config. A fresh root install
+uses `/usr/local/bin`; an unprivileged user prefers `~/.local/bin` or `~/bin`
+when either is already in `PATH`, then falls back to `~/.local/bin`. For an
+automatic home-directory install, the installer adds an idempotent entry to the
+selected shell's common startup file (`.zshrc`, `.bashrc`, or `.profile`) and
+prints the exact reload command; other shells receive a warning. The captured
+directory and `export` above make the selected binary available in the current
+shell without guessing its location.
+
+The first install creates `config.yaml` beside the binary with mode `0600`.
+Reinstalling or upgrading replaces only the binary and preserves the existing
+config. Running `vmflow` uses the colocated config by default; `-config`
 overrides that path.
 
 The bundled SSH forwarding example is disabled and listens on loopback only.
@@ -73,33 +89,47 @@ forwarding port.
 Start vmflow in one terminal:
 
 ```bash
-"$HOME/.local/bin/vmflow"
+vmflow
 ```
 
 Query it from another terminal:
 
 ```bash
-"$HOME/.local/bin/vmflow" ctl rules
-"$HOME/.local/bin/vmflow" ctl stats
-"$HOME/.local/bin/vmflow" ctl metrics
-"$HOME/.local/bin/vmflow" ctl precheck
+vmflow ctl rules
+vmflow ctl stats
+vmflow ctl metrics
+vmflow ctl precheck
 ```
 
 Open the terminal UI or show build metadata:
 
 ```bash
-"$HOME/.local/bin/vmflow" tui
-"$HOME/.local/bin/vmflow" version -json
+vmflow tui
+vmflow version -json
 ```
 
-For a root-owned system installation, put both files in `/usr/local/bin`:
+To explicitly request a system installation, use `--system`. It writes directly
+when already root and otherwise validates sudo before downloading, then uses
+sudo only to prepare, inspect, and write the target directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-  | sudo bash -s -- --version v0.2.0-rc.3 --dir /usr/local/bin
+  | bash -s -- --version v0.2.0-rc.3 --system
 ```
 
-The installer downloads GitHub Release archives, verifies `checksums.txt` with SHA-256 by default, and auto-detects an install directory (`/usr/local/bin` → `~/.local/bin` → `~/bin`) when `--dir` is omitted. It installs `vmflow` and, only when absent, `config.yaml` in that directory. You can override the directory with `--dir PATH` or `VMFLOW_INSTALL_DIR`, and skip checksum verification with `--skip-verify` if needed. For private releases or higher GitHub API limits, set `GITHUB_TOKEN` or `GH_TOKEN`.
+When a non-root user requests `--system`, a newly created colocated config stays
+root-owned with mode `0600`; the installer therefore prints sudo/root commands
+for verification and startup. The default quick start above uses a per-user
+install instead and makes `vmflow` directly runnable in the current shell.
+
+The installer downloads GitHub Release archives, verifies `checksums.txt` with
+SHA-256 by default, and installs `vmflow` plus, only when absent, a colocated
+`config.yaml`. Override the automatic directory with `--dir PATH` or
+`VMFLOW_INSTALL_DIR`; explicit directories never modify shell startup files.
+Use `--no-modify-path` to disable startup-file changes for an automatic user
+install, `--print-install-dir` for machine-readable PATH integration, and
+`--skip-verify` to skip checksum verification if needed. For private releases
+or higher GitHub API limits, set `GITHUB_TOKEN` or `GH_TOKEN`.
 
 Or build from source:
 

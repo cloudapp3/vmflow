@@ -6,28 +6,47 @@ BINARY_NAME="vmflow"
 CONFIG_NAME="config.yaml"
 CONFIG_MARKER_NAME=".vmflow-config-owned"
 INSTALL_DIR="${VMFLOW_INSTALL_DIR:-}"
+INSTALL_DIR_EXPLICIT=0
 VERSION=""
 SKIP_VERIFY=0
 UNINSTALL=0
+SYSTEM_INSTALL=0
+NO_MODIFY_PATH="${VMFLOW_NO_MODIFY_PATH:-0}"
+PRINT_INSTALL_DIR=0
+USE_SUDO=0
+SUDO_BIN="${VMFLOW_SUDO:-}"
+PATH_RC=""
+REUSING_INSTALL=0
+
+if [ -n "$INSTALL_DIR" ]; then
+  INSTALL_DIR_EXPLICIT=1
+fi
 
 usage() {
   cat <<'EOF'
 Install vmflow from GitHub Releases.
 
 Usage:
-  install.sh [--version vX.Y.Z] [--dir PATH] [--skip-verify] [--uninstall]
+  install.sh [--version vX.Y.Z] [--dir PATH] [--system] [--skip-verify]
+             [--no-modify-path] [--print-install-dir] [--uninstall]
 
 Options:
   --version <tag>   Install a specific release tag. Defaults to the latest release.
-  --dir <path>      Install directory. Auto-detected in order: /usr/local/bin,
-                    ~/.local/bin, ~/bin. Override with VMFLOW_INSTALL_DIR env var.
+  --dir <path>      Install directory. Overrides automatic root/user selection.
+                    Also available through VMFLOW_INSTALL_DIR.
+  --system          Install system-wide to /usr/local/bin (or the explicit --dir).
+                    Uses sudo only for target checks and writes when needed.
+                    A newly created config remains root-owned with mode 0600.
   --skip-verify     Skip SHA-256 checksum verification.
+  --no-modify-path  Do not add an automatic user install to a shell startup file.
+  --print-install-dir
+                    Print the selected install directory to stdout after success.
   --uninstall       Uninstall vmflow instead of installing. Stops the service
                     and removes the binary, config, logs, and cache.
   -h, --help        Show this help message.
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --dir /usr/local/bin
+  curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash -s -- --system
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | bash
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh | sudo bash -s -- --uninstall
 EOF
@@ -57,6 +76,224 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
+run_privileged() {
+  local command_name
+  local command_path
+
+  if [ "$USE_SUDO" -eq 1 ]; then
+    command_name="$1"
+    shift
+    case "$command_name" in
+      test)
+        for command_path in /usr/bin/test /bin/test; do
+          [ -x "$command_path" ] && break
+        done
+        ;;
+      mkdir)
+        for command_path in /usr/bin/mkdir /bin/mkdir; do
+          [ -x "$command_path" ] && break
+        done
+        ;;
+      *)
+        die "internal error: no trusted privileged command path for ${command_name}"
+        ;;
+    esac
+    [ -x "$command_path" ] \
+      || die "required privileged command not found: ${command_name}"
+    "$SUDO_BIN" "$command_path" "$@"
+  else
+    "$@"
+  fi
+}
+
+create_exclusive_from_file() {
+  local target="$1"
+  local source="$2"
+
+  if [ "$USE_SUDO" -eq 1 ]; then
+    "$SUDO_BIN" /bin/sh -c 'umask 077; set -C; /bin/cat >"$1"' vmflow-install "$target" <"$source"
+  else
+    create_exclusive_file "$target" cat "$source"
+  fi
+}
+
+create_exclusive_with_text() {
+  local target="$1"
+  local value="$2"
+
+  if [ "$USE_SUDO" -eq 1 ]; then
+    "$SUDO_BIN" /bin/sh -c 'umask 077; set -C; printf "%s" "$2" >"$1"' vmflow-install "$target" "$value"
+  else
+    create_exclusive_file "$target" printf '%s' "$value"
+  fi
+}
+
+dir_can_be_created() {
+  local dir="$1"
+  local parent
+
+  while [ ! -e "$dir" ]; do
+    parent="$(dirname "$dir")"
+    [ "$parent" != "$dir" ] || return 1
+    dir="$parent"
+  done
+
+  [ -d "$dir" ] && [ -w "$dir" ]
+}
+
+prepare_system_privileges() {
+  [ "$SYSTEM_INSTALL" -eq 1 ] || return 0
+
+  if [ "$(id -u)" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ -n "$SUDO_BIN" ]; then
+    case "$SUDO_BIN" in
+      /*) ;;
+      *) die "VMFLOW_SUDO must be an absolute path" ;;
+    esac
+    [ -x "$SUDO_BIN" ] || die "configured sudo command is not executable: ${SUDO_BIN}"
+  else
+    for candidate in /usr/bin/sudo /bin/sudo; do
+      if [ -x "$candidate" ]; then
+        SUDO_BIN="$candidate"
+        break
+      fi
+    done
+    [ -n "$SUDO_BIN" ] || die "system installation requires root or sudo"
+  fi
+
+  if "$SUDO_BIN" -n -v >/dev/null 2>&1; then
+    USE_SUDO=1
+    return 0
+  fi
+
+  [ -e /dev/tty ] || die "system installation requires root or an interactive sudo session"
+  "$SUDO_BIN" -v </dev/tty || die "sudo authentication failed; rerun as root or without --system"
+  USE_SUDO=1
+}
+
+is_reusable_install_dir() {
+  local dir="$1"
+
+  [ -x "$dir/$BINARY_NAME" ] && [ -f "$dir/$BINARY_NAME" ] \
+    && [ ! -L "$dir/$BINARY_NAME" ] \
+    && [ -f "$dir/$CONFIG_NAME" ] && [ ! -L "$dir/$CONFIG_NAME" ] \
+    && dir_can_be_created "$dir"
+}
+
+select_install_dir() {
+  local existing_binary
+  local existing_dir
+  local d
+
+  [ -n "$INSTALL_DIR" ] && return 0
+
+  if [ "$SYSTEM_INSTALL" -eq 1 ]; then
+    INSTALL_DIR="/usr/local/bin"
+    return 0
+  fi
+
+  existing_binary="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
+  if [ -n "$existing_binary" ] && [ -x "$existing_binary" ] \
+    && [ -f "$existing_binary" ] && [ ! -L "$existing_binary" ]; then
+    existing_dir="$(dirname "$existing_binary")"
+    case "$existing_dir" in
+      "$HOME/.local/bin"|"$HOME/bin"|/usr/local/bin)
+        if is_reusable_install_dir "$existing_dir"; then
+          INSTALL_DIR="$existing_dir"
+          REUSING_INSTALL=1
+          return 0
+        fi
+        ;;
+    esac
+  fi
+
+  # Preserve the colocated config chosen by earlier installer versions when
+  # vmflow is not currently in PATH. This avoids creating a second binary/config
+  # pair for root users upgrading from the former ~/.local/bin quick start.
+  for d in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
+    if is_reusable_install_dir "$d"; then
+      INSTALL_DIR="$d"
+      REUSING_INSTALL=1
+      return 0
+    fi
+  done
+
+  if [ "$(id -u)" -eq 0 ]; then
+    INSTALL_DIR="/usr/local/bin"
+    return 0
+  fi
+
+  # Prefer a conventional user bin directory only when it is already in PATH.
+  # Otherwise the fallback below will add ~/.local/bin to the user's shell
+  # startup file and the caller can export it for the current shell.
+  for d in "$HOME/.local/bin" "$HOME/bin"; do
+    if path_has_dir "$d" && dir_can_be_created "$d"; then
+      INSTALL_DIR="$d"
+      return 0
+    fi
+  done
+
+  for d in "$HOME/.local/bin" "$HOME/bin"; do
+    if dir_can_be_created "$d"; then
+      INSTALL_DIR="$d"
+      return 0
+    fi
+  done
+
+  INSTALL_DIR="$HOME/.local/bin"
+}
+
+configure_user_path() {
+  local install_dir="$1"
+  local shell_path="${SHELL:-}"
+  local shell_name="${shell_path##*/}"
+  local rc_file
+  local path_line
+  local quoted_install_dir
+
+  [ "$SYSTEM_INSTALL" -eq 0 ] || return 0
+  [ "$INSTALL_DIR_EXPLICIT" -eq 0 ] || return 0
+  [ "$NO_MODIFY_PATH" != "1" ] || return 0
+  path_has_dir "$install_dir" && return 0
+  case "$install_dir" in
+    "$HOME"/*) ;;
+    *) return 0 ;;
+  esac
+
+  case "$shell_name" in
+    zsh)  rc_file="$HOME/.zshrc" ;;
+    bash) rc_file="$HOME/.bashrc" ;;
+    sh|dash|ksh) rc_file="$HOME/.profile" ;;
+    *)
+      log "Warning: unsupported shell ${shell_name:-<unknown>}; PATH startup file was not modified."
+      return 0
+      ;;
+  esac
+
+  if [ -L "$rc_file" ] || { [ -e "$rc_file" ] && [ ! -f "$rc_file" ]; }; then
+    log "Warning: cannot update shell PATH because ${rc_file} is not a regular file."
+    return 0
+  fi
+  if [ -e "$rc_file" ] && [ ! -w "$rc_file" ]; then
+    log "Warning: cannot update shell PATH because ${rc_file} is not writable."
+    return 0
+  fi
+
+  printf -v quoted_install_dir '%q' "$install_dir"
+  path_line="export PATH=${quoted_install_dir}:\$PATH"
+  if [ ! -f "$rc_file" ] || ! grep -Fqx "$path_line" "$rc_file" 2>/dev/null; then
+    if ! printf '\n# vmflow user install\n%s\n' "$path_line" >>"$rc_file"; then
+      log "Warning: could not add ${install_dir} to ${rc_file}."
+      return 0
+    fi
+  fi
+
+  PATH_RC="$rc_file"
+}
+
 path_has_dir() (
   dir="$1"
 
@@ -81,21 +318,25 @@ print_path_hint() {
   local target_path="$2"
   local config_path="$3"
 
-  if path_has_dir "$install_dir"; then
+  if [ "$USE_SUDO" -eq 1 ]; then
+    log "Verify the root-owned system installation with:"
+    log "  \"${SUDO_BIN}\" \"${target_path}\" version"
+  elif path_has_dir "$install_dir"; then
     log "Verify the installation with:"
     log "  ${BINARY_NAME} version"
   else
-    log "Warning: ${install_dir} is not in your PATH, so running \"${BINARY_NAME}\" may fail."
+    if [ -n "$PATH_RC" ]; then
+      log "Added ${install_dir} to ${PATH_RC}."
+      log "Reload it with:"
+      log "  . \"${PATH_RC}\""
+    else
+      log "Warning: ${install_dir} is not in your PATH, so running \"${BINARY_NAME}\" may fail."
+    fi
     log ""
     log "You can run it directly with:"
     log "  \"${target_path}\" version"
     log ""
-    if [ "$install_dir" != "/usr/local/bin" ]; then
-      log "To make \"${BINARY_NAME}\" available globally, either create a symlink:"
-      log "  sudo ln -sf \"${target_path}\" \"/usr/local/bin/${BINARY_NAME}\""
-      log ""
-    fi
-    log "Or add ${install_dir} to your shell PATH:"
+    log "To use \"${BINARY_NAME}\" in this shell, run:"
     log "  export PATH=\"${install_dir}:\$PATH\""
   fi
 
@@ -104,8 +345,13 @@ print_path_hint() {
   log "  ${config_path}"
   log "Upgrades preserve existing rules, including enabled public listeners."
   log ""
-  log "Start vmflow (loads ${config_path} by default):"
-  log "  \"${target_path}\""
+  if [ "$USE_SUDO" -eq 1 ]; then
+    log "Start vmflow as root (loads ${config_path} by default):"
+    log "  \"${SUDO_BIN}\" \"${target_path}\""
+  else
+    log "Start vmflow (loads ${config_path} by default):"
+    log "  \"${target_path}\""
+  fi
 }
 
 # stop_service best-effort stops and removes the native service (systemd on
@@ -242,12 +488,25 @@ while [ "$#" -gt 0 ]; do
       shift
       [ "$#" -gt 0 ] || die "missing value for --dir"
       INSTALL_DIR="$1"
+      [ -n "$INSTALL_DIR" ] || die "empty value for --dir"
+      INSTALL_DIR_EXPLICIT=1
       ;;
     --dir=*)
       INSTALL_DIR="${1#*=}"
+      [ -n "$INSTALL_DIR" ] || die "empty value for --dir"
+      INSTALL_DIR_EXPLICIT=1
+      ;;
+    --system)
+      SYSTEM_INSTALL=1
       ;;
     --skip-verify)
       SKIP_VERIFY=1
+      ;;
+    --no-modify-path)
+      NO_MODIFY_PATH=1
+      ;;
+    --print-install-dir)
+      PRINT_INSTALL_DIR=1
       ;;
     --uninstall)
       UNINSTALL=1
@@ -272,16 +531,17 @@ require_cmd curl
 require_cmd tar
 require_cmd uname
 require_cmd mktemp
+require_cmd id
+require_cmd dirname
+require_cmd grep
+require_cmd mkdir
+require_cmd cp
+require_cmd chmod
 
-# Auto-detect install directory if not explicitly set
-if [ -z "$INSTALL_DIR" ]; then
-  for d in /usr/local/bin "$HOME/.local/bin" "$HOME/bin"; do
-    if [ -w "$d" ] 2>/dev/null || [ -w "$(dirname "$d")" ] 2>/dev/null; then
-      INSTALL_DIR="$d"
-      break
-    fi
-  done
-  INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+select_install_dir
+prepare_system_privileges
+if [ "$REUSING_INSTALL" -eq 1 ]; then
+  log "Using existing installation directory: ${INSTALL_DIR}"
 fi
 
 case "$(uname -s)" in
@@ -392,45 +652,68 @@ CONFIG_SOURCE="${TMPDIR}/${CONFIG_NAME}"
 [ -f "$CONFIG_SOURCE" ] && [ ! -L "$CONFIG_SOURCE" ] \
   || die "release ${VERSION} is incompatible with this installer: expected a top-level regular ${CONFIG_NAME}"
 
-if [ ! -d "$INSTALL_DIR" ]; then
-  mkdir -p "$INSTALL_DIR" 2>/dev/null || die "cannot create install directory: ${INSTALL_DIR}"
+if ! run_privileged test -d "$INSTALL_DIR"; then
+  run_privileged mkdir -p "$INSTALL_DIR" 2>/dev/null \
+    || die "cannot create install directory: ${INSTALL_DIR}"
 fi
-[ -w "$INSTALL_DIR" ] || die "install directory is not writable: ${INSTALL_DIR}"
+run_privileged test -w "$INSTALL_DIR" \
+  || die "install directory is not writable: ${INSTALL_DIR}; use --system for a privileged install"
 
 TARGET_PATH="${INSTALL_DIR}/${BINARY_NAME}"
 TARGET_CONFIG_PATH="${INSTALL_DIR}/${CONFIG_NAME}"
 TARGET_CONFIG_MARKER="${INSTALL_DIR}/${CONFIG_MARKER_NAME}"
+if run_privileged test -L "$TARGET_PATH"; then
+  die "existing binary path is a symbolic link: ${TARGET_PATH}"
+fi
+if run_privileged test -e "$TARGET_PATH" && ! run_privileged test -f "$TARGET_PATH"; then
+  die "existing binary path is not a regular file: ${TARGET_PATH}"
+fi
 CONFIG_MARKER_EXISTS=0
-if [ -e "$TARGET_CONFIG_MARKER" ] || [ -L "$TARGET_CONFIG_MARKER" ]; then
-  [ -f "$TARGET_CONFIG_MARKER" ] && [ ! -L "$TARGET_CONFIG_MARKER" ] \
-    || die "existing config ownership marker is not a regular file: ${TARGET_CONFIG_MARKER}"
+if run_privileged test -e "$TARGET_CONFIG_MARKER" || run_privileged test -L "$TARGET_CONFIG_MARKER"; then
+  if ! run_privileged test -f "$TARGET_CONFIG_MARKER" || run_privileged test -L "$TARGET_CONFIG_MARKER"; then
+    die "existing config ownership marker is not a regular file: ${TARGET_CONFIG_MARKER}"
+  fi
   CONFIG_MARKER_EXISTS=1
 fi
-if [ -e "$TARGET_CONFIG_PATH" ] || [ -L "$TARGET_CONFIG_PATH" ]; then
-  [ -f "$TARGET_CONFIG_PATH" ] && [ ! -L "$TARGET_CONFIG_PATH" ] \
-    || die "existing config path is not a regular file: ${TARGET_CONFIG_PATH}"
+if run_privileged test -e "$TARGET_CONFIG_PATH" || run_privileged test -L "$TARGET_CONFIG_PATH"; then
+  if ! run_privileged test -f "$TARGET_CONFIG_PATH" || run_privileged test -L "$TARGET_CONFIG_PATH"; then
+    die "existing config path is not a regular file: ${TARGET_CONFIG_PATH}"
+  fi
   INSTALL_CONFIG=0
 else
   INSTALL_CONFIG=1
 fi
 
-if command -v install >/dev/null 2>&1; then
-  install -m 0755 "$BINARY_PATH" "$TARGET_PATH" \
+if [ "$USE_SUDO" -eq 1 ]; then
+  PRIVILEGED_INSTALL=""
+  for candidate in /usr/bin/install /bin/install; do
+    if [ -x "$candidate" ]; then
+      PRIVILEGED_INSTALL="$candidate"
+      break
+    fi
+  done
+  [ -n "$PRIVILEGED_INSTALL" ] \
+    || die "system installation requires /usr/bin/install or /bin/install"
+  "$SUDO_BIN" "$PRIVILEGED_INSTALL" -m 0755 "$BINARY_PATH" "$TARGET_PATH" \
+    || die "failed to install ${BINARY_NAME} to ${TARGET_PATH}"
+elif command -v install >/dev/null 2>&1; then
+  run_privileged install -m 0755 "$BINARY_PATH" "$TARGET_PATH" \
     || die "failed to install ${BINARY_NAME} to ${TARGET_PATH}"
 else
-  cp "$BINARY_PATH" "$TARGET_PATH" \
+  run_privileged cp "$BINARY_PATH" "$TARGET_PATH" \
     || die "failed to copy ${BINARY_NAME} to ${TARGET_PATH}"
-  chmod 0755 "$TARGET_PATH" \
+  run_privileged chmod 0755 "$TARGET_PATH" \
     || die "failed to chmod ${TARGET_PATH}"
 fi
 
 if [ "$INSTALL_CONFIG" -eq 1 ]; then
-  create_exclusive_file "$TARGET_CONFIG_PATH" cat "$CONFIG_SOURCE" \
+  create_exclusive_from_file "$TARGET_CONFIG_PATH" "$CONFIG_SOURCE" \
     || die "failed to create ${CONFIG_NAME} without overwriting an existing path: ${TARGET_CONFIG_PATH}"
   if [ "$CONFIG_MARKER_EXISTS" -eq 1 ]; then
-    [ -f "$TARGET_CONFIG_MARKER" ] && [ ! -L "$TARGET_CONFIG_MARKER" ] \
-      || die "config was installed, but its existing ownership marker changed: ${TARGET_CONFIG_MARKER}"
-  elif ! create_exclusive_file "$TARGET_CONFIG_MARKER" printf 'vmflow\n'; then
+    if ! run_privileged test -f "$TARGET_CONFIG_MARKER" || run_privileged test -L "$TARGET_CONFIG_MARKER"; then
+      die "config was installed, but its existing ownership marker changed: ${TARGET_CONFIG_MARKER}"
+    fi
+  elif ! create_exclusive_with_text "$TARGET_CONFIG_MARKER" $'vmflow\n'; then
     die "config was installed and left in place, but the ownership marker could not be created safely: ${TARGET_CONFIG_MARKER}"
   fi
 fi
@@ -442,4 +725,8 @@ else
   log "Preserved existing config at ${TARGET_CONFIG_PATH}"
 fi
 
+configure_user_path "$INSTALL_DIR"
 print_path_hint "$INSTALL_DIR" "$TARGET_PATH" "$TARGET_CONFIG_PATH"
+if [ "$PRINT_INSTALL_DIR" -eq 1 ]; then
+  printf '%s\n' "$INSTALL_DIR"
+fi
