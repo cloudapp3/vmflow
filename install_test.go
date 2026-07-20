@@ -76,15 +76,17 @@ func TestInstallScriptDoesNotClaimPreexistingConfig(t *testing.T) {
 	}
 }
 
-func TestInstallScriptRejectsLegacyArchiveConfigPath(t *testing.T) {
+func TestInstallScriptAcceptsLegacyArchiveConfigPath(t *testing.T) {
 	fixture := newInstallFixture(t, "examples/config.yaml")
 	installDir := t.TempDir()
-	out := runInstallScript(t, fixture, installDir, false)
-	if !strings.Contains(out, "is incompatible with this installer") || !strings.Contains(out, "top-level regular config.yaml") {
-		t.Fatalf("unexpected legacy archive failure:\n%s", out)
-	}
-	if _, err := os.Lstat(filepath.Join(installDir, "config.yaml")); !os.IsNotExist(err) {
-		t.Fatalf("legacy archive unexpectedly installed config: %v", err)
+
+	out := runInstallScriptArgs(t, fixture, true, "--dir", installDir)
+	assertFileContent(t, filepath.Join(installDir, "vmflow"), "test-binary\n")
+	assertFileContent(t, filepath.Join(installDir, "config.yaml"), "version: 1\nrules: []\n")
+	assertFileContent(t, filepath.Join(installDir, testConfigMarker), "vmflow\n")
+	if !strings.Contains(out, "Resolving latest release") ||
+		!strings.Contains(out, "Installed vmflow v"+testInstallVersion) {
+		t.Fatalf("default-version legacy install output is incomplete:\n%s", out)
 	}
 }
 
@@ -175,7 +177,7 @@ func TestInstallScriptAutoUserInstallUpdatesZshPathOnce(t *testing.T) {
 		t.Fatalf("installer did not report the persistent PATH update:\n%s", out)
 	}
 
-	runInstallScriptArgs(t, fixture, true, args...)
+	secondOut := runInstallScriptArgs(t, fixture, true, args...)
 	rc, err := os.ReadFile(filepath.Join(home, ".zshrc"))
 	if err != nil {
 		t.Fatal(err)
@@ -184,9 +186,176 @@ func TestInstallScriptAutoUserInstallUpdatesZshPathOnce(t *testing.T) {
 	if count := strings.Count(string(rc), pathLine); count != 1 {
 		t.Fatalf("PATH line count = %d, want 1:\n%s", count, rc)
 	}
+	if strings.Contains(secondOut, "Added "+installDir) ||
+		!strings.Contains(secondOut, installDir+" is already configured in "+filepath.Join(home, ".zshrc")) {
+		t.Fatalf("repeat install reported the wrong PATH state:\n%s", secondOut)
+	}
 	if _, err := os.Lstat(sudoLog); !os.IsNotExist(err) {
 		t.Fatalf("automatic user install unexpectedly invoked sudo: %v", err)
 	}
+}
+
+func TestInstallScriptDelegatedUninstallRemovesOnlyOwnedPathBlock(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := filepath.Join(t.TempDir(), "home with spaces")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	installFakeUID(t, fixture.fakeBin, "1000")
+	t.Setenv("HOME", home)
+	t.Setenv("SHELL", "/bin/zsh")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	args := []string{"--version", "v" + testInstallVersion}
+	runInstallScriptArgs(t, fixture, true, args...)
+	installDir := filepath.Join(home, ".local", "bin")
+	rcPath := filepath.Join(home, ".zshrc")
+	quotedInstallDir := strings.ReplaceAll(installDir, " ", `\ `)
+	pathLine := `export PATH=` + quotedInstallDir + `:$PATH`
+	operatorBlock := "# vmflow user install\nexport PATH=/operator/bin:$PATH\n" + pathLine + "\n"
+	otherInstallDir := filepath.Join(home, "bin")
+	if err := os.Mkdir(otherInstallDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	otherBinary := filepath.Join(otherInstallDir, "vmflow")
+	writeExecutable(t, otherBinary, "other-install\n")
+	otherPathLine := `export PATH=` + strings.ReplaceAll(otherInstallDir, " ", `\ `) + `:$PATH`
+	otherBlock := "# vmflow user install\n" + otherPathLine + "\n"
+	rc, err := os.OpenFile(rcPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(rc, operatorBlock+otherBlock); err != nil {
+		rc.Close()
+		t.Fatal(err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	writeExecutable(t, filepath.Join(installDir, "vmflow"), `#!/bin/sh
+set -eu
+if [ "${1:-}" = "uninstall" ] && [ "${2:-}" = "--help" ]; then
+  exit 0
+fi
+if [ "${1:-}" = "uninstall" ]; then
+  dir=${0%/*}
+  /bin/rm -f -- "$dir/config.yaml" "$dir/.vmflow-config-owned" "$0"
+  exit 0
+fi
+exit 1
+`)
+	out := runInstallScriptArgs(t, fixture, true, "--uninstall", "--dir", installDir)
+	if !strings.Contains(out, "Removed vmflow PATH entry from "+rcPath) {
+		t.Fatalf("uninstall did not report PATH cleanup:\n%s", out)
+	}
+	for _, name := range []string{"vmflow", "config.yaml", testConfigMarker} {
+		if _, err := os.Lstat(filepath.Join(installDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("delegated uninstall left %s behind: %v", name, err)
+		}
+	}
+	assertFileContent(t, otherBinary, "other-install\n")
+	raw, err := os.ReadFile(rcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "# vmflow user install"); got != 2 {
+		t.Fatalf("marker count = %d, want the operator and other-install blocks:\n%s", got, raw)
+	}
+	if got := strings.Count(string(raw), pathLine); got != 1 {
+		t.Fatalf("matching PATH line count = %d, want standalone operator line preserved:\n%s", got, raw)
+	}
+	if !strings.Contains(string(raw), operatorBlock) {
+		t.Fatalf("uninstall changed the operator PATH content:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), otherBlock) {
+		t.Fatalf("uninstall removed the other active installation's PATH block:\n%s", raw)
+	}
+}
+
+func TestInstallScriptUninstallCleansStalePathBlockWithoutInstalledFiles(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	home := t.TempDir()
+	installDir := filepath.Join(home, ".local", "bin")
+	pathBlock := "before\n\n# vmflow user install\nexport PATH=" + installDir + ":$PATH\nafter\n"
+	rcPath := filepath.Join(home, ".bashrc")
+	if err := os.WriteFile(rcPath, []byte(pathBlock), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(home, "profile-victim")
+	if err := os.WriteFile(victim, []byte(pathBlock), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(home, ".profile")); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, filepath.Join(fixture.fakeBin, "uname"), "#!/bin/sh\nprintf 'TestOS\\n'\n")
+	writeExecutable(t, filepath.Join(fixture.fakeBin, "systemctl"), "#!/bin/sh\nexit 0\n")
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", fixture.fakeBin+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	out := runInstallScriptArgs(t, fixture, true, "--uninstall", "--dir", installDir)
+	if !strings.Contains(out, "stale shell PATH entries were removed") ||
+		!strings.Contains(out, filepath.Join(home, ".profile")+" is not a regular file") {
+		t.Fatalf("stale cleanup output is incomplete:\n%s", out)
+	}
+	assertFileContent(t, rcPath, "before\n\nafter\n")
+	assertFileContent(t, victim, pathBlock)
+}
+
+func TestInstallScriptRejectsInvalidOptionValuesBeforeDownload(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		installDir string
+		want       string
+	}{
+		{name: "version consumes option", args: []string{"--version", "--system"}, want: "invalid value for --version"},
+		{name: "dir consumes option", args: []string{"--dir", "--system"}, want: "invalid value for --dir"},
+		{name: "empty version equals", args: []string{"--version="}, want: "empty value for --version"},
+		{name: "empty dir equals", args: []string{"--dir="}, want: "empty value for --dir"},
+		{name: "option-like version equals", args: []string{"--version=--system"}, want: "invalid value for --version"},
+		{name: "option-like dir equals", args: []string{"--dir=--system"}, want: "invalid value for --dir"},
+		{
+			name:       "option-like dir environment",
+			args:       []string{"--version", "v" + testInstallVersion},
+			installDir: "--target-directory=/tmp",
+			want:       "invalid value for VMFLOW_INSTALL_DIR",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newInstallFixture(t, "config.yaml")
+			curlMarker := filepath.Join(t.TempDir(), "curl-called")
+			t.Setenv("FAKE_CURL_MARKER", curlMarker)
+			if tc.installDir != "" {
+				t.Setenv("VMFLOW_INSTALL_DIR", tc.installDir)
+			}
+			writeExecutable(t, filepath.Join(fixture.fakeBin, "curl"), `#!/bin/sh
+set -eu
+: >"$FAKE_CURL_MARKER"
+exit 99
+`)
+
+			out := runInstallScriptArgs(t, fixture, false, tc.args...)
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("unexpected argument validation failure:\n%s", out)
+			}
+			if _, err := os.Lstat(curlMarker); !os.IsNotExist(err) {
+				t.Fatalf("installer reached curl before rejecting arguments: %v", err)
+			}
+		})
+	}
+}
+
+func TestInstallScriptDirArgumentOverridesInvalidEnvironment(t *testing.T) {
+	fixture := newInstallFixture(t, "config.yaml")
+	installDir := t.TempDir()
+	t.Setenv("VMFLOW_INSTALL_DIR", "--target-directory=/tmp")
+
+	runInstallScript(t, fixture, installDir, true)
+	assertFileContent(t, filepath.Join(installDir, "vmflow"), "test-binary\n")
 }
 
 func TestInstallScriptReadmeExportMakesBinaryResolvable(t *testing.T) {
@@ -501,8 +670,12 @@ for arg in "$@"; do
   esac
 done
 case "$url" in
-  */checksums.txt) source="$FAKE_CHECKSUMS" ;;
-  *.tar.gz) source="$FAKE_ARCHIVE" ;;
+	*/releases/latest)
+		printf '  "tag_name": "%s",\n' "$FAKE_VERSION"
+		exit 0
+		;;
+	*/checksums.txt) source="$FAKE_CHECKSUMS" ;;
+	*.tar.gz) source="$FAKE_ARCHIVE" ;;
   *) echo "unexpected URL: $url" >&2; exit 1 ;;
 esac
 if [ -n "$out" ]; then
@@ -582,6 +755,7 @@ func installScriptCommand(t *testing.T, fixture installFixture, args ...string) 
 		"PATH="+fixture.fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"FAKE_ARCHIVE="+fixture.archive,
 		"FAKE_CHECKSUMS="+fixture.checksums,
+		"FAKE_VERSION=v"+testInstallVersion,
 	)
 	return cmd
 }

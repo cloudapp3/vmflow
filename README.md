@@ -64,7 +64,9 @@ VMFLOW_BIN_DIR="$(
 
 Omit `--version v0.2.0-rc.3` to follow the latest stable release instead. The
 unversioned installer currently resolves to `v0.1.1`, which predates the MCP
-and Source IP policy features documented on this branch.
+and Source IP policy features documented on this branch. The installer accepts
+that release's legacy `examples/config.yaml` archive layout as well as the
+top-level `config.yaml` layout used by current releases.
 
 Without an explicit `--dir`, the installer first reuses a conventional existing
 vmflow installation so upgrades keep its colocated config. A fresh root install
@@ -303,6 +305,20 @@ files are never removed because they may be shared with other services. Custom
 certificate cache directories are left in place unless the directory is
 exclusively owned by vmflow and contains a `.vmflow-owned` marker; use
 `--dry-run` to inspect the plan without changing the system.
+
+For a user installation created by `install.sh`, run the installer-level
+uninstall so it can also remove its exact PATH block from `.zshrc`, `.bashrc`,
+or `.profile` after the binary cleanup succeeds:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
+  | bash -s -- --uninstall
+```
+
+Use `sudo bash -s -- --uninstall` only for a root-owned system installation.
+Re-running the installer-level uninstall also removes a stale installer-owned
+PATH block when the vmflow files have already been deleted. Similar user-written
+PATH lines and symlinked or non-writable shell startup files are left untouched.
 
 ## Local management
 

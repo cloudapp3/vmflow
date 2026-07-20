@@ -7,6 +7,7 @@ CONFIG_NAME="config.yaml"
 CONFIG_MARKER_NAME=".vmflow-config-owned"
 INSTALL_DIR="${VMFLOW_INSTALL_DIR:-}"
 INSTALL_DIR_EXPLICIT=0
+INSTALL_DIR_FROM_ENV=0
 VERSION=""
 SKIP_VERIFY=0
 UNINSTALL=0
@@ -16,10 +17,13 @@ PRINT_INSTALL_DIR=0
 USE_SUDO=0
 SUDO_BIN="${VMFLOW_SUDO:-}"
 PATH_RC=""
+PATH_RC_ADDED=0
+PATH_BLOCKS_REMOVED=0
 REUSING_INSTALL=0
 
 if [ -n "$INSTALL_DIR" ]; then
   INSTALL_DIR_EXPLICIT=1
+  INSTALL_DIR_FROM_ENV=1
 fi
 
 usage() {
@@ -59,6 +63,16 @@ log() {
 die() {
   log "Error: $*"
   exit 1
+}
+
+validate_option_value() {
+  local option="$1"
+  local value="$2"
+
+  [ -n "$value" ] || die "empty value for ${option}"
+  case "$value" in
+    -*) die "invalid value for ${option}: values must not start with '-': ${value}" ;;
+  esac
 }
 
 # create_exclusive_file opens target once with noclobber enabled. This prevents
@@ -289,6 +303,7 @@ configure_user_path() {
       log "Warning: could not add ${install_dir} to ${rc_file}."
       return 0
     fi
+    PATH_RC_ADDED=1
   fi
 
   PATH_RC="$rc_file"
@@ -326,7 +341,11 @@ print_path_hint() {
     log "  ${BINARY_NAME} version"
   else
     if [ -n "$PATH_RC" ]; then
-      log "Added ${install_dir} to ${PATH_RC}."
+      if [ "$PATH_RC_ADDED" -eq 1 ]; then
+        log "Added ${install_dir} to ${PATH_RC}."
+      else
+        log "${install_dir} is already configured in ${PATH_RC}."
+      fi
       log "Reload it with:"
       log "  . \"${PATH_RC}\""
     else
@@ -368,6 +387,148 @@ stop_service() {
   fi
 }
 
+remove_path_block_from_file() {
+  local rc_file="$1"
+  local install_dir="$2"
+  local quoted_install_dir
+  local path_line
+  local temp_file
+  local awk_status
+
+  [ -e "$rc_file" ] || [ -L "$rc_file" ] || return 0
+  if [ -L "$rc_file" ] || [ ! -f "$rc_file" ]; then
+    log "Warning: cannot clean vmflow PATH entry because ${rc_file} is not a regular file."
+    return 0
+  fi
+  if [ ! -w "$rc_file" ]; then
+    log "Warning: cannot clean vmflow PATH entry because ${rc_file} is not writable."
+    return 0
+  fi
+  if ! command -v awk >/dev/null 2>&1 || ! command -v mktemp >/dev/null 2>&1; then
+    log "Warning: cannot clean vmflow PATH entry in ${rc_file} because awk or mktemp is unavailable."
+    return 0
+  fi
+
+  printf -v quoted_install_dir '%q' "$install_dir"
+  path_line="export PATH=${quoted_install_dir}:\$PATH"
+  if ! grep -Fqx '# vmflow user install' "$rc_file" 2>/dev/null; then
+    return 0
+  fi
+
+  if ! temp_file="$(mktemp "${TMPDIR:-/tmp}/vmflow-path.XXXXXX")"; then
+    log "Warning: could not create a temporary file while cleaning ${rc_file}."
+    return 0
+  fi
+
+  awk_status=0
+  VMFLOW_PATH_LINE="$path_line" awk '
+    BEGIN {
+      marker = "# vmflow user install"
+      path_line = ENVIRON["VMFLOW_PATH_LINE"]
+    }
+    pending {
+      if ($0 == path_line) {
+        removed = 1
+        pending = 0
+        next
+      }
+      print marker
+      pending = 0
+    }
+    $0 == marker {
+      pending = 1
+      next
+    }
+    { print }
+    END {
+      if (pending) {
+        print marker
+      }
+      if (removed) {
+        exit 42
+      }
+    }
+  ' "$rc_file" >"$temp_file" || awk_status=$?
+
+  if [ "$awk_status" -eq 0 ]; then
+    rm -f "$temp_file"
+    return 0
+  fi
+  if [ "$awk_status" -ne 42 ]; then
+    log "Warning: could not parse ${rc_file} while cleaning the vmflow PATH entry."
+    rm -f "$temp_file"
+    return 0
+  fi
+
+  # Revalidate immediately before truncating the existing file. Writing through
+  # the file preserves its owner and mode instead of replacing it with mktemp's.
+  if [ -L "$rc_file" ] || [ ! -f "$rc_file" ] || [ ! -w "$rc_file" ]; then
+    log "Warning: ${rc_file} changed while cleaning the vmflow PATH entry; leaving it untouched."
+    rm -f "$temp_file"
+    return 0
+  fi
+  if ! cat "$temp_file" >"$rc_file"; then
+    log "Warning: could not remove the vmflow PATH entry from ${rc_file}."
+    rm -f "$temp_file"
+    return 0
+  fi
+
+  rm -f "$temp_file"
+  PATH_BLOCKS_REMOVED=$((PATH_BLOCKS_REMOVED + 1))
+  log "Removed vmflow PATH entry from ${rc_file}."
+}
+
+remove_user_path_blocks() {
+  local requested_dir="${1:-}"
+  local rc_file
+  local install_dir
+  local -a install_dirs
+
+  if [ -z "${HOME:-}" ]; then
+    log "Warning: HOME is unset; shell PATH entries were not cleaned."
+    return 0
+  fi
+
+  if [ -n "$requested_dir" ]; then
+    case "$requested_dir" in
+      "$HOME/.local/bin"|"$HOME/bin") install_dirs=("$requested_dir") ;;
+      *) return 0 ;;
+    esac
+  else
+    install_dirs=("$HOME/.local/bin" "$HOME/bin")
+  fi
+
+  for install_dir in "${install_dirs[@]}"; do
+    if [ -e "$install_dir/$BINARY_NAME" ] || [ -L "$install_dir/$BINARY_NAME" ]; then
+      log "Preserving vmflow PATH entry because ${install_dir}/${BINARY_NAME} still exists."
+      continue
+    fi
+    for rc_file in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+      remove_path_block_from_file "$rc_file" "$install_dir"
+    done
+  done
+}
+
+run_delegated_uninstall() {
+  local target="$1"
+  local status
+
+  if [ -t 0 ]; then
+    "$target" uninstall
+    return $?
+  fi
+
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    status=0
+    "$target" uninstall <&3 || status=$?
+    exec 3<&-
+    return "$status"
+  fi
+
+  log "No controlling terminal is available; delegated uninstall will use non-interactive input."
+  "$target" uninstall </dev/null
+}
+
 # do_uninstall removes vmflow. It delegates to `vmflow uninstall` when the
 # installed binary supports it; otherwise it falls back to a shell-level
 # removal of service/binary/config/logs/cache.
@@ -383,13 +544,24 @@ do_uninstall() {
       if [ -x "$d/$BINARY_NAME" ]; then TARGET="$d/$BINARY_NAME"; break; fi
     done
   fi
+  PATH_CLEANUP_DIR=""
+  if [ -n "$TARGET" ]; then
+    PATH_CLEANUP_DIR="$(dirname "$TARGET")"
+  fi
 
   # Delegate to the binary's own uninstall when available (richest cleanup).
   if [ -n "$TARGET" ] && [ -x "$TARGET" ] && "$TARGET" uninstall --help >/dev/null 2>&1; then
     log "Delegating to: $TARGET uninstall"
-    # Read confirmation from the user's tty: under `curl | bash`, stdin is the
-    # download pipe and cannot serve the [y/N] prompt.
-    exec "$TARGET" uninstall </dev/tty
+    uninstall_status=0
+    run_delegated_uninstall "$TARGET" || uninstall_status=$?
+    [ "$uninstall_status" -eq 0 ] \
+      || die "delegated uninstall failed with status ${uninstall_status}"
+    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+      log "Delegated uninstall left ${TARGET} in place; shell PATH entries were not changed."
+      return 0
+    fi
+    remove_user_path_blocks "$PATH_CLEANUP_DIR"
+    return 0
   fi
 
   log "vmflow binary not found (or too old for self-uninstall) at ${TARGET:-<none>}; cleaning up via shell."
@@ -423,8 +595,13 @@ do_uninstall() {
 
   if [ "${#PLAN[@]}" -eq 0 ]; then
     stop_service
-    log "Nothing left to remove."
-    exit 0
+    remove_user_path_blocks "$PATH_CLEANUP_DIR"
+    if [ "$PATH_BLOCKS_REMOVED" -eq 0 ]; then
+      log "Nothing left to remove."
+    else
+      log "No vmflow files remained; stale shell PATH entries were removed."
+    fi
+    return 0
   fi
 
   log "The following will be removed:"
@@ -470,6 +647,8 @@ do_uninstall() {
   # caller-provided XDG_CACHE_HOME and must never be recursively purged.
   rmdir "$CACHE_DIR" 2>/dev/null || true
 
+  remove_user_path_blocks "$PATH_CLEANUP_DIR"
+
   log "vmflow uninstalled."
   log "External TLS certificate and key files referenced by the config are preserved."
 }
@@ -479,22 +658,26 @@ while [ "$#" -gt 0 ]; do
     --version)
       shift
       [ "$#" -gt 0 ] || die "missing value for --version"
+      validate_option_value "--version" "$1"
       VERSION="$1"
       ;;
     --version=*)
       VERSION="${1#*=}"
+      validate_option_value "--version" "$VERSION"
       ;;
     --dir)
       shift
       [ "$#" -gt 0 ] || die "missing value for --dir"
       INSTALL_DIR="$1"
-      [ -n "$INSTALL_DIR" ] || die "empty value for --dir"
+      validate_option_value "--dir" "$INSTALL_DIR"
       INSTALL_DIR_EXPLICIT=1
+      INSTALL_DIR_FROM_ENV=0
       ;;
     --dir=*)
       INSTALL_DIR="${1#*=}"
-      [ -n "$INSTALL_DIR" ] || die "empty value for --dir"
+      validate_option_value "--dir" "$INSTALL_DIR"
       INSTALL_DIR_EXPLICIT=1
+      INSTALL_DIR_FROM_ENV=0
       ;;
     --system)
       SYSTEM_INSTALL=1
@@ -521,6 +704,10 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$INSTALL_DIR_FROM_ENV" -eq 1 ]; then
+  validate_option_value "VMFLOW_INSTALL_DIR" "$INSTALL_DIR"
+fi
 
 if [ "$UNINSTALL" -eq 1 ]; then
   do_uninstall
@@ -647,10 +834,18 @@ if [ ! -f "$BINARY_PATH" ]; then
 fi
 [ -n "${BINARY_PATH}" ] && [ -f "$BINARY_PATH" ] || die "failed to find ${BINARY_NAME} in archive"
 
-# Release archives place config.yaml beside the binary.
+# Current release archives place config.yaml beside the binary. Stable releases
+# published before that layout used examples/config.yaml.
 CONFIG_SOURCE="${TMPDIR}/${CONFIG_NAME}"
-[ -f "$CONFIG_SOURCE" ] && [ ! -L "$CONFIG_SOURCE" ] \
-  || die "release ${VERSION} is incompatible with this installer: expected a top-level regular ${CONFIG_NAME}"
+if [ -f "$CONFIG_SOURCE" ] && [ ! -L "$CONFIG_SOURCE" ]; then
+  :
+elif [ ! -e "$CONFIG_SOURCE" ] && [ ! -L "$CONFIG_SOURCE" ] \
+  && [ -d "${TMPDIR}/examples" ] && [ ! -L "${TMPDIR}/examples" ] \
+  && [ -f "${TMPDIR}/examples/${CONFIG_NAME}" ] && [ ! -L "${TMPDIR}/examples/${CONFIG_NAME}" ]; then
+  CONFIG_SOURCE="${TMPDIR}/examples/${CONFIG_NAME}"
+else
+  die "release ${VERSION} is incompatible with this installer: expected a regular ${CONFIG_NAME} at the archive root or under examples/"
+fi
 
 if ! run_privileged test -d "$INSTALL_DIR"; then
   run_privileged mkdir -p "$INSTALL_DIR" 2>/dev/null \
