@@ -54,7 +54,7 @@ Install the current MCP-enabled prerelease and a colocated config (Linux/macOS):
 ```bash
 VMFLOW_BIN_DIR="$(
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-    | bash -s -- --version v0.2.0-rc.3 --print-install-dir
+    | bash -s -- --version v0.2.0-rc.4 --print-install-dir
 )" \
   && [ -n "$VMFLOW_BIN_DIR" ] \
   && [ "${VMFLOW_BIN_DIR#/}" != "$VMFLOW_BIN_DIR" ] \
@@ -62,7 +62,7 @@ VMFLOW_BIN_DIR="$(
   && export PATH="$VMFLOW_BIN_DIR:$PATH"
 ```
 
-Omit `--version v0.2.0-rc.3` to follow the latest stable release instead. The
+Omit `--version v0.2.0-rc.4` to follow the latest stable release instead. The
 unversioned installer currently resolves to `v0.1.1`, which predates the MCP
 and Source IP policy features documented on this branch. The installer accepts
 that release's legacy `examples/config.yaml` archive layout as well as the
@@ -116,7 +116,7 @@ sudo only to prepare, inspect, and write the target directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-  | bash -s -- --version v0.2.0-rc.3 --system
+  | bash -s -- --version v0.2.0-rc.4 --system
 ```
 
 When a non-root user requests `--system`, a newly created colocated config stays
