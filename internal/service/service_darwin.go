@@ -3,12 +3,14 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
@@ -66,6 +68,34 @@ func platformStatus(cfg Config, w io.Writer) error {
 	cmd.Stderr = w
 	_ = cmd.Run()
 	return nil
+}
+
+func platformInspect(cfg Config) (Summary, error) {
+	if info, err := os.Lstat(plistPath(cfg)); os.IsNotExist(err) {
+		return Summary{State: "not installed"}, nil
+	} else if err != nil {
+		return Summary{State: "unknown"}, fmt.Errorf("inspect launchd plist: %w", err)
+	} else if !info.Mode().IsRegular() {
+		return Summary{State: "unknown", Detail: "plist path is not a regular file"}, nil
+	}
+	summary := Summary{Installed: true, Enabled: true, State: "loaded"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "launchctl", "print", "system/"+launchdLabel(cfg)).CombinedOutput()
+	if ctx.Err() != nil {
+		return summary, fmt.Errorf("inspect launchd state: %w", ctx.Err())
+	}
+	text := strings.ToLower(string(output))
+	if err == nil {
+		summary.Running = strings.Contains(text, "state = running")
+		if summary.Running {
+			summary.State = "running"
+		}
+	} else {
+		summary.State = "not loaded"
+		summary.Detail = strings.TrimSpace(string(output))
+	}
+	return summary, nil
 }
 
 func logStdout(cfg Config) string { s, _ := launchdLogPaths(cfg); return s }

@@ -10,7 +10,7 @@ import (
 // managers supervise the foreground process directly. logFileFlag controls
 // whether -log-file is appended (macOS captures stdout/stderr itself).
 func foregroundArgs(cfg Config, logFileFlag bool) []string {
-	args := []string{"-config", cfg.ConfigPath}
+	args := []string{"run", "-config", cfg.ConfigPath}
 	if logFileFlag {
 		if lp := strings.TrimSpace(cfg.LogFile); lp != "" {
 			args = append(args, "-log-file", lp)

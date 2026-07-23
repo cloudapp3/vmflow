@@ -25,7 +25,7 @@ fmt:
 	gofmt -w $(GO_FILES)
 
 run:
-	GOCACHE=$(GOCACHE) GOFLAGS=-buildvcs=false go run ./cmd/vmflow -config $(CONFIG)
+	GOCACHE=$(GOCACHE) GOFLAGS=-buildvcs=false go run ./cmd/vmflow run -config $(CONFIG)
 
 smoke:
 	GOCACHE=$(GOCACHE) GOFLAGS=-buildvcs=false go run ./cmd/vmflow version

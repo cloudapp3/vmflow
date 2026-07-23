@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/cloudapp3/vmflow/config"
+	"github.com/cloudapp3/vmflow/internal/clientconfig"
 	"github.com/cloudapp3/vmflow/internal/service"
 	"github.com/cloudapp3/vmflow/internal/statsstore"
 	"github.com/cloudapp3/vmflow/internal/updater"
@@ -35,6 +36,7 @@ const (
 	kindDir                   = "dir"
 	kindOwnedConfig           = "owned-config"
 	kindStatsFile             = "stats-file"
+	kindClientProfile         = "client-profile"
 	colocatedConfigName       = "config.yaml"
 	colocatedConfigMarkerName = ".vmflow-config-owned"
 )
@@ -94,6 +96,11 @@ func Plan() (items []Item, warnings []string) {
 			warnings = append(warnings, fmt.Sprintf("leaving relative self-update cache path %s in place", cacheFile))
 		}
 	}
+	if profilePath, err := clientconfig.DefaultPath(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("could not resolve local management client profile: %v", err))
+	} else {
+		items, warnings = appendClientProfilePlan(items, warnings, profilePath)
+	}
 
 	if binPath != "" {
 		if owner := packageOwner(binPath); owner != "" {
@@ -102,6 +109,18 @@ func Plan() (items []Item, warnings []string) {
 		}
 		items = append(items, Item{Kind: kindBinary, Path: binPath, Note: "vmflow binary", Self: true})
 	}
+	return items, warnings
+}
+
+func appendClientProfilePlan(items []Item, warnings []string, path string) ([]Item, []string) {
+	if !pathLexists(path) || planContainsPath(items, filepath.Clean(path)) {
+		return items, warnings
+	}
+	if _, err := clientconfig.Load(path); err != nil {
+		warnings = append(warnings, fmt.Sprintf("leaving local management client profile %s in place: %v", path, err))
+		return items, warnings
+	}
+	items = append(items, Item{Kind: kindClientProfile, Path: filepath.Clean(path), Note: "local management client profile"})
 	return items, warnings
 }
 
@@ -265,6 +284,22 @@ func Execute(w io.Writer, items []Item) error {
 				continue
 			} else if err != nil {
 				problems = append(problems, fmt.Sprintf("refusing to remove changed stats file %s: %v", it.Path, err))
+				continue
+			}
+			if err := os.Remove(it.Path); err != nil && !os.IsNotExist(err) {
+				problems = append(problems, fmt.Sprintf("%s: %v", it.Path, err))
+				continue
+			}
+			fmt.Fprintf(w, "removed %s\n", it.Path)
+		case kindClientProfile:
+			if isProtected(it.Path) {
+				problems = append(problems, fmt.Sprintf("refusing to remove protected path: %s", it.Path))
+				continue
+			}
+			if _, err := clientconfig.Load(it.Path); os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				problems = append(problems, fmt.Sprintf("refusing to remove changed client profile %s: %v", it.Path, err))
 				continue
 			}
 			if err := os.Remove(it.Path); err != nil && !os.IsNotExist(err) {

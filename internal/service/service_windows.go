@@ -284,6 +284,36 @@ func platformStatus(cfg Config, w io.Writer) error {
 	return nil
 }
 
+func platformInspect(cfg Config) (Summary, error) {
+	m, err := mgr.Connect()
+	if err != nil {
+		return Summary{State: "unknown"}, fmt.Errorf("connect to Windows service manager: %w", err)
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(cfg.ServiceName)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return Summary{State: "not installed"}, nil
+	}
+	if err != nil {
+		return Summary{State: "unknown"}, fmt.Errorf("open Windows service %s: %w", cfg.ServiceName, err)
+	}
+	defer s.Close()
+	status, err := s.Query()
+	if err != nil {
+		return Summary{Installed: true, State: "unknown"}, fmt.Errorf("query Windows service %s: %w", cfg.ServiceName, err)
+	}
+	serviceCfg, err := s.Config()
+	if err != nil {
+		return Summary{Installed: true, State: windowsServiceStateName(status.State)}, fmt.Errorf("read Windows service %s config: %w", cfg.ServiceName, err)
+	}
+	return Summary{
+		Installed: true,
+		Running:   status.State == svc.Running,
+		Enabled:   serviceCfg.StartType != mgr.StartDisabled,
+		State:     windowsServiceStateName(status.State),
+	}, nil
+}
+
 func windowsServiceArgs(cfg Config) []string {
 	args := foregroundArgs(cfg, true)
 	// svc.Run must register the exact CreateService name for custom names.

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudapp3/vmflow/internal/clientconfig"
 	"github.com/cloudapp3/vmflow/internal/statsstore"
 )
 
@@ -158,6 +159,27 @@ func TestAppendConfigPlanIncludesConfiguredStatsFile(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("configured stats file missing from plan: %+v", items)
+	}
+}
+
+func TestAppendClientProfilePlanValidatesBeforeRemoval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.yaml")
+	if err := clientconfig.Save(path, clientconfig.Profile{Address: "http://127.0.0.1:19090", Token: "secret-token"}); err != nil {
+		t.Fatal(err)
+	}
+	items, warnings := appendClientProfilePlan(nil, nil, path)
+	if len(warnings) != 0 || len(items) != 1 || items[0].Kind != kindClientProfile {
+		t.Fatalf("client profile plan = %+v, warnings = %v", items, warnings)
+	}
+	if err := os.WriteFile(path, []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Execute(io.Discard, items); err == nil {
+		t.Fatal("changed client profile should not be removed")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("changed client profile was removed: %v", err)
 	}
 }
 

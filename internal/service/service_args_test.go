@@ -30,8 +30,8 @@ func TestValidateServiceExtraArgsAllowsFutureFlagTokens(t *testing.T) {
 func TestForegroundArgsUseDirectRuntimeEntry(t *testing.T) {
 	cfg := Config{ConfigPath: "/etc/vmflow/config.yaml"}
 	args := foregroundArgs(cfg, false)
-	if len(args) != 2 || args[0] != "-config" || args[1] != cfg.ConfigPath {
-		t.Fatalf("foregroundArgs = %#v, want direct -config arguments", args)
+	if len(args) != 3 || args[0] != "run" || args[1] != "-config" || args[2] != cfg.ConfigPath {
+		t.Fatalf("foregroundArgs = %#v, want explicit run arguments", args)
 	}
 	for _, arg := range args {
 		if arg == "daemon" || arg == "d" {

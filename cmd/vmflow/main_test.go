@@ -27,9 +27,12 @@ func TestRouteCLI(t *testing.T) {
 		wantCommand string
 		wantArgs    []string
 	}{
-		{name: "empty starts foreground", wantCommand: "foreground"},
+		{name: "empty shows guide", wantCommand: "guide"},
 		{name: "runtime flags start foreground", input: []string{"-config", "/tmp/config.yaml"}, wantCommand: "foreground", wantArgs: []string{"-config", "/tmp/config.yaml"}},
 		{name: "top-level help", input: []string{"--help"}, wantCommand: "help"},
+		{name: "init", input: []string{"init", "-listen-port", "2201"}, wantCommand: "init", wantArgs: []string{"-listen-port", "2201"}},
+		{name: "run", input: []string{"run", "-config", "/tmp/config.yaml"}, wantCommand: "run", wantArgs: []string{"-config", "/tmp/config.yaml"}},
+		{name: "status", input: []string{"status", "-json"}, wantCommand: "status", wantArgs: []string{"-json"}},
 		{name: "ctl", input: []string{"ctl", "rules"}, wantCommand: "ctl", wantArgs: []string{"rules"}},
 		{name: "ctl alias", input: []string{"c", "rules"}, wantCommand: "c", wantArgs: []string{"rules"}},
 		{name: "tui", input: []string{"tui", "-addr", "http://localhost"}, wantCommand: "tui", wantArgs: []string{"-addr", "http://localhost"}},

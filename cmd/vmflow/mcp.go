@@ -19,8 +19,6 @@ import (
 	"github.com/cloudapp3/vmflow/internal/mcpserver"
 )
 
-const defaultMCPControlAddress = "http://127.0.0.1:19090"
-
 type mcpOptions struct {
 	addr    string
 	token   string
@@ -67,12 +65,13 @@ func runMCPWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, s
 func parseMCPOptions(args []string, output io.Writer) (mcpOptions, error) {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(output)
+	defaults := loadManagementDefaults(output)
 	fs.Usage = func() {
 		fmt.Fprintln(output, "Usage:\n  vmflow mcp [flags]\n\nStarts a read-only MCP server over stdio for a running local vmflow daemon.\n\nOptions:")
 		fs.PrintDefaults()
 	}
-	addr := fs.String("addr", defaultMCPControlAddress, "local daemon management address")
-	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "daemon management token (or VMFLOW_CONTROL_TOKEN)")
+	addr := fs.String("addr", defaults.Address, "local daemon management address")
+	token := fs.String("token", defaults.Token, "daemon management token (or environment/client profile)")
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
 	if err := fs.Parse(args); err != nil {

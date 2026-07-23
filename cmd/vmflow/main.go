@@ -41,9 +41,12 @@ var (
 const usageText = `vmflow - L4 port forwarding engine
 
 Usage:
-  vmflow               [-config path] [-control-port port]              Start forwarding in foreground
-                                                                       Default config: config.yaml beside vmflow
-  vmflow ctl           [-token token] <rules|stats|metrics|precheck|reload>    Query running vmflow
+  vmflow                                                                  Show status and next steps
+  vmflow init          [-config path]                                    Create the first forwarding rule
+  vmflow run           [-config path] [-control-port port]               Start forwarding in foreground
+                                                                         Default config: config.yaml beside vmflow
+  vmflow status        [-config path] [-json]                            Inspect config and daemon status
+  vmflow ctl           [-token token] <health|rules|stats|metrics|precheck|reload> Query running vmflow
   vmflow tui           [-token token]                                  Terminal UI dashboard
   vmflow mcp           [-token token]                                  Read-only MCP server over stdio
   vmflow version       [-json]                                         Show version info
@@ -61,8 +64,17 @@ Aliases: ctl=c, tui=t, version=v, update=u, service=svc, uninstall=remove,rm
 func main() {
 	command, args := routeCLI(os.Args[1:])
 	switch command {
-	case "foreground":
+	case "guide":
+		runGuide(args)
+	case "init":
+		runInit(args)
+	case "run":
 		runForeground(args)
+	case "foreground":
+		fmt.Fprintln(os.Stderr, "warning: starting vmflow without the 'run' command is deprecated; use 'vmflow run [flags]'")
+		runForeground(args)
+	case "status":
+		runStatus(args)
 	case "help":
 		fmt.Fprint(os.Stdout, usageText)
 	case "ctl", "c":
@@ -88,12 +100,12 @@ func main() {
 
 func routeCLI(args []string) (string, []string) {
 	if len(args) == 0 {
-		return "foreground", nil
+		return "guide", nil
 	}
 	switch args[0] {
 	case "-h", "--help", "help":
 		return "help", args[1:]
-	case "ctl", "c", "tui", "t", "mcp", "version", "v", "update", "u", "service", "svc", "uninstall", "remove", "rm":
+	case "init", "run", "status", "ctl", "c", "tui", "t", "mcp", "version", "v", "update", "u", "service", "svc", "uninstall", "remove", "rm":
 		return args[0], args[1:]
 	default:
 		if strings.HasPrefix(args[0], "-") {
@@ -116,7 +128,7 @@ func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, 
 	fs := flag.NewFlagSet("vmflow", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.Usage = func() {
-		fmt.Fprintln(output, "Usage:\n  vmflow [flags]\n\nRuns vmflow in the foreground.\n\nOptions:")
+		fmt.Fprintln(output, "Usage:\n  vmflow run [flags]\n\nRuns vmflow in the foreground.\n\nOptions:")
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "config file path (default: config.yaml beside vmflow)")
@@ -213,7 +225,13 @@ func runForeground(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := runForwarding(ctx, cfg, startupConfig, opts.configPath, logger); err != nil {
+	var reporter func(runtimeReadyInfo)
+	if shouldPrintRuntimeSummary(cfg, opts) {
+		reporter = func(info runtimeReadyInfo) {
+			printRuntimeReady(os.Stdout, info)
+		}
+	}
+	if err := runForwardingWithReporter(ctx, cfg, startupConfig, opts.configPath, logger, reporter); err != nil {
 		fmt.Fprintf(os.Stderr, "vmflow failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -224,7 +242,11 @@ func runForeground(args []string) {
 // or an SCM stop) or the control server fails. It performs graceful shutdown
 // before returning. Shared by the foreground daemon and the Windows SCM runner.
 func runForwarding(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger) error {
-	return runForwardingWithReady(ctx, cfg, startupConfig, configPath, logger, nil)
+	return runForwardingWithReporter(ctx, cfg, startupConfig, configPath, logger, nil)
+}
+
+func runForwardingWithReporter(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, reporter func(runtimeReadyInfo)) error {
+	return runForwardingWithReadyAndReporter(ctx, cfg, startupConfig, configPath, logger, nil, reporter)
 }
 
 // runForwardingWithReady reports initialization success only after rules are
@@ -232,6 +254,10 @@ func runForwarding(ctx context.Context, cfg, startupConfig config.File, configPa
 // ready before the function returns, allowing the Windows SCM runner to avoid a
 // transient false Running state.
 func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, ready chan<- error) (runErr error) {
+	return runForwardingWithReadyAndReporter(ctx, cfg, startupConfig, configPath, logger, ready, nil)
+}
+
+func runForwardingWithReadyAndReporter(ctx context.Context, cfg, startupConfig config.File, configPath string, logger *slog.Logger, ready chan<- error, reporter func(runtimeReadyInfo)) (runErr error) {
 	readyReported := false
 	reportReady := func(err error) {
 		if readyReported {
@@ -332,6 +358,15 @@ func runForwardingWithReady(ctx context.Context, cfg, startupConfig config.File,
 	var statsFlush *statsFlusher
 	if statsStore != nil {
 		statsFlush = startStatsFlusher(ctx, statsStore, manager, statsFlushInterval(cfg, logger), logger)
+	}
+	if reporter != nil {
+		reporter(runtimeReadyInfo{
+			ConfigPath:      configPath,
+			ControlAddress:  scheme + "://" + listener.Addr().String(),
+			ConfiguredRules: len(cfg.Rules),
+			EnabledRules:    countEnabledRules(cfg.Rules),
+			ActiveRules:     len(manager.RunningRules()),
+		})
 	}
 	reportReady(nil)
 
@@ -551,15 +586,16 @@ func newLogger(logCfg config.LogConfig, logFile string) (*slog.Logger, error) {
 
 func runCtl(args []string) {
 	fs := flag.NewFlagSet("ctl", flag.ExitOnError)
-	addr := fs.String("addr", "http://127.0.0.1:19090", "daemon management address")
-	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "daemon management token (or VMFLOW_CONTROL_TOKEN)")
+	defaults := loadManagementDefaults(os.Stderr)
+	addr := fs.String("addr", defaults.Address, "daemon management address")
+	token := fs.String("token", defaults.Token, "daemon management token (or environment/client profile)")
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
 	fs.Parse(args)
 
 	cmdArgs := fs.Args()
 	if len(cmdArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: vmflow ctl [-token token] <rules|stats|metrics|precheck|reload>")
+		fmt.Fprintln(os.Stderr, "usage: vmflow ctl [-token token] <health|rules|stats|metrics|precheck|reload>")
 		os.Exit(1)
 	}
 
@@ -567,6 +603,9 @@ func runCtl(args []string) {
 	var path string
 	var reqBody string
 	switch cmdArgs[0] {
+	case "health":
+		method = http.MethodGet
+		path = "/v1/session"
 	case "rules":
 		method = http.MethodGet
 		path = "/v1/rules"
@@ -636,8 +675,9 @@ func doRequest(baseURL, token string, tlsOpts controlapi.ClientTLSOptions, heade
 
 func runTUI(args []string) {
 	fs := flag.NewFlagSet("tui", flag.ExitOnError)
-	addr := fs.String("addr", "http://127.0.0.1:19090", "daemon management address")
-	token := fs.String("token", os.Getenv("VMFLOW_CONTROL_TOKEN"), "daemon management token (or VMFLOW_CONTROL_TOKEN)")
+	defaults := loadManagementDefaults(os.Stderr)
+	addr := fs.String("addr", defaults.Address, "daemon management address")
+	token := fs.String("token", defaults.Token, "daemon management token (or environment/client profile)")
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
 	fs.Parse(args)

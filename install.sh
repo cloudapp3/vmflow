@@ -365,11 +365,21 @@ print_path_hint() {
   log "Upgrades preserve existing rules, including enabled public listeners."
   log ""
   if [ "$USE_SUDO" -eq 1 ]; then
+	log "Inspect status and next steps:"
+	log "  \"${SUDO_BIN}\" \"${target_path}\""
+	log "Create the first forwarding rule:"
+	log "  \"${SUDO_BIN}\" \"${target_path}\" init -config \"${config_path}\""
+	log ""
     log "Start vmflow as root (loads ${config_path} by default):"
-    log "  \"${SUDO_BIN}\" \"${target_path}\""
+	log "  \"${SUDO_BIN}\" \"${target_path}\" run"
   else
+	log "Inspect status and next steps:"
+	log "  \"${target_path}\""
+	log "Create the first forwarding rule:"
+	log "  \"${target_path}\" init -config \"${config_path}\""
+	log ""
     log "Start vmflow (loads ${config_path} by default):"
-    log "  \"${target_path}\""
+	log "  \"${target_path}\" run"
   fi
 }
 

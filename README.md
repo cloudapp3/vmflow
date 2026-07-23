@@ -80,18 +80,26 @@ shell without guessing its location.
 
 The first install creates `config.yaml` beside the binary with mode `0600`.
 Reinstalling or upgrading replaces only the binary and preserves the existing
-config. Running `vmflow` uses the colocated config by default; `-config`
-overrides that path.
+config. `vmflow` shows status and next steps, while `vmflow run` starts the
+foreground process. Both `init` and `run` use the colocated config by default;
+`-config` overrides that path.
 
 The bundled SSH forwarding example is disabled and listens on loopback only.
-Review its listen address, target, and firewall exposure before setting
-`enabled: true`; a first launch starts the control plane without exposing a new
-forwarding port.
-
-Start vmflow in one terminal:
+Run the first-use wizard to replace that untouched example with a validated,
+enabled rule. Non-loopback listeners require an explicit exposure confirmation:
 
 ```bash
-vmflow
+vmflow init
+```
+
+The wizard also enables authenticated management with a random admin token and
+saves a mode-`0600` local client profile. `vmflow ctl` and `vmflow tui` use that
+profile automatically, so the token is not placed in shell history.
+
+Start vmflow in one terminal after setup:
+
+```bash
+vmflow run
 ```
 
 Query it from another terminal:
@@ -107,6 +115,7 @@ Open the terminal UI or show build metadata:
 
 ```bash
 vmflow tui
+vmflow status
 vmflow version -json
 ```
 
@@ -140,7 +149,8 @@ git clone https://github.com/cloudapp3/vmflow.git
 cd vmflow
 go build -trimpath -o vmflow ./cmd/vmflow
 cp -n examples/config.yaml config.yaml
-./vmflow
+./vmflow init
+./vmflow run
 ```
 
 ## Configuration
@@ -234,9 +244,11 @@ are rejected; replace the field with `control_port` before upgrading.
 
 ### TUI rule management
 
-`vmflow tui -token ADMIN_TOKEN` can manage `rules` and `udp_max_sessions` when
-auth is enabled and the token has the `admin` role. Viewer tokens and sessions
-with auth disabled are read-only. In the Rules view use `n`/`e`/`c` to create,
+`vmflow init` configures an admin token and local client profile by default, so
+`vmflow tui` can manage `rules` and `udp_max_sessions` without a token argument.
+Explicit `-token`, `VMFLOW_CONTROL_TOKEN`, and `VMFLOW_CLIENT_CONFIG` remain
+available for custom deployments. Viewer tokens and sessions with auth disabled
+are read-only. In the Rules view use `n`/`e`/`c` to create,
 edit, or copy, `space` to toggle, `d` to delete, `g` for the global UDP limit,
 `P` to precheck, `A` to apply, and `u` to discard the draft.
 The rule editor's Source IPs / CIDRs field accepts comma-separated entries.
@@ -249,8 +261,11 @@ require editing YAML and restarting vmflow.
 ## Commands
 
 ```bash
-vmflow               [-config path] [-control-port 19090]
-vmflow ctl           [-token TOKEN] <rules|stats|metrics|precheck|reload>
+vmflow
+vmflow init          [-config path] [-protocol tcp] [-listen-port PORT] [-target-port PORT]
+vmflow run           [-config path] [-control-port 19090]
+vmflow status        [-config path] [-json]
+vmflow ctl           [-token TOKEN] <health|rules|stats|metrics|precheck|reload>
 vmflow tui           [-token TOKEN]
 vmflow mcp           [-token TOKEN]
 vmflow version       [-json]
@@ -264,6 +279,10 @@ Self-update is supported on Linux and macOS. On Windows, download and install
 the release ZIP manually.
 
 Aliases are available: `ctl=c`, `tui=t`, `version=v`, `update=u`, and `service=svc`.
+
+For one migration release, the old `vmflow -config PATH` foreground form still
+works with a deprecation warning. New scripts and service definitions should use
+`vmflow run -config PATH`.
 
 ## Run as a service (boot startup)
 
@@ -298,7 +317,8 @@ Uninstall with `sudo vmflow service uninstall` (config and logs are left in plac
 For a complete removal, run `sudo vmflow uninstall`. It prints the full plan
 and requires confirmation before removing the service, binary, platform-default
 config, installer-owned colocated config, persistent traffic statistics, logs,
-update cache, and vmflow-owned certificate caches. Stats files are parsed and
+the local management client profile, update cache, and vmflow-owned certificate
+caches. Stats files and the client profile are parsed and
 revalidated immediately before removal; changed or unrecognized files are kept.
 An unowned colocated `config.yaml` is preserved. External TLS certificate and key
 files are never removed because they may be shared with other services. Custom
@@ -327,6 +347,11 @@ read-only `vmflow mcp` adapter. The daemon uses an internal loopback-only
 control channel to implement them; that transport is not a public integration
 API and carries no compatibility promise. `control_port` changes the local port
 without making it externally reachable.
+
+Client commands resolve management settings in this order: explicit flags,
+`VMFLOW_CONTROL_ADDR` / `VMFLOW_CONTROL_TOKEN`, then the local profile at
+`$XDG_CONFIG_HOME/vmflow/client.yaml` (or the platform user-config equivalent).
+Set `VMFLOW_CLIENT_CONFIG` to an absolute path to use a different profile.
 
 For remote administration, forward the loopback port over SSH and continue to
 use the CLI/TUI locally:

@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
@@ -231,6 +233,38 @@ func platformStatus(cfg Config, w io.Writer) error {
 	cmd.Stderr = w
 	_ = cmd.Run()
 	return nil
+}
+
+func platformInspect(cfg Config) (Summary, error) {
+	if info, err := os.Lstat(unitPath(cfg)); os.IsNotExist(err) {
+		return Summary{State: "not installed"}, nil
+	} else if err != nil {
+		return Summary{State: "unknown"}, fmt.Errorf("inspect systemd unit: %w", err)
+	} else if !info.Mode().IsRegular() {
+		return Summary{State: "unknown", Detail: "unit path is not a regular file"}, nil
+	}
+	summary := Summary{Installed: true, State: "unknown"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	activeOutput, activeErr := exec.CommandContext(ctx, "systemctl", "is-active", cfg.ServiceName).CombinedOutput()
+	if ctx.Err() != nil {
+		return summary, fmt.Errorf("inspect systemd active state: %w", ctx.Err())
+	}
+	activeState := strings.TrimSpace(string(activeOutput))
+	if activeState != "" {
+		summary.State = activeState
+	}
+	summary.Running = activeErr == nil && activeState == "active"
+	enabledOutput, enabledErr := exec.CommandContext(ctx, "systemctl", "is-enabled", cfg.ServiceName).CombinedOutput()
+	if ctx.Err() != nil {
+		return summary, fmt.Errorf("inspect systemd enabled state: %w", ctx.Err())
+	}
+	enabledState := strings.TrimSpace(string(enabledOutput))
+	summary.Enabled = enabledErr == nil && (enabledState == "enabled" || enabledState == "static")
+	if activeErr != nil && activeState == "" {
+		summary.Detail = strings.TrimSpace(activeErr.Error())
+	}
+	return summary, nil
 }
 
 // ensureSystemUser creates name as a system (no-login) user if it does not

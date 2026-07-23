@@ -33,8 +33,8 @@ func TestInstallScriptCreatesAndPreservesColocatedConfig(t *testing.T) {
 	assertFileMode(t, configPath, 0o600)
 	assertFileContent(t, markerPath, "vmflow\n")
 	assertFileMode(t, markerPath, 0o600)
-	if !strings.Contains(out, `"`+filepath.Join(installDir, "vmflow")+`"`) {
-		t.Fatalf("installer output does not show the direct runtime command:\n%s", out)
+	if !strings.Contains(out, `"`+filepath.Join(installDir, "vmflow")+`" run`) || !strings.Contains(out, `" init -config`) {
+		t.Fatalf("installer output does not show setup and runtime commands:\n%s", out)
 	}
 	if strings.Contains(out, " daemon ") || strings.Contains(out, "daemon -config") {
 		t.Fatalf("installer output still exposes removed daemon command:\n%s", out)
@@ -481,7 +481,8 @@ func TestInstallScriptSystemModeUsesSudoForTargetWrites(t *testing.T) {
 	targetPath := filepath.Join(installDir, "vmflow")
 	privilegedCommand := `"` + sudoPath + `" "` + targetPath + `"`
 	if !strings.Contains(out, "Verify the root-owned system installation with:\n  "+privilegedCommand+" version") ||
-		!strings.Contains(out, "Start vmflow as root") || !strings.Contains(out, "\n  "+privilegedCommand+"\n") {
+		!strings.Contains(out, "Start vmflow as root") || !strings.Contains(out, "\n  "+privilegedCommand+" run\n") ||
+		!strings.Contains(out, privilegedCommand+" init -config") {
 		t.Fatalf("system install did not report root startup commands:\n%s", out)
 	}
 }
@@ -528,7 +529,8 @@ func TestInstallScriptRootSystemModeDoesNotUseSudo(t *testing.T) {
 	targetPath := filepath.Join(installDir, "vmflow")
 	assertFileContent(t, targetPath, "test-binary\n")
 	if strings.Contains(out, "root-owned system installation") ||
-		!strings.Contains(out, "Start vmflow (loads ") || !strings.Contains(out, "\n  \""+targetPath+"\"\n") {
+		!strings.Contains(out, "Start vmflow (loads ") || !strings.Contains(out, "\n  \""+targetPath+"\" run\n") ||
+		!strings.Contains(out, `"`+targetPath+`" init -config`) {
 		t.Fatalf("root system install did not report a direct startup command:\n%s", out)
 	}
 }

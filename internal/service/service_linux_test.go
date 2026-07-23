@@ -36,9 +36,9 @@ func TestSystemdUnitContainsRequiredDirectives(t *testing.T) {
 			t.Errorf("systemd unit missing %q\n---\n%s", want, unit)
 		}
 	}
-	// ExecStart invokes vmflow directly and keeps the config path quoted.
-	if !strings.Contains(unit, `ExecStart="/usr/local/bin/vmflow" "-config"`) {
-		t.Errorf("ExecStart does not use the direct runtime entry:\n%s", unit)
+	// ExecStart uses the explicit runtime command and keeps the config path quoted.
+	if !strings.Contains(unit, `ExecStart="/usr/local/bin/vmflow" "run" "-config"`) {
+		t.Errorf("ExecStart does not use the explicit runtime entry:\n%s", unit)
 	}
 	if strings.Contains(unit, `"daemon"`) {
 		t.Errorf("ExecStart still contains removed daemon command:\n%s", unit)
