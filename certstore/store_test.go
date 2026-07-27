@@ -12,8 +12,11 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
+
+	"github.com/cloudapp3/vmflow/internal/certpath"
 )
 
 // generateSelfSignedCert creates a self-signed certificate for testing.
@@ -246,11 +249,17 @@ func TestStoreLoadFromDisk(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "certs.json")); err != nil {
 		t.Fatalf("certs.json not found: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "manual", "persist.com.crt")); err != nil {
-		t.Fatalf("manual cert not found: %v", err)
+	entries, err := os.ReadDir(filepath.Join(dir, "manual"))
+	if err != nil {
+		t.Fatalf("read manual certificate directory: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "manual", "persist.com.key")); err != nil {
-		t.Fatalf("manual key not found: %v", err)
+	if len(entries) != 2 {
+		t.Fatalf("stored certificate file count = %d, want 2", len(entries))
+	}
+	for _, entry := range entries {
+		if entry.Name() == "persist.com.crt" || entry.Name() == "persist.com.key" {
+			t.Fatalf("certificate domain leaked into storage filename %q", entry.Name())
+		}
 	}
 
 	// Create a new store and load from the same dir
@@ -298,5 +307,181 @@ func TestStoreGetNotFound(t *testing.T) {
 	_, ok := s.Get("nonexistent.com")
 	if ok {
 		t.Fatal("expected not found")
+	}
+}
+
+func TestStoreImportRejectsUnsafeDomain(t *testing.T) {
+	dir := t.TempDir()
+	s := New(nil, dir)
+	certPEM, keyPEM := generateSelfSignedCert(t, "example.com")
+	outside := filepath.Join(filepath.Dir(dir), "outside-sentinel")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outside) })
+
+	for _, domain := range []string{"../../outside-sentinel", `..\..\outside-sentinel`, "/tmp/outside-sentinel", `C:\outside-sentinel`} {
+		if _, err := s.Import(context.Background(), domain, certPEM, keyPEM); err == nil {
+			t.Errorf("Import(%q) unexpectedly succeeded", domain)
+		}
+	}
+	data, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("read sentinel: %v", err)
+	}
+	if string(data) != "unchanged" {
+		t.Fatalf("outside sentinel changed to %q", data)
+	}
+	if len(s.List()) != 0 {
+		t.Fatalf("unsafe imports changed in-memory metadata: %+v", s.List())
+	}
+}
+
+func TestStoreImportRejectsCertificateForDifferentDomain(t *testing.T) {
+	s := New(nil, t.TempDir())
+	certPEM, keyPEM := generateSelfSignedCert(t, "example.com")
+	if _, err := s.Import(context.Background(), "other.example.com", certPEM, keyPEM); err == nil {
+		t.Fatal("Import unexpectedly accepted a certificate for a different domain")
+	}
+	if len(s.List()) != 0 {
+		t.Fatalf("mismatched import changed metadata: %+v", s.List())
+	}
+}
+
+func TestStoreDeleteRejectsUnsafeDomain(t *testing.T) {
+	dir := t.TempDir()
+	s := New(nil, dir)
+	outside := filepath.Join(filepath.Dir(dir), "outside-delete-sentinel")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outside) })
+
+	for _, domain := range []string{"../../outside-delete-sentinel", `..\..\outside-delete-sentinel`, "/tmp/outside-delete-sentinel"} {
+		if err := s.Delete(context.Background(), domain); err == nil {
+			t.Errorf("Delete(%q) unexpectedly succeeded", domain)
+		}
+	}
+	data, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("read sentinel: %v", err)
+	}
+	if string(data) != "unchanged" {
+		t.Fatalf("outside sentinel changed to %q", data)
+	}
+}
+
+func TestStoreLoadRejectsUnsafeMetadataDomain(t *testing.T) {
+	dir := t.TempDir()
+	metadata := `[{"domain":"../../outside","source":"manual"}]`
+	if err := os.WriteFile(filepath.Join(dir, "certs.json"), []byte(metadata), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	s := New(nil, dir)
+	if err := s.Load(context.Background()); err == nil {
+		t.Fatal("Load unexpectedly accepted an unsafe metadata domain")
+	}
+	if len(s.List()) != 0 {
+		t.Fatalf("unsafe metadata changed store state: %+v", s.List())
+	}
+}
+
+func TestStoreLoadMigratesLegacyDomainFilenames(t *testing.T) {
+	dir := t.TempDir()
+	manualDir := filepath.Join(dir, "manual")
+	if err := os.MkdirAll(manualDir, 0o700); err != nil {
+		t.Fatalf("create manual directory: %v", err)
+	}
+	certPEM, keyPEM := generateSelfSignedCert(t, "legacy.example.com")
+	legacyCert := filepath.Join(manualDir, "legacy.example.com.crt")
+	legacyKey := filepath.Join(manualDir, "legacy.example.com.key")
+	if err := os.WriteFile(legacyCert, certPEM, 0o644); err != nil {
+		t.Fatalf("write legacy cert: %v", err)
+	}
+	if err := os.WriteFile(legacyKey, keyPEM, 0o600); err != nil {
+		t.Fatalf("write legacy key: %v", err)
+	}
+	metadata := `[{"domain":"legacy.example.com","source":"manual"}]`
+	if err := os.WriteFile(filepath.Join(dir, "certs.json"), []byte(metadata), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	s := New(nil, dir)
+	if err := s.Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := s.GetCertificate(&tls.ClientHelloInfo{ServerName: "legacy.example.com"}); err != nil {
+		t.Fatalf("GetCertificate after migration: %v", err)
+	}
+	if _, err := os.Lstat(legacyCert); !os.IsNotExist(err) {
+		t.Fatalf("legacy cert still exists: %v", err)
+	}
+	if _, err := os.Lstat(legacyKey); !os.IsNotExist(err) {
+		t.Fatalf("legacy key still exists: %v", err)
+	}
+}
+
+func TestStoreLoadRestoresACMESANAliases(t *testing.T) {
+	dir := t.TempDir()
+	metadata := `[{
+  "domain":"example.com",
+  "sans":["example.com","api.example.com"],
+  "source":"acme"
+}]`
+	if err := os.WriteFile(filepath.Join(dir, "certs.json"), []byte(metadata), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	s := New(nil, dir)
+	if err := s.Load(context.Background()); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, domain := range []string{"example.com", "api.example.com"} {
+		meta, ok := s.Get(domain)
+		if !ok || meta.Domain != "example.com" {
+			t.Fatalf("Get(%q) = %+v, %v", domain, meta, ok)
+		}
+	}
+}
+
+func TestStoreImportRestoresPairWhenMetadataPersistenceFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires platform-specific privileges on Windows")
+	}
+	dir := t.TempDir()
+	s := New(nil, dir)
+	oldCertPEM, oldKeyPEM := generateSelfSignedCert(t, "example.com")
+	if _, err := s.Import(context.Background(), "example.com", oldCertPEM, oldKeyPEM); err != nil {
+		t.Fatalf("initial Import: %v", err)
+	}
+
+	metadataPath := filepath.Join(dir, "certs.json")
+	if err := os.Remove(metadataPath); err != nil {
+		t.Fatalf("remove metadata: %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.Symlink(outside, metadataPath); err != nil {
+		t.Fatalf("symlink metadata: %v", err)
+	}
+
+	newCertPEM, newKeyPEM := generateSelfSignedCert(t, "example.com")
+	if _, err := s.Import(context.Background(), "example.com", newCertPEM, newKeyPEM); err == nil {
+		t.Fatal("replacement Import unexpectedly succeeded with unsafe metadata path")
+	}
+	storedCertPEM, storedKeyPEM, err := certpath.ReadPair(dir, certpath.Manual, "example.com")
+	if err != nil {
+		t.Fatalf("ReadPair after rollback: %v", err)
+	}
+	if string(storedCertPEM) != string(oldCertPEM) || string(storedKeyPEM) != string(oldKeyPEM) {
+		t.Fatal("failed replacement did not restore the previous certificate pair")
+	}
+	outsideData, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("read outside file: %v", err)
+	}
+	if string(outsideData) != "unchanged" {
+		t.Fatalf("outside file changed to %q", outsideData)
 	}
 }

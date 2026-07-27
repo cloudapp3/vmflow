@@ -8,15 +8,18 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cloudapp3/vmflow/internal/certpath"
 	"golang.org/x/crypto/acme"
 )
 
@@ -27,6 +30,7 @@ type Manager struct {
 	dnsSolver     *DNS01Solver  // nil when using http-01
 	challengeType string        // "http-01" or "dns-01"
 	certCache     map[string]*tls.Certificate
+	cacheKeys     map[string]string // requested domain -> persisted primary domain
 	cacheDir      string
 	mu            sync.RWMutex
 	onObtain      func(domains []string) // called after successful Obtain or renewal
@@ -40,6 +44,7 @@ func NewManager(cacheDir string, solver *HTTP01Solver) *Manager {
 		solver:        solver,
 		challengeType: "http-01",
 		certCache:     make(map[string]*tls.Certificate),
+		cacheKeys:     make(map[string]string),
 		cacheDir:      cacheDir,
 	}
 }
@@ -53,6 +58,7 @@ func NewManagerWithDNS(cacheDir string, dnsSolver *DNS01Solver) *Manager {
 		dnsSolver:     dnsSolver,
 		challengeType: "dns-01",
 		certCache:     make(map[string]*tls.Certificate),
+		cacheKeys:     make(map[string]string),
 		cacheDir:      cacheDir,
 	}
 }
@@ -62,10 +68,14 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 	if hello == nil {
 		return nil, fmt.Errorf("nil ClientHelloInfo")
 	}
-	name := strings.ToLower(hello.ServerName)
+	name, err := certpath.Normalize(hello.ServerName, true)
+	if err != nil {
+		return nil, err
+	}
 
 	m.mu.RLock()
 	cert, ok := m.certCache[name]
+	storageDomain := m.cacheKeys[name]
 	m.mu.RUnlock()
 
 	if ok {
@@ -74,10 +84,17 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 
 	// Try to load from disk
 	if m.cacheDir != "" {
-		if loaded, err := m.loadFromDisk(name); err == nil {
+		if storageDomain == "" {
+			storageDomain = name
+		}
+		if loaded, err := m.loadFromDisk(storageDomain); err == nil {
 			m.mu.Lock()
 			m.certCache[name] = loaded
+			m.cacheKeys[name] = storageDomain
 			m.mu.Unlock()
+			if err := m.persistDomainIndex(); err != nil {
+				log.Printf("[acme] warning: failed to persist cache index: %v", err)
+			}
 			return loaded, nil
 		}
 	}
@@ -87,9 +104,11 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 
 // Obtain requests a certificate for the given domains via ACME.
 func (m *Manager) Obtain(ctx context.Context, domains []string) error {
-	if len(domains) == 0 {
-		return fmt.Errorf("no domains specified")
+	normalizedDomains, err := certpath.NormalizeAll(domains, true)
+	if err != nil {
+		return err
 	}
+	domains = normalizedDomains
 
 	// Try load from disk first
 	if m.cacheDir != "" {
@@ -97,8 +116,12 @@ func (m *Manager) Obtain(ctx context.Context, domains []string) error {
 			m.mu.Lock()
 			for _, d := range domains {
 				m.certCache[d] = loaded
+				m.cacheKeys[d] = domains[0]
 			}
 			m.mu.Unlock()
+			if err := m.persistDomainIndex(); err != nil {
+				log.Printf("[acme] warning: failed to persist cache index: %v", err)
+			}
 			log.Printf("[acme] loaded cached certificate for %s", strings.Join(domains, ","))
 			return nil
 		}
@@ -143,6 +166,7 @@ func (m *Manager) Obtain(ctx context.Context, domains []string) error {
 	m.mu.Lock()
 	for _, d := range domains {
 		m.certCache[d] = cert
+		m.cacheKeys[d] = domains[0]
 	}
 	m.mu.Unlock()
 
@@ -282,10 +306,11 @@ func (m *Manager) authorize(ctx context.Context, domain string) error {
 }
 
 func (m *Manager) loadFromDisk(domain string) (*tls.Certificate, error) {
-	certPath := filepath.Join(m.cacheDir, domain+".crt")
-	keyPath := filepath.Join(m.cacheDir, domain+".key")
-
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	certPEM, keyPEM, err := certpath.ReadPair(m.cacheDir, certpath.ACME, domain)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, err
 	}
@@ -296,28 +321,31 @@ func (m *Manager) loadFromDisk(domain string) (*tls.Certificate, error) {
 }
 
 func (m *Manager) saveToDisk(domain string, cert *tls.Certificate) error {
-	if err := os.MkdirAll(m.cacheDir, 0700); err != nil {
-		return err
+	if cert == nil {
+		return fmt.Errorf("missing certificate")
 	}
 
-	// Save certificate
-	certPath := filepath.Join(m.cacheDir, domain+".crt")
 	var certPEM []byte
 	for _, der := range cert.Certificate {
 		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
 	}
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		return err
+	if len(certPEM) == 0 {
+		return fmt.Errorf("certificate chain is empty")
 	}
 
-	// Save private key
-	keyPath := filepath.Join(m.cacheDir, domain+".key")
-	keyBytes, err := x509.MarshalECPrivateKey(cert.PrivateKey.(*ecdsa.PrivateKey))
+	privateKey, ok := cert.PrivateKey.(*ecdsa.PrivateKey)
+	if !ok || privateKey == nil {
+		return fmt.Errorf("certificate private key must be ECDSA")
+	}
+	keyBytes, err := x509.MarshalECPrivateKey(privateKey)
 	if err != nil {
 		return err
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
-	return os.WriteFile(keyPath, keyPEM, 0600)
+	if err := certpath.WritePair(m.cacheDir, certpath.ACME, domain, certPEM, keyPEM); err != nil {
+		return err
+	}
+	return m.persistDomainIndex()
 }
 
 func createCSR(key crypto.Signer, domains []string) ([]byte, error) {
@@ -364,6 +392,46 @@ func (m *Manager) Preload(ctx context.Context) {
 	if m.cacheDir == "" {
 		return
 	}
+	if data, err := certpath.ReadACMEIndex(m.cacheDir); err == nil {
+		var index map[string]string
+		if err := json.Unmarshal(data, &index); err != nil {
+			log.Printf("[acme] warning: failed to parse cache index: %v", err)
+			return
+		}
+		loaded := make(map[string]*tls.Certificate, len(index))
+		for rawDomain, rawStorageDomain := range index {
+			domain, err := certpath.Normalize(rawDomain, true)
+			if err != nil {
+				log.Printf("[acme] warning: invalid cache index domain %q: %v", rawDomain, err)
+				continue
+			}
+			storageDomain, err := certpath.Normalize(rawStorageDomain, true)
+			if err != nil {
+				log.Printf("[acme] warning: invalid cache index storage domain %q: %v", rawStorageDomain, err)
+				continue
+			}
+			cert := loaded[storageDomain]
+			if cert == nil {
+				cert, err = m.loadFromDisk(storageDomain)
+				if err != nil {
+					log.Printf("[acme] warning: failed to preload %s: %v", domain, err)
+					continue
+				}
+				loaded[storageDomain] = cert
+			}
+			m.mu.Lock()
+			m.certCache[domain] = cert
+			m.cacheKeys[domain] = storageDomain
+			m.mu.Unlock()
+		}
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("[acme] warning: failed to read cache index: %v", err)
+		return
+	}
+
+	// Legacy caches used the domain itself as the filename. Enumerate directory
+	// entries rather than constructing a path from an external domain value.
 	entries, err := os.ReadDir(m.cacheDir)
 	if err != nil {
 		return
@@ -372,7 +440,37 @@ func (m *Manager) Preload(ctx context.Context) {
 		if !strings.HasSuffix(entry.Name(), ".crt") {
 			continue
 		}
-		domain := strings.TrimSuffix(entry.Name(), ".crt")
-		m.GetCertificate(&tls.ClientHelloInfo{ServerName: domain})
+		domain, err := certpath.Normalize(strings.TrimSuffix(entry.Name(), ".crt"), true)
+		if err != nil {
+			continue
+		}
+		if _, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: domain}); err != nil {
+			log.Printf("[acme] warning: failed to migrate legacy cache for %s: %v", domain, err)
+		}
 	}
+}
+
+func (m *Manager) persistDomainIndex() error {
+	if m.cacheDir == "" {
+		return nil
+	}
+	m.mu.RLock()
+	domains := make([]string, 0, len(m.cacheKeys))
+	for domain := range m.cacheKeys {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+	index := make(map[string]string, len(domains))
+	for _, domain := range domains {
+		index[domain] = m.cacheKeys[domain]
+	}
+	m.mu.RUnlock()
+	data, err := json.MarshalIndent(index, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal ACME cache index: %w", err)
+	}
+	if err := certpath.WriteACMEIndex(m.cacheDir, data); err != nil {
+		return fmt.Errorf("write ACME cache index: %w", err)
+	}
+	return nil
 }

@@ -94,6 +94,7 @@ func NewHandler(runtime *Runtime) http.Handler {
 		})
 	})
 	runtime.registerConfigManagementHandlers(mux)
+	runtime.registerCertificateHandlers(mux)
 	mux.HandleFunc("/v1/precheck", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})

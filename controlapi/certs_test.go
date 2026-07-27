@@ -21,6 +21,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -445,5 +447,59 @@ func TestCertsImportWithBodyReader(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 201, got %d: %s", resp.StatusCode, b)
+	}
+}
+
+func TestCertHandlersRejectPathInjectionInputs(t *testing.T) {
+	dir := t.TempDir()
+	store := certstore.New(nil, dir)
+	runtime := &Runtime{
+		ConfigPath: "missing.yaml",
+		Manager:    engine.NewManager(engine.NewCollector()),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Auth:       NewAuthenticator(config.AuthConfig{}),
+		CertStore:  store,
+	}
+	handler := NewHandler(runtime)
+	outside := filepath.Join(filepath.Dir(dir), "outside-api-sentinel")
+	if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outside) })
+
+	certPEM, keyPEM := generateTestCert(t, "example.com")
+	importBody := fmt.Sprintf(`{"domain":"../../outside-api-sentinel","cert":%q,"key":%q}`, certPEM, keyPEM)
+	request := httptest.NewRequest(http.MethodPost, "/v1/certs", strings.NewReader(importBody))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unsafe import status = %d, want 400: %s", recorder.Code, recorder.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/v1/certs/obtain", strings.NewReader(`{"domains":["../../outside-api-sentinel"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code < 400 {
+		t.Fatalf("unsafe obtain status = %d, want an error: %s", recorder.Code, recorder.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodDelete, "/v1/certs/..%5C..%5Coutside-api-sentinel", nil)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code < 400 {
+		t.Fatalf("unsafe delete status = %d, want an error: %s", recorder.Code, recorder.Body.String())
+	}
+
+	data, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("read sentinel: %v", err)
+	}
+	if string(data) != "unchanged" {
+		t.Fatalf("outside sentinel changed to %q", data)
+	}
+	if len(store.List()) != 0 {
+		t.Fatalf("unsafe API requests changed certificate metadata: %+v", store.List())
 	}
 }
