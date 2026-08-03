@@ -238,6 +238,7 @@ func TestInstallScriptFallbackUninstallPreservesFilesWhenSystemdStopFails(t *tes
 	systemctlLog := filepath.Join(t.TempDir(), "systemctl.log")
 	t.Setenv("FAKE_SYSTEMCTL_LOG", systemctlLog)
 	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	writeExecutable(t, filepath.Join(fixture.fakeBin, "uname"), "#!/bin/sh\nprintf 'Linux\\n'\n")
 	writeExecutable(t, filepath.Join(fixture.fakeBin, "systemctl"), `#!/bin/sh
 set -eu
@@ -291,6 +292,7 @@ func TestInstallScriptFallbackUninstallAllowsAbsentInactiveSystemdService(t *tes
 	systemctlLog := filepath.Join(t.TempDir(), "systemctl.log")
 	t.Setenv("FAKE_SYSTEMCTL_LOG", systemctlLog)
 	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	writeExecutable(t, filepath.Join(fixture.fakeBin, "uname"), "#!/bin/sh\nprintf 'Linux\\n'\n")
 	writeExecutable(t, filepath.Join(fixture.fakeBin, "systemctl"), `#!/bin/sh
 set -eu
