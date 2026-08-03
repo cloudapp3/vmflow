@@ -7,20 +7,20 @@ pure Go. Run it as a single-binary network proxy or embed the forwarding runtime
 in your own Go control plane, with explicit resource limits, hot-reloadable
 rules, a terminal UI, and Prometheus metrics.
 
-[![Docs](https://img.shields.io/badge/docs-vmflow.bestcheapvps.org-14b8a6)](https://vmflow.bestcheapvps.org/)
+[![Docs source](https://img.shields.io/badge/docs-source-14b8a6)](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs)
 [![CI](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml/badge.svg)](https://github.com/cloudapp3/vmflow/actions/workflows/go.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/cloudapp3/vmflow.svg)](https://pkg.go.dev/github.com/cloudapp3/vmflow)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Documentation: [Website](https://vmflow.bestcheapvps.org/) · [中文](https://vmflow.bestcheapvps.org/zh/) · [Docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs)
+Documentation: [English quick start](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/guide/quick-start.md) · [中文快速开始](https://github.com/cloudapp3/vmdocs/blob/main/sites/vmflow/docs/zh/quick-start.md) · [All docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs)
 
 > **完整使用指南:** [中文文档源码](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs/zh) —— 覆盖安装、配置、运维、安全加固与排错。English quick reference is below; the deep guide is in the [public docs source](https://github.com/cloudapp3/vmdocs/tree/main/sites/vmflow/docs).
 
 <p align="center">
-  <img src="assets/vmflow-demo.gif" width="960" alt="vmflow TUI dashboard, rules, and precheck views">
+  <img src="assets/vmflow-demo.gif" width="960" alt="vmflow v0.3.0 TUI showing the Host Network dashboard, running TCP and UDP rules, bandwidth and traffic quotas, successful precheck, and language selection">
 </p>
 
-<p align="center"><sub>Real TUI output from the current vmflow build.</sub></p>
+<p align="center"><sub>Real v0.3.0 TUI output: Host Network, TCP/UDP/tcp+udp rules, bandwidth and daily/monthly quotas, precheck, and language views.</sub></p>
 
 ## TCP/UDP port forwarding features
 
@@ -111,13 +111,20 @@ to `en` or `zh-CN`. For a one-off override, use
 `vmflow --lang zh-CN <command>` or set `VMFLOW_LANG`. Resolution order is
 `--lang`, `VMFLOW_LANG`, `config.yaml`, then English.
 
-Start vmflow in one terminal after setup:
+What happens after setup depends on the run mode selected in `vmflow init`:
+
+- **Native system service:** vmflow is already installed, enabled, and running
+  in the background. Do not start a second foreground process.
+- **Foreground:** vmflow is already running and remains attached to the current
+  terminal until interrupted.
+- **Configure only:** no daemon is started. Start the saved user configuration
+  later with:
 
 ```bash
 vmflow run
 ```
 
-Query it from another terminal:
+Once a daemon is running, query it from another terminal:
 
 ```bash
 vmflow ctl rules
@@ -126,10 +133,24 @@ vmflow ctl metrics
 vmflow ctl precheck
 ```
 
-Open the terminal UI or show build metadata:
+The default local `vmflow tui` path manages the native service and first checks
+that it is installed and running. Use it for system-service mode:
 
 ```bash
 vmflow tui
+```
+
+For a daemon started manually in foreground mode, provide the loopback address
+explicitly so the TUI connects to that process instead of requiring a native
+service:
+
+```bash
+vmflow tui -addr http://127.0.0.1:19090
+```
+
+Show runtime status or build metadata with:
+
+```bash
 vmflow status
 vmflow version -json
 ```
