@@ -335,7 +335,7 @@ func TestTCPCopyWriteTimeout(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := copyTCPDirection(context.Background(), dst, src, 0, 100*time.Millisecond, newTCPActivity(), nil)
+		_, err := copyTCPDirection(context.Background(), dst, src, 0, 100*time.Millisecond, newTCPActivity(), nil, trafficUpload, nil, nil)
 		done <- err
 	}()
 	if _, err := srcPeer.Write([]byte("blocked-write")); err != nil {

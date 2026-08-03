@@ -82,11 +82,11 @@ func TestDetailScrollReachesTrafficAndResets(t *testing.T) {
 func TestHelpScrollReachesSyncWithFixedFooterAndReturnsHome(t *testing.T) {
 	m := managedTestModel()
 	m.width = 80
-	m.height = 24
+	m.height = 14
 	m.overlay = overlayHelp
 	m.overlayYOffset = 0
 	if m.helpMaxYOffset() == 0 {
-		t.Fatal("80x24 help unexpectedly fits without scrolling")
+		t.Fatal("80x14 help unexpectedly fits without scrolling")
 	}
 
 	updated, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEnd})
@@ -111,7 +111,7 @@ func TestHelpScrollReachesSyncWithFixedFooterAndReturnsHome(t *testing.T) {
 		t.Fatalf("Home did not reset help offset: offset=%d cmd=%v", m.overlayYOffset, cmd)
 	}
 	output = ansi.Strip(m.View())
-	if !strings.Contains(output, "Keyboard Shortcuts") || !strings.Contains(output, "Quit") {
+	if !strings.Contains(output, "Keyboard Shortcuts") || !strings.Contains(output, "Dashboard / Rules / Bot") {
 		t.Fatalf("Home did not restore help top:\n%s", output)
 	}
 }
@@ -120,7 +120,7 @@ func TestMouseWheelScrollsHelpAndDetail(t *testing.T) {
 	t.Run("help", func(t *testing.T) {
 		m := managedTestModel()
 		m.width = 80
-		m.height = 24
+		m.height = 14
 		m.overlay = overlayHelp
 
 		updated, cmd := m.Update(mouseWheelMsg(tea.MouseWheelDown, tea.MouseButtonWheelDown))

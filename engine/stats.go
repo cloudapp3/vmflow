@@ -15,6 +15,7 @@ type ruleCounter struct {
 	sourceIPDenied     atomic.Int64
 	udpSessionRejected atomic.Int64
 	udpPacketsDropped  atomic.Int64
+	quotaRejectedBytes atomic.Int64
 	updatedAtUnix      atomic.Int64
 }
 
@@ -26,16 +27,77 @@ type boundRuleStats struct {
 }
 
 type Collector struct {
-	mu        sync.RWMutex
-	counters  map[string]*ruleCounter
-	protocols map[string]Protocol
+	mu         sync.RWMutex
+	counters   map[string]*ruleCounter
+	protocols  map[string]Protocol
+	bandwidths map[string]*BandwidthLimit
+	quotas     map[string]*TrafficQuota
 }
 
 func NewCollector() *Collector {
 	return &Collector{
-		counters:  make(map[string]*ruleCounter),
-		protocols: make(map[string]Protocol),
+		counters:   make(map[string]*ruleCounter),
+		protocols:  make(map[string]Protocol),
+		bandwidths: make(map[string]*BandwidthLimit),
+		quotas:     make(map[string]*TrafficQuota),
 	}
+}
+
+func (collector *Collector) SetBandwidthPolicy(ruleID string, limit *BandwidthLimit) {
+	if collector == nil {
+		return
+	}
+	ruleID = stringsTrim(ruleID)
+	collector.mu.Lock()
+	if limit == nil {
+		delete(collector.bandwidths, ruleID)
+	} else {
+		value := *limit
+		collector.bandwidths[ruleID] = &value
+	}
+	collector.mu.Unlock()
+}
+
+// BandwidthPolicies returns isolated rule-level limits for metrics and other
+// read-only observers. Map membership distinguishes an unlimited direction
+// from a rule with no aggregate bandwidth policy.
+func (collector *Collector) BandwidthPolicies() map[string]BandwidthLimit {
+	if collector == nil {
+		return nil
+	}
+	collector.mu.RLock()
+	result := make(map[string]BandwidthLimit, len(collector.bandwidths))
+	for ruleID, limit := range collector.bandwidths {
+		if limit != nil {
+			result[ruleID] = *limit
+		}
+	}
+	collector.mu.RUnlock()
+	return result
+}
+
+func (collector *Collector) SetQuotaPolicy(ruleID string, quota *TrafficQuota) {
+	if collector == nil {
+		return
+	}
+	ruleID = stringsTrim(ruleID)
+	collector.mu.Lock()
+	if quota == nil {
+		delete(collector.quotas, ruleID)
+	} else {
+		collector.quotas[ruleID] = cloneTrafficQuota(quota)
+	}
+	collector.mu.Unlock()
+}
+
+func (collector *Collector) QuotaPolicy(ruleID string) *TrafficQuota {
+	if collector == nil {
+		return nil
+	}
+	collector.mu.RLock()
+	quota := collector.quotas[stringsTrim(ruleID)]
+	collector.mu.RUnlock()
+	return cloneTrafficQuota(quota)
 }
 
 func (collector *Collector) EnsureRule(ruleID string) {
@@ -73,6 +135,8 @@ func (collector *Collector) RemoveRule(ruleID string) {
 	collector.mu.Lock()
 	delete(collector.counters, ruleID)
 	delete(collector.protocols, ruleID)
+	delete(collector.bandwidths, ruleID)
+	delete(collector.quotas, ruleID)
 	collector.mu.Unlock()
 }
 
@@ -127,6 +191,13 @@ func (collector *Collector) IncUDPPacketsDropped(ruleID string) {
 	collector.bindRule(ruleID).incUDPPacketsDropped()
 }
 
+func (collector *Collector) AddQuotaRejectedBytes(ruleID string, n int64) {
+	if collector == nil || n <= 0 {
+		return
+	}
+	collector.bindRule(ruleID).addQuotaRejectedBytes(n)
+}
+
 func (collector *Collector) Snapshot(ruleID string) TrafficSnapshot {
 	if collector == nil {
 		return TrafficSnapshot{RuleID: stringsTrim(ruleID)}
@@ -174,6 +245,7 @@ func (collector *Collector) Restore(snapshots []TrafficSnapshot) {
 		counter.sourceIPDenied.Store(s.SourceIPDenied)
 		counter.udpSessionRejected.Store(s.UDPSessionRejected)
 		counter.udpPacketsDropped.Store(s.UDPPacketsDropped)
+		counter.quotaRejectedBytes.Store(s.QuotaRejectedBytes)
 		counter.updatedAtUnix.Store(time.Now().Unix())
 	}
 }
@@ -283,6 +355,14 @@ func (stats boundRuleStats) incUDPPacketsDropped() {
 	stats.touch()
 }
 
+func (stats boundRuleStats) addQuotaRejectedBytes(n int64) {
+	if stats.counter == nil || n <= 0 {
+		return
+	}
+	stats.counter.quotaRejectedBytes.Add(n)
+	stats.touch()
+}
+
 func (stats boundRuleStats) touch() {
 	stats.counter.updatedAtUnix.Store(time.Now().Unix())
 }
@@ -299,6 +379,7 @@ func snapshotCounter(ruleID string, counter *ruleCounter) TrafficSnapshot {
 		SourceIPDenied:     counter.sourceIPDenied.Load(),
 		UDPSessionRejected: counter.udpSessionRejected.Load(),
 		UDPPacketsDropped:  counter.udpPacketsDropped.Load(),
+		QuotaRejectedBytes: counter.quotaRejectedBytes.Load(),
 		UpdatedTime:        counter.updatedAtUnix.Load(),
 	}
 }

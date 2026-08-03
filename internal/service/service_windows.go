@@ -9,21 +9,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudapp3/vmflow/internal/appdirs"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
 const (
-	windowsDefaultCfg        = `C:\ProgramData\vmflow\config.yaml`
+	windowsDefaultCfg        = appdirs.WindowsProgramData + `\vmflow\config.yaml`
 	windowsDefaultLog        = `C:\ProgramData\vmflow\logs\vmflow.log`
 	windowsServiceTimeout    = 30 * time.Second
 	windowsServicePollPeriod = 250 * time.Millisecond
 	windowsServiceDesc       = "vmflow L4 forwarding daemon"
 	windowsRecoveryResetSecs = 24 * 60 * 60
 )
-
-func defaultConfigPath() string { return windowsDefaultCfg }
 
 func platformInstall(cfg Config, w io.Writer) error {
 	if strings.TrimSpace(cfg.LogFile) == "" {
@@ -94,14 +93,46 @@ func platformInstall(cfg Config, w io.Writer) error {
 	if err := ensureWindowsServiceRunning(s, windowsServiceTimeout); err != nil {
 		return rollbackWindowsInstall(s, cfg.ServiceName, created, previous, fmt.Errorf("start Windows service %s: %w", cfg.ServiceName, err))
 	}
-	verb := "updated"
+	verb := cfg.t("cli.service.output.action_updated")
 	if created {
-		verb = "created"
+		verb = cfg.t("cli.service.output.action_created")
 	} else {
-		fmt.Fprintf(w, "service %s already exists; configuration updated\n", cfg.ServiceName)
+		fmt.Fprintln(w, cfg.tf("cli.service.output.already_exists_updated", cfg.ServiceName))
 	}
-	fmt.Fprintf(w, "service %s %s and running (start=automatic, restart on failure)\n", cfg.ServiceName, verb)
-	fmt.Fprintf(w, "logs: %s   |   status: vmflow service status\n", cfg.LogFile)
+	fmt.Fprintln(w, cfg.tf("cli.service.output.windows_running", cfg.ServiceName, verb))
+	fmt.Fprintln(w, cfg.tf("cli.service.output.windows_logs", cfg.LogFile))
+	return nil
+}
+
+func platformStart(cfg Config, w io.Writer) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return fmt.Errorf("%w: connect to Windows service manager", ErrPrivilegesRequired)
+		}
+		return fmt.Errorf("connect to Windows service manager: %w", err)
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(cfg.ServiceName)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return fmt.Errorf("%w: %s", ErrNotInstalled, cfg.ServiceName)
+	}
+	if err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return fmt.Errorf("%w: open Windows service %s", ErrPrivilegesRequired, cfg.ServiceName)
+		}
+		return fmt.Errorf("open Windows service %s: %w", cfg.ServiceName, err)
+	}
+	defer s.Close()
+
+	if err := ensureWindowsServiceRunning(s, windowsServiceTimeout); err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return fmt.Errorf("%w: start Windows service %s", ErrPrivilegesRequired, cfg.ServiceName)
+		}
+		return fmt.Errorf("start Windows service %s: %w", cfg.ServiceName, err)
+	}
+	fmt.Fprintln(w, cfg.tf("cli.service.output.started", cfg.ServiceName))
 	return nil
 }
 
@@ -232,7 +263,7 @@ func platformUninstall(cfg Config, w io.Writer) error {
 
 	s, err := m.OpenService(cfg.ServiceName)
 	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		fmt.Fprintf(w, "service %s is not installed\n", cfg.ServiceName)
+		fmt.Fprintln(w, cfg.tf("cli.service.output.not_installed", cfg.ServiceName))
 		return nil
 	}
 	if err != nil {
@@ -246,8 +277,8 @@ func platformUninstall(cfg Config, w io.Writer) error {
 	if err := s.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
 		return fmt.Errorf("delete Windows service %s: %w", cfg.ServiceName, err)
 	}
-	fmt.Fprintf(w, "service %s stopped and removed\n", cfg.ServiceName)
-	fmt.Fprintln(w, "config and log files were left in place; remove them manually if desired")
+	fmt.Fprintln(w, cfg.tf("cli.service.output.stopped_removed", cfg.ServiceName))
+	fmt.Fprintln(w, cfg.t("cli.service.output.files_preserved"))
 	return nil
 }
 
@@ -277,9 +308,9 @@ func platformStatus(cfg Config, w io.Writer) error {
 		return fmt.Errorf("read Windows service %s config: %w", cfg.ServiceName, err)
 	}
 
-	fmt.Fprintf(w, "service: %s\nstate: %s\nstartup: %s\npid: %d\n", cfg.ServiceName, windowsServiceStateName(status.State), windowsServiceStartTypeName(serviceCfg.StartType), status.ProcessId)
+	fmt.Fprintln(w, cfg.tf("cli.service.output.windows_status", cfg.ServiceName, windowsServiceStateName(status.State), windowsServiceStartTypeName(serviceCfg.StartType), status.ProcessId))
 	if status.State == svc.Stopped && (status.Win32ExitCode != 0 || status.ServiceSpecificExitCode != 0) {
-		fmt.Fprintf(w, "last exit: win32=%d service=%d\n", status.Win32ExitCode, status.ServiceSpecificExitCode)
+		fmt.Fprintln(w, cfg.tf("cli.service.output.windows_last_exit", status.Win32ExitCode, status.ServiceSpecificExitCode))
 	}
 	return nil
 }

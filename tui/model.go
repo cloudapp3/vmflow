@@ -2,7 +2,7 @@ package tui
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"sort"
@@ -13,6 +13,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 )
 
 type viewMode int
@@ -33,6 +35,7 @@ type overlayMode int
 const (
 	overlayNone overlayMode = iota
 	overlayHelp
+	overlayLanguage
 	overlayReload
 	overlayDelete
 	overlayApply
@@ -42,6 +45,8 @@ const (
 	overlayUDPSettings
 	overlayBotStop
 	overlayCancelBotEditor
+	overlayStartService
+	overlayElevateService
 )
 
 type operationState int
@@ -193,14 +198,16 @@ func (d *draftConfig) request() ConfigRulesRequest {
 type Model struct {
 	ctx    context.Context
 	client *Client
+	tr     *i18n.Translator
 
 	// Runtime monitoring data.
-	stats       *StatsResponse
-	prevStats   *StatsResponse
-	rules       *RulesResponse
-	rates       map[string]rateEntry
-	history     map[string]*rateHistory
-	lastStatsAt time.Time
+	stats        *StatsResponse
+	prevStats    *StatsResponse
+	rules        *RulesResponse
+	rates        map[string]rateEntry
+	networkRates map[string]rateEntry
+	history      map[string]*rateHistory
+	lastStatsAt  time.Time
 
 	// Configuration management data.
 	session            *SessionResponse
@@ -228,19 +235,20 @@ type Model struct {
 	resultSelected     int
 
 	// List and input state.
-	view           viewMode
-	selectedRuleID string
-	sort           sortKey
-	sortDesc       bool
-	paused         bool
-	filterActive   bool
-	filterInput    textinput.Model
-	udpInput       textinput.Model
-	udpInputError  string
-	statusText     string
-	statusTime     time.Time
-	contentYOffset int
-	overlayYOffset int
+	view            viewMode
+	selectedRuleID  string
+	sort            sortKey
+	sortDesc        bool
+	paused          bool
+	filterActive    bool
+	filterInput     textinput.Model
+	udpInput        textinput.Model
+	udpInputError   string
+	statusText      string
+	statusTime      time.Time
+	contentYOffset  int
+	overlayYOffset  int
+	networkExpanded bool
 
 	// Request generations prevent slower responses from replacing newer state.
 	statsRequestID       int64
@@ -250,6 +258,14 @@ type Model struct {
 	lastConfigResponseID int64
 	configBarrierID      int64
 	botRequestID         int64
+	serviceRequestID     int64
+
+	// Native service recovery is enabled only for a known-local target.
+	serviceController        *ServiceController
+	serviceState             serviceRecoveryState
+	serviceSummary           ServiceSummary
+	serviceErr               error
+	serviceReconnectDeadline time.Time
 
 	width  int
 	height int
@@ -260,8 +276,19 @@ type Model struct {
 	ready           bool
 }
 
+// RunOptions controls presentation and optional local-service recovery for a
+// TUI session.
+type RunOptions struct {
+	Translator        *i18n.Translator
+	ServiceController *ServiceController
+}
+
 func Run(ctx context.Context, stdout io.Writer, addr, token string, httpClient *http.Client, headers http.Header) error {
-	m := newModel(ctx, addr, token)
+	return RunWithOptions(ctx, stdout, addr, token, httpClient, headers, RunOptions{})
+}
+
+func RunWithOptions(ctx context.Context, stdout io.Writer, addr, token string, httpClient *http.Client, headers http.Header, options RunOptions) error {
+	m := newModelWithOptions(ctx, addr, options, token)
 	m.client.SetHTTPClient(httpClient)
 	m.client.SetHeaders(headers)
 	p := tea.NewProgram(m,
@@ -274,37 +301,100 @@ func Run(ctx context.Context, stdout io.Writer, addr, token string, httpClient *
 }
 
 func newModel(ctx context.Context, addr string, token ...string) Model {
+	return newModelWithOptions(ctx, addr, RunOptions{}, token...)
+}
+
+func newModelWithOptions(ctx context.Context, addr string, options RunOptions, token ...string) Model {
+	translator := options.Translator
+	if translator == nil {
+		translator = i18n.New(i18n.English)
+	}
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = subtleStyle
 
 	filter := textinput.New()
-	filter.Placeholder = "filter by name or id..."
+	filter.Placeholder = translator.T("tui.input.filter.placeholder")
 	filter.CharLimit = 80
 
 	udpInput := textinput.New()
 	udpInput.Prompt = ""
-	udpInput.Placeholder = "global UDP sessions"
+	udpInput.Placeholder = translator.T("tui.input.udp_sessions.placeholder")
 	udpInput.CharLimit = 5
 	udpInput.Width = 16
 
-	return Model{
-		ctx:              ctx,
-		client:           NewClient(addr, token...),
-		rates:            make(map[string]rateEntry),
-		history:          make(map[string]*rateHistory),
-		view:             viewDashboard,
-		sort:             sortName,
-		sync:             syncUnavailable,
-		refreshInterval:  3 * time.Second,
-		spinner:          s,
-		filterInput:      filter,
-		udpInput:         udpInput,
-		statsRequestID:   1,
-		rulesRequestID:   1,
-		sessionRequestID: 1,
-		configRequestID:  1,
+	serviceState := serviceRecoveryDisabled
+	if options.ServiceController != nil {
+		serviceState = serviceRecoveryIdle
 	}
+
+	return Model{
+		ctx:               ctx,
+		client:            NewClient(addr, token...),
+		tr:                translator,
+		rates:             make(map[string]rateEntry),
+		networkRates:      make(map[string]rateEntry),
+		history:           make(map[string]*rateHistory),
+		view:              viewDashboard,
+		sort:              sortName,
+		sync:              syncUnavailable,
+		refreshInterval:   3 * time.Second,
+		spinner:           s,
+		filterInput:       filter,
+		udpInput:          udpInput,
+		serviceController: options.ServiceController,
+		serviceState:      serviceState,
+		statsRequestID:    1,
+		rulesRequestID:    1,
+		sessionRequestID:  1,
+		configRequestID:   1,
+	}
+}
+
+func (m Model) t(key string) string {
+	if m.tr == nil {
+		return i18n.New(i18n.English).T(key)
+	}
+	return m.tr.T(key)
+}
+
+func (m Model) tf(key string, args ...any) string {
+	if m.tr == nil {
+		return i18n.New(i18n.English).Tf(key, args...)
+	}
+	return m.tr.Tf(key, args...)
+}
+
+func (m *Model) openLanguageSelector() {
+	m.overlayYOffset = 0
+	m.overlay = overlayLanguage
+}
+
+func (m *Model) setLanguage(locale string) {
+	matched, ok := i18n.Match(locale)
+	if !ok {
+		return
+	}
+	translator := i18n.New(matched)
+	m.tr = translator
+	m.filterInput.Placeholder = translator.T("tui.input.filter.placeholder")
+	m.udpInput.Placeholder = translator.T("tui.input.udp_sessions.placeholder")
+	if m.udpInputError != "" {
+		m.udpInputError = translator.Tf("tui.validation.udp_sessions", engine.MaxUDPGlobalMaxSessions)
+	}
+	if m.editor != nil {
+		m.editor.setTranslator(translator)
+	}
+	if m.botEditor != nil {
+		m.botEditor.setTranslator(translator)
+	}
+	m.overlay = overlayNone
+	m.overlayYOffset = 0
+	languageKey := "tui.language.english"
+	if matched == i18n.SimplifiedChinese {
+		languageKey = "tui.language.simplified_chinese"
+	}
+	m.setStatus(m.tf("tui.status.language_changed", m.t(languageKey)))
 }
 
 func (m Model) Init() tea.Cmd {
@@ -345,15 +435,84 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.connectionErr = msg.err
+			if m.shouldInspectService(msg.err) {
+				return m, m.beginServiceInspection()
+			}
 		} else {
+			wasRecovering := m.serviceState != serviceRecoveryDisabled && m.serviceState != serviceRecoveryIdle
 			m.connectionErr = nil
 			sampledAt := time.Now()
 			m.computeRates(msg.resp, sampledAt)
 			m.prevStats = m.stats
 			m.stats = msg.resp
 			m.lastStatsAt = sampledAt
+			if wasRecovering {
+				m.resetServiceRecovery()
+				m.setStatus(m.t("tui.status.service_connected"))
+			}
 		}
 		return m, nil
+
+	case serviceInspectMsg:
+		if msg.requestID != m.serviceRequestID || m.serviceState != serviceRecoveryChecking {
+			return m, nil
+		}
+		m.serviceSummary = msg.summary
+		m.serviceErr = msg.err
+		switch {
+		case msg.err != nil:
+			m.serviceState = serviceRecoveryFailed
+		case !msg.summary.Installed:
+			m.serviceState = serviceRecoveryNotInstalled
+		case msg.summary.Running:
+			m.serviceState = serviceRecoveryRunning
+		default:
+			m.serviceState = serviceRecoveryStopped
+		}
+		return m, nil
+
+	case serviceStartMsg:
+		if msg.requestID != m.serviceRequestID || m.serviceState != serviceRecoveryStarting {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.serviceErr = msg.err
+			switch {
+			case !msg.elevated && errors.Is(msg.err, ErrServicePrivilegesRequired) && m.serviceController != nil && m.serviceController.ElevatedStartCommand != nil:
+				m.serviceState = serviceRecoveryStopped
+				m.overlay = overlayElevateService
+				m.setStatus(m.t("tui.status.service_privileges_required"))
+			case errors.Is(msg.err, ErrServiceNotInstalled):
+				m.serviceSummary = ServiceSummary{State: "not installed"}
+				m.serviceState = serviceRecoveryNotInstalled
+				m.setStatus(m.t("tui.status.service_not_installed"))
+			default:
+				m.serviceState = serviceRecoveryFailed
+				m.setStatus(m.tf("tui.status.service_start_failed", msg.err))
+			}
+			return m, nil
+		}
+		m.serviceState = serviceRecoveryWaiting
+		m.serviceSummary.Running = true
+		m.serviceErr = nil
+		m.serviceReconnectDeadline = time.Now().Add(serviceReconnectTimeout)
+		m.setStatus(m.t("tui.status.service_waiting"))
+		commands := m.refreshCommands()
+		commands = append(commands, serviceReconnectCmd(m.serviceRequestID))
+		return m, tea.Batch(commands...)
+
+	case serviceReconnectMsg:
+		if msg.requestID != m.serviceRequestID || m.serviceState != serviceRecoveryWaiting {
+			return m, nil
+		}
+		if !m.serviceReconnectDeadline.IsZero() && time.Now().After(m.serviceReconnectDeadline) {
+			m.serviceState = serviceRecoveryRunning
+			m.setStatus(m.t("tui.status.service_management_unreachable"))
+			return m, nil
+		}
+		commands := m.refreshCommands()
+		commands = append(commands, serviceReconnectCmd(msg.requestID))
+		return m, tea.Batch(commands...)
 
 	case rulesMsg:
 		if msg.requestID != m.rulesRequestID {
@@ -406,13 +565,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			if msg.operation == botOperationFetching {
 				m.botConfigErr = msg.err
-				message := "bot config unavailable: " + friendlyError(msg.err)
+				message := m.tf("tui.status.bot_config_unavailable", m.friendlyError(msg.err))
 				if m.botReconcileAction != "" {
-					message = "could not reconcile bot " + m.botReconcileAction + ": " + friendlyError(msg.err)
+					message = m.tf("tui.status.bot_reconcile_failed", m.botActionLabel(m.botReconcileAction), m.friendlyError(msg.err))
 				}
 				if m.botRebasePending && m.botEditor != nil {
-					message = "could not load the latest bot config: " + friendlyError(msg.err)
-					m.botEditor.formError = message + "; press Ctrl+R to retry"
+					message = m.tf("tui.status.bot_latest_load_failed", m.friendlyError(msg.err))
+					m.botEditor.formError = m.tf("tui.status.retry_ctrl_r", message)
 				}
 				m.setStatus(message)
 				return m, nil
@@ -421,9 +580,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case http.StatusPreconditionFailed:
 				m.botRebasePending = true
 				if m.botEditor != nil {
-					m.botEditor.formError = "Bot configuration changed remotely; loading the latest version..."
+					m.botEditor.formError = m.t("tui.status.bot_remote_changed_loading")
 				}
-				m.setStatus("bot config changed remotely; loading the latest version")
+				m.setStatus(m.t("tui.status.bot_remote_changed"))
 				botRequestID := m.beginBotOperation(botOperationFetching)
 				configRequestID := m.beginConfigBarrier()
 				return m, tea.Batch(
@@ -431,19 +590,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					fetchConfigRulesCmd(m.ctx, m.client, configRequestID),
 				)
 			case http.StatusForbidden:
-				message := "bot config requires admin"
+				message := m.t("tui.status.bot_admin_required")
 				if m.botEditor != nil {
 					m.botEditor.formError = message
 				}
 				m.setStatus(message)
 			case http.StatusUnprocessableEntity:
-				message := "bot config rejected: invalid Telegram token or chat settings"
+				message := m.t("tui.status.bot_config_rejected")
 				if m.botEditor != nil {
 					m.botEditor.formError = message
 				}
 				m.setStatus(message)
 			case http.StatusServiceUnavailable:
-				message, refresh, committed := botConfigUnavailableState(msg.err)
+				message, refresh, committed := m.botConfigUnavailableState(msg.err)
 				m.setStatus(message)
 				if m.botEditor != nil {
 					m.botEditor.formError = message
@@ -464,7 +623,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					)
 				}
 			default:
-				message := "bot config result is uncertain; refreshing: " + friendlyError(msg.err)
+				message := m.tf("tui.status.bot_result_uncertain", m.friendlyError(msg.err))
 				m.setStatus(message)
 				if m.botEditor != nil {
 					m.botEditor.formError = message
@@ -484,19 +643,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.botLastUpdated = time.Now()
 		if msg.operation == botOperationFetching && m.botRebasePending && m.botEditor != nil {
 			m.botEditor.rebase(msg.resp)
-			m.botEditor.formError = "Latest remote configuration loaded. Review and save again."
+			m.botEditor.formError = m.t("tui.status.bot_latest_loaded_editor")
 			m.botRebasePending = false
-			m.setStatus("latest bot config loaded; review and save again")
+			m.setStatus(m.t("tui.status.bot_latest_loaded"))
 			return m, nil
 		}
 		if msg.operation == botOperationFetching {
 			m.botRebasePending = false
 			if m.botReconcileAction != "" {
-				state := "STOPPED"
+				state := m.t("tui.state.stopped")
 				if msg.resp != nil && msg.resp.Running {
-					state = "RUNNING"
+					state = m.t("tui.state.running")
 				}
-				m.setStatus("bot " + m.botReconcileAction + " result reconciled: " + state)
+				m.setStatus(m.tf("tui.status.bot_reconciled", m.botActionLabel(m.botReconcileAction), state))
 				m.botReconcileAction = ""
 			}
 		}
@@ -504,7 +663,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.botEditor = nil
 			m.view = viewBotConfig
 			m.botRebasePending = false
-			m.setStatus("bot config saved")
+			m.setStatus(m.t("tui.status.bot_config_saved"))
 			configRequestID := m.beginConfigBarrier()
 			return m, fetchConfigRulesCmd(m.ctx, m.client, configRequestID)
 		}
@@ -517,12 +676,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.botOperation = botOperationIdle
 		if msg.err != nil {
 			m.botReconcileAction = msg.action
-			m.setStatus("bot " + msg.action + " failed: " + botControlErrorMessage(msg.action, msg.err) + "; refreshing state")
+			m.setStatus(m.tf("tui.status.bot_action_failed", m.botActionLabel(msg.action), m.botControlErrorMessage(msg.action, msg.err)))
 			requestID := m.beginBotOperation(botOperationFetching)
 			return m, fetchBotConfigCmd(m.ctx, m.client, requestID)
 		}
 		m.botReconcileAction = ""
-		m.setStatus("bot " + msg.action + " ok")
+		m.setStatus(m.tf("tui.status.bot_action_ok", m.botActionLabel(msg.action)))
 		requestID := m.beginBotOperation(botOperationFetching)
 		return m, fetchBotConfigCmd(m.ctx, m.client, requestID)
 
@@ -536,10 +695,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.operation = operationIdle
 		m.overlay = overlayNone
 		if msg.err != nil {
-			m.setStatus("reload failed: " + controlErrorMessage(msg.err))
+			m.setStatus(m.tf("tui.status.reload_failed", m.controlErrorMessage(msg.err)))
 			return m, nil
 		}
-		m.setStatus(fmt.Sprintf("reload ok: %d rules applied", msg.resp.RuleCount))
+		m.setStatus(m.tf("tui.status.reload_ok", msg.resp.RuleCount))
 		statsRequestID := m.beginStatsRequest()
 		rulesRequestID := m.beginRulesRequest()
 		m.configRequestID++
@@ -598,7 +757,52 @@ func botControlErrorMessage(action string, err error) string {
 	}
 }
 
+func (m Model) botControlErrorMessage(action string, err error) string {
+	switch apiStatus(err) {
+	case http.StatusForbidden:
+		return m.t("tui.error.admin_required")
+	case http.StatusUnprocessableEntity:
+		return m.t("tui.error.bot_settings_invalid")
+	case http.StatusServiceUnavailable:
+		message := strings.ToLower(err.Error())
+		if action == "start" && strings.Contains(message, "readiness") {
+			return m.t("tui.error.bot_readiness")
+		}
+		if strings.Contains(message, "controller unavailable") {
+			return m.t("tui.error.bot_controller_unavailable")
+		}
+		return m.t("tui.error.bot_lifecycle_uncertain")
+	case 0:
+		return m.friendlyError(err)
+	default:
+		return err.Error()
+	}
+}
+
+func (m Model) botActionLabel(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "start":
+		return m.t("tui.action.start")
+	case "stop":
+		return m.t("tui.action.stop")
+	default:
+		return action
+	}
+}
+
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.overlay == overlayLanguage {
+		return m.handleOverlayKey(msg)
+	}
+	if m.serviceBusy() {
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		default:
+			m.setStatus(m.t("tui.status.service_operation_in_progress"))
+			return m, nil
+		}
+	}
 	if updated, cmd, handled := m.handlePendingOperationKey(msg); handled {
 		return updated, cmd
 	}
@@ -612,10 +816,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleBotEditorKey(msg)
 	}
 	if m.view == viewBotConfig {
+		if updated, cmd, handled := m.handleNavigationKey(msg); handled {
+			return updated, cmd
+		}
 		return m.handleBotConfigKey(msg)
 	}
 	if m.filterActive {
 		return m.handleFilterInput(msg)
+	}
+	if updated, cmd, handled := m.handleNavigationKey(msg); handled {
+		return updated, cmd
 	}
 	if m.view == viewPrecheck {
 		return m.handlePrecheckKey(msg)
@@ -668,6 +878,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?", "f1":
 		m.overlayYOffset = 0
 		m.overlay = overlayHelp
+	case "l":
+		m.openLanguageSelector()
 	case "esc":
 		if m.view == viewDetail {
 			m.view = viewRules
@@ -683,72 +895,95 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "p":
 		m.paused = !m.paused
 		if m.paused {
-			m.setStatus("monitoring paused")
+			m.setStatus(m.t("tui.status.monitoring_paused"))
 		} else {
-			m.setStatus("monitoring resumed")
+			m.setStatus(m.t("tui.status.monitoring_resumed"))
 		}
 	case "r":
 		return m.refreshNow()
 	case "+", "=":
 		if m.refreshInterval > time.Second {
 			m.refreshInterval -= time.Second
-			m.setStatus(fmt.Sprintf("interval: %ds", int(m.refreshInterval.Seconds())))
+			m.setStatus(m.tf("tui.status.interval", int(m.refreshInterval.Seconds())))
 		}
 	case "-":
 		if m.refreshInterval < 10*time.Second {
 			m.refreshInterval += time.Second
-			m.setStatus(fmt.Sprintf("interval: %ds", int(m.refreshInterval.Seconds())))
+			m.setStatus(m.tf("tui.status.interval", int(m.refreshInterval.Seconds())))
 		}
 	case "R":
 		if m.draft != nil {
-			m.setStatus("discard the local draft before reloading from disk")
+			m.setStatus(m.t("tui.status.discard_before_reload"))
 		} else if !m.canReload() {
-			m.setStatus("reload requires an admin session")
+			m.setStatus(m.t("tui.status.reload_admin_required"))
 		} else {
 			m.overlay = overlayReload
 		}
 	case "b":
 		return m.openBotConfig()
+	case "a":
+		if m.view == viewDashboard {
+			m.networkExpanded = !m.networkExpanded
+			m.contentYOffset = m.dashboardNetworkYOffset()
+			if m.networkExpanded {
+				m.setStatus(m.t("tui.status.network_showing_all"))
+			} else {
+				m.setStatus(m.t("tui.status.network_hiding_inactive"))
+			}
+		}
 	case "up", "k":
-		if m.view == viewDetail {
-			m.scrollDetail(-1)
+		if m.view == viewDashboard || m.view == viewDetail {
+			m.scrollContent(-1)
 		} else if m.view == viewRules {
 			m.moveSelection(-1)
 		}
 	case "down", "j":
-		if m.view == viewDetail {
-			m.scrollDetail(1)
+		if m.view == viewDashboard || m.view == viewDetail {
+			m.scrollContent(1)
 		} else if m.view == viewRules {
 			m.moveSelection(1)
 		}
 	case "pgup":
-		if m.view == viewDetail {
-			m.scrollDetail(-m.mainViewportHeight())
+		if m.view == viewDashboard || m.view == viewDetail {
+			m.scrollContent(-m.mainViewportHeight())
 		} else if m.view == viewRules {
 			m.moveSelection(-m.rulePageSize())
 		}
 	case "pgdown":
-		if m.view == viewDetail {
-			m.scrollDetail(m.mainViewportHeight())
+		if m.view == viewDashboard || m.view == viewDetail {
+			m.scrollContent(m.mainViewportHeight())
 		} else if m.view == viewRules {
 			m.moveSelection(m.rulePageSize())
 		}
 	case "home":
-		if m.view == viewDetail {
+		if m.view == viewDashboard || m.view == viewDetail {
 			m.contentYOffset = 0
 		} else if m.view == viewRules {
 			m.selectRuleAt(0)
 		}
 	case "end":
-		if m.view == viewDetail {
-			m.contentYOffset = m.detailMaxYOffset()
+		if m.view == viewDashboard || m.view == viewDetail {
+			m.contentYOffset = m.contentMaxYOffset()
 		} else if m.view == viewRules {
 			m.selectRuleAt(len(m.sortedRules()) - 1)
 		}
 	case "enter":
-		if m.view == viewRules && m.selectedRule() != nil {
-			m.view = viewDetail
-			m.contentYOffset = 0
+		if m.view == viewDashboard && m.connectionErr != nil && m.canStartService() {
+			m.overlay = overlayStartService
+			return m, nil
+		}
+		if m.view == viewRules {
+			switch {
+			case m.draft != nil && m.sync == syncValidated && m.precheckResult != nil && m.precheckResult.Precheck.OK:
+				m.overlay = overlayApply
+			case m.draft != nil && m.sync == syncStale:
+				m.setStatus(m.t("tui.status.stale_draft_before_precheck"))
+			case m.draft != nil:
+				return m.startPrecheck()
+			case m.selectedRule() != nil:
+				m.view = viewDetail
+				m.contentYOffset = 0
+			}
 		}
 	case "s":
 		if m.view == viewRules {
@@ -767,17 +1002,47 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) refreshNow() (tea.Model, tea.Cmd) {
+func (m Model) handleNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
+	switch msg.String() {
+	case "1":
+		m.view = viewDashboard
+		m.contentYOffset = 0
+		return m, nil, true
+	case "2":
+		m.view = viewRules
+		m.contentYOffset = 0
+		return m, nil, true
+	case "3":
+		updated, cmd := m.openBotConfig()
+		return updated, cmd, true
+	case "4":
+		m.view = viewDashboard
+		m.contentYOffset = m.dashboardNetworkYOffset()
+		return m, nil, true
+	default:
+		return m, nil, false
+	}
+}
+
+func (m *Model) refreshCommands() []tea.Cmd {
 	statsRequestID := m.beginStatsRequest()
 	rulesRequestID := m.beginRulesRequest()
 	sessionRequestID := m.beginSessionRequest()
 	m.configRequestID++
-	return m, tea.Batch(
+	return []tea.Cmd{
 		fetchStatsCmd(m.ctx, m.client, statsRequestID),
 		fetchRulesCmd(m.ctx, m.client, rulesRequestID),
 		fetchSessionCmd(m.ctx, m.client, sessionRequestID),
 		fetchConfigRulesCmd(m.ctx, m.client, m.configRequestID),
-	)
+	}
+}
+
+func (m Model) refreshNow() (tea.Model, tea.Cmd) {
+	commands := m.refreshCommands()
+	if m.serviceController != nil && m.connectionErr != nil && apiStatus(m.connectionErr) == 0 && !m.serviceBusy() {
+		commands = append(commands, m.beginServiceInspection())
+	}
+	return m, tea.Batch(commands...)
 }
 
 func (m Model) handleFilterInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -821,8 +1086,8 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.overlay != overlayNone {
 		return m, nil
 	}
-	if m.view == viewDetail {
-		m.scrollDetail(delta)
+	if m.view == viewDashboard || m.view == viewDetail {
+		m.scrollContent(delta)
 		return m, nil
 	}
 	switch m.view {
@@ -892,6 +1157,46 @@ func (m *Model) computeRates(newStats *StatsResponse, sampledAt time.Time) {
 		}
 		history.push(rate.UploadRate, rate.DownloadRate)
 	}
+	m.computeNetworkRates(newStats.HostNetwork, elapsed)
+}
+
+func (m *Model) computeNetworkRates(current *HostNetworkSnapshot, elapsed float64) {
+	currentInterfaces := make(map[string]struct{})
+	if current != nil {
+		currentInterfaces = make(map[string]struct{}, len(current.Interfaces))
+		for _, iface := range current.Interfaces {
+			currentInterfaces[iface.Name] = struct{}{}
+		}
+	}
+	for name := range m.networkRates {
+		if _, ok := currentInterfaces[name]; !ok {
+			delete(m.networkRates, name)
+		}
+	}
+	if current == nil {
+		return
+	}
+
+	previousInterfaces := make(map[string]HostNetworkInterface)
+	if m.stats != nil && m.stats.HostNetwork != nil {
+		previousInterfaces = make(map[string]HostNetworkInterface, len(m.stats.HostNetwork.Interfaces))
+		for _, iface := range m.stats.HostNetwork.Interfaces {
+			previousInterfaces[iface.Name] = iface
+		}
+	}
+	for _, iface := range current.Interfaces {
+		rate := rateEntry{}
+		previous, ok := previousInterfaces[iface.Name]
+		if ok && elapsed > 0 && iface.CountersAvailable && previous.CountersAvailable {
+			if iface.RXBytes >= previous.RXBytes {
+				rate.DownloadRate = float64(iface.RXBytes-previous.RXBytes) / elapsed
+			}
+			if iface.TXBytes >= previous.TXBytes {
+				rate.UploadRate = float64(iface.TXBytes-previous.TXBytes) / elapsed
+			}
+		}
+		m.networkRates[iface.Name] = rate
+	}
 }
 
 func (m Model) filteredRules() []RuleInfo {
@@ -902,7 +1207,14 @@ func (m Model) filteredRules() []RuleInfo {
 	}
 	result := make([]RuleInfo, 0, len(rules))
 	for _, rule := range rules {
-		if strings.Contains(strings.ToLower(rule.Name), filter) || strings.Contains(strings.ToLower(rule.RuleID), filter) {
+		searchable := strings.Join([]string{
+			rule.Name,
+			rule.RuleID,
+			formatEndpoint(rule.ListenAddr, rule.ListenPort),
+			formatEndpoint(rule.TargetAddr, rule.TargetPort),
+			rule.Remark,
+		}, "\n")
+		if strings.Contains(strings.ToLower(searchable), filter) {
 			result = append(result, rule)
 		}
 	}
@@ -1030,7 +1342,7 @@ func (m *Model) cycleSort() {
 			break
 		}
 	}
-	m.sortDesc = !m.sortDesc
+	m.sortDesc = m.sort != sortName
 	m.reconcileSelection()
 }
 
@@ -1142,6 +1454,23 @@ func controlErrorMessage(err error) string {
 		return "operation failed; runtime rolled back"
 	case 0:
 		return friendlyError(err)
+	default:
+		return err.Error()
+	}
+}
+
+func (m Model) controlErrorMessage(err error) string {
+	switch apiStatus(err) {
+	case http.StatusPreconditionFailed:
+		return m.t("tui.error.config_changed")
+	case http.StatusForbidden:
+		return m.t("tui.error.admin_required")
+	case http.StatusUnprocessableEntity:
+		return m.t("tui.error.precheck_failed")
+	case http.StatusServiceUnavailable:
+		return m.t("tui.error.runtime_rolled_back")
+	case 0:
+		return m.friendlyError(err)
 	default:
 		return err.Error()
 	}

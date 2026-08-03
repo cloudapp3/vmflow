@@ -5,11 +5,11 @@
 //   - macOS:   launchd daemon (/Library/LaunchDaemons/io.cloudapp.<name>.plist)
 //   - Windows: Windows Service (managed via services.msc / SCM APIs)
 //
-// The package only performs install/uninstall/status: it generates the unit or
-// plist file and invokes the platform's service manager (systemctl / launchctl /
-// Windows SCM). The runtime itself does not need this package to run: Linux and
-// macOS execute vmflow in the foreground and supervise it via signals; on
-// Windows vmflow detects the SCM at startup (see
+// The package performs install/start/uninstall/status operations: it generates
+// the unit or plist file and invokes the platform's service manager (systemctl /
+// launchctl / Windows SCM). The runtime itself does not need this package to
+// run: Linux and macOS execute vmflow in the foreground and supervise it via
+// signals; on Windows vmflow detects the SCM at startup (see
 // cmd/vmflow/daemon_windows.go) and reports state itself.
 //
 // Style follows internal/updater: error-return (no logger in the package),
@@ -18,6 +18,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,14 +27,27 @@ import (
 	"strings"
 
 	vmconfig "github.com/cloudapp3/vmflow/config"
+	"github.com/cloudapp3/vmflow/internal/appdirs"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 )
 
 // DefaultServiceName is the service/unit/registry name used when Config.Name is
 // empty.
 const DefaultServiceName = "vmflow"
 
+var (
+	// ErrNotInstalled reports that no native service definition exists.
+	ErrNotInstalled = errors.New("native service is not installed")
+	// ErrPrivilegesRequired reports that starting the native service requires
+	// administrator privileges.
+	ErrPrivilegesRequired = errors.New("administrator privileges are required")
+)
+
 // Config describes how to install or query the vmflow service.
 type Config struct {
+	// Translator localizes human-readable progress output. It does not affect
+	// service names, paths, arguments, templates, or platform state values.
+	Translator *i18n.Translator
 	// BinaryPath is the vmflow executable path. Defaults to the current
 	// executable when empty.
 	BinaryPath string
@@ -58,9 +72,21 @@ type Config struct {
 	ExtraArgs []string
 }
 
+// InstallPlan is the validated, side-effect-free result of preparing a native
+// service installation. Paths are absolute, symlinks are resolved, and both
+// the binary and config have passed the same trust checks used by Install.
+type InstallPlan struct {
+	BinaryPath  string
+	ConfigPath  string
+	ServiceName string
+}
+
 // normalize fills in platform-agnostic defaults (service name, binary path,
 // config path) for a Config.
 func normalize(cfg Config) Config {
+	if cfg.Translator == nil {
+		cfg.Translator = i18n.New(i18n.English)
+	}
 	if strings.TrimSpace(cfg.ServiceName) == "" {
 		cfg.ServiceName = DefaultServiceName
 	}
@@ -74,15 +100,51 @@ func normalize(cfg Config) Config {
 		}
 	}
 	if strings.TrimSpace(cfg.ConfigPath) == "" {
-		cfg.ConfigPath = defaultConfigPath()
+		if configPath, err := appdirs.SystemConfigPath(); err == nil {
+			cfg.ConfigPath = configPath
+		}
 	}
 	return cfg
+}
+
+func (cfg Config) t(key string) string {
+	if cfg.Translator == nil {
+		return i18n.New(i18n.English).T(key)
+	}
+	return cfg.Translator.T(key)
+}
+
+func (cfg Config) tf(key string, args ...any) string {
+	if cfg.Translator == nil {
+		return i18n.New(i18n.English).Tf(key, args...)
+	}
+	return cfg.Translator.Tf(key, args...)
 }
 
 // validateInstall checks install preconditions shared across platforms: the
 // binary and config must resolve to trusted absolute paths, and the config must
 // parse successfully before any OS service state changes.
 func validateInstall(cfg Config) (Config, error) {
+	var err error
+	cfg, err = validateInstallTarget(cfg)
+	if err != nil {
+		return cfg, err
+	}
+	configPath, err := trustedServiceConfigPath(cfg.ConfigPath)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ConfigPath = configPath
+	if err := validateServiceConfig(cfg.ConfigPath); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+// validateInstallTarget checks everything that can be established before a
+// system config exists. Install performs the stricter config ownership and
+// content checks after the elevated setup process has written the file.
+func validateInstallTarget(cfg Config) (Config, error) {
 	if err := validateServiceExtraArgs(cfg.ExtraArgs); err != nil {
 		return cfg, err
 	}
@@ -94,14 +156,14 @@ func validateInstall(cfg Config) (Config, error) {
 		return cfg, err
 	}
 	cfg.BinaryPath = binaryPath
-	configPath, err := trustedServiceConfigPath(cfg.ConfigPath)
-	if err != nil {
-		return cfg, err
+	configPath := strings.TrimSpace(cfg.ConfigPath)
+	if configPath == "" {
+		return cfg, fmt.Errorf("could not determine vmflow config path; pass --config")
 	}
-	cfg.ConfigPath = configPath
-	if err := validateServiceConfig(cfg.ConfigPath); err != nil {
-		return cfg, err
+	if !filepath.IsAbs(configPath) {
+		return cfg, fmt.Errorf("config path must be absolute: %s", configPath)
 	}
+	cfg.ConfigPath = filepath.Clean(configPath)
 	return cfg, nil
 }
 
@@ -131,6 +193,38 @@ func validateServiceConfig(path string) error {
 		return fmt.Errorf("invalid service config %s: %w", path, err)
 	}
 	return nil
+}
+
+// PlanInstall validates a service installation without changing service state.
+// Callers can use it before requesting administrator privileges or presenting
+// an installation plan to a user. Install repeats the validation at commit time.
+func PlanInstall(cfg Config) (InstallPlan, error) {
+	cfg = normalize(cfg)
+	validated, err := validateInstall(cfg)
+	if err != nil {
+		return InstallPlan{}, err
+	}
+	return InstallPlan{
+		BinaryPath:  validated.BinaryPath,
+		ConfigPath:  validated.ConfigPath,
+		ServiceName: validated.ServiceName,
+	}, nil
+}
+
+// PlanInstallTarget validates the executable and destination path before an
+// elevated first-run helper creates the system config. It does not require the
+// config file to exist; Install repeats validation against the written file.
+func PlanInstallTarget(cfg Config) (InstallPlan, error) {
+	cfg = normalize(cfg)
+	validated, err := validateInstallTarget(cfg)
+	if err != nil {
+		return InstallPlan{}, err
+	}
+	return InstallPlan{
+		BinaryPath:  validated.BinaryPath,
+		ConfigPath:  validated.ConfigPath,
+		ServiceName: validated.ServiceName,
+	}, nil
 }
 
 // trustedServiceBinaryPath resolves binaryPath to the exact executable path the
@@ -213,6 +307,22 @@ func Install(cfg Config, w io.Writer) error {
 		return err
 	}
 	return platformInstall(cfg, w)
+}
+
+// Start starts an existing native service without changing its definition or
+// startup policy. Calling Start for an already-running service succeeds.
+func Start(cfg Config, w io.Writer) error {
+	cfg = normalize(cfg)
+	if summary, err := platformInspect(cfg); err == nil {
+		if !summary.Installed {
+			return fmt.Errorf("%w: %s", ErrNotInstalled, cfg.ServiceName)
+		}
+		if summary.Running {
+			fmt.Fprintln(w, cfg.tf("cli.service.output.already_running", cfg.ServiceName))
+			return nil
+		}
+	}
+	return platformStart(cfg, w)
 }
 
 // Uninstall stops and removes the service. Config and log files are left in

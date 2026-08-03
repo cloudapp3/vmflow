@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"io"
@@ -17,7 +18,9 @@ import (
 
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/cloudapp3/vmflow/internal/statsstore"
+	"github.com/cloudapp3/vmflow/internal/updater"
 )
 
 func TestRouteCLI(t *testing.T) {
@@ -55,6 +58,19 @@ func TestRouteCLI(t *testing.T) {
 	}
 }
 
+func TestWriteUpdateCheckIsLocalized(t *testing.T) {
+	result := &updater.CheckResult{CurrentVersion: "v1.0.0", LatestVersion: "v1.1.0", UpdateAvailable: true}
+	var english, chinese bytes.Buffer
+	writeUpdateCheckWithTranslator(&english, result, false, i18n.New(i18n.English))
+	writeUpdateCheckWithTranslator(&chinese, result, false, i18n.New(i18n.SimplifiedChinese))
+	if !strings.Contains(english.String(), "update available") || !strings.Contains(chinese.String(), "有可用更新") {
+		t.Fatalf("update output was not localized\nEnglish: %s\nChinese: %s", english.String(), chinese.String())
+	}
+	if !strings.Contains(chinese.String(), "v1.1.0") || strings.Contains(chinese.String(), "cli.update") {
+		t.Fatalf("Chinese update output changed the version or leaked a key: %s", chinese.String())
+	}
+}
+
 func TestParseForegroundOptionsUsesExplicitConfigWithoutResolver(t *testing.T) {
 	resolverCalled := false
 	opts, err := parseForegroundOptions([]string{"-config", " /custom/config.yaml ", "-control-port", "9999"}, func() (string, error) {
@@ -80,6 +96,22 @@ func TestParseForegroundOptionsRejectsInvalidControlPort(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "control-port") {
 			t.Fatalf("control-port=%s error = %v, want validation error", value, err)
 		}
+	}
+}
+
+func TestParseForegroundOptionsLocalizesValidationErrors(t *testing.T) {
+	_, err := parseForegroundOptionsWithTranslator([]string{"-config", "/custom/config.yaml", "-control-port", "65536"}, func() (string, error) {
+		return "", os.ErrNotExist
+	}, io.Discard, i18n.New(i18n.SimplifiedChinese))
+	if err == nil || !strings.Contains(err.Error(), "必须为 0") {
+		t.Fatalf("Chinese control-port validation error = %v", err)
+	}
+
+	_, err = parseForegroundOptionsWithTranslator([]string{"unexpected"}, func() (string, error) {
+		return "/opt/vmflow/config.yaml", nil
+	}, io.Discard, i18n.New(i18n.SimplifiedChinese))
+	if err == nil || !strings.Contains(err.Error(), "未预期的参数") {
+		t.Fatalf("Chinese positional validation error = %v", err)
 	}
 }
 
@@ -132,35 +164,16 @@ func TestForegroundRejectsLegacyRemoteControlListener(t *testing.T) {
 	}
 }
 
-func TestConfigPathBesideExecutableResolvesSymlink(t *testing.T) {
+func TestDefaultRuntimeConfigPathUsesUserConfigDirectory(t *testing.T) {
 	dir := t.TempDir()
-	realDir := filepath.Join(dir, "real dir")
-	if err := os.Mkdir(realDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	realBinary := filepath.Join(realDir, "vmflow")
-	if err := os.WriteFile(realBinary, []byte("binary"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	linkDir := filepath.Join(dir, "links")
-	if err := os.Mkdir(linkDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(linkDir, "vmflow")
-	if err := os.Symlink(realBinary, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-
-	got, err := configPathBesideExecutable(link)
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	got, err := defaultRuntimeConfigPath()
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(realDir, "config.yaml")
+	want := filepath.Join(dir, "vmflow", "config.yaml")
 	if got != want {
 		t.Fatalf("config path = %q, want %q", got, want)
-	}
-	if _, err := configPathBesideExecutable(filepath.Join(dir, "missing-vmflow")); err == nil {
-		t.Fatal("missing executable should fail closed")
 	}
 }
 
@@ -202,6 +215,82 @@ func TestRunForwardingRejectsStatsConfigPathCollision(t *testing.T) {
 	}
 	if readyErr := <-ready; readyErr == nil || !strings.Contains(readyErr.Error(), "must differ from config path") {
 		t.Fatalf("ready error = %v, want stats/config collision", readyErr)
+	}
+}
+
+func TestRunForwardingRejectsQuotaPathCollisions(t *testing.T) {
+	t.Run("stats", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		cfg := config.File{
+			ControlPort: 0,
+			Stats:       config.StatsConfig{Persist: true, Path: filepath.Join(dir, statsstore.DefaultQuotaFilename)},
+		}
+		ready := make(chan error, 1)
+		err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), ready)
+		if err == nil || !strings.Contains(err.Error(), "quota state path must differ from stats path") {
+			t.Fatalf("run error = %v, want quota/stats collision", err)
+		}
+		if readyErr := <-ready; readyErr == nil || !strings.Contains(readyErr.Error(), "quota state path must differ from stats path") {
+			t.Fatalf("ready error = %v, want quota/stats collision", readyErr)
+		}
+	})
+
+	t.Run("config", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, statsstore.DefaultQuotaFilename)
+		cfg := config.File{ControlPort: 0}
+		ready := make(chan error, 1)
+		err := runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), ready)
+		if err == nil || !strings.Contains(err.Error(), "quota state path must differ from config path") {
+			t.Fatalf("run error = %v, want quota/config collision", err)
+		}
+		if readyErr := <-ready; readyErr == nil || !strings.Contains(readyErr.Error(), "quota state path must differ from config path") {
+			t.Fatalf("ready error = %v, want quota/config collision", readyErr)
+		}
+	})
+}
+
+func TestRunForwardingInitializesDurableQuotaState(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := config.File{
+		ControlPort: 0,
+		Rules: []engine.Rule{{
+			RuleID: "limited", Name: "limited", Protocol: engine.ProtocolTCP,
+			ListenAddr: "127.0.0.1", ListenPort: 2201, TargetAddr: "127.0.0.1", TargetPort: 22,
+			Enabled: false,
+			TrafficQuota: &engine.TrafficQuota{
+				Daily: 100, Timezone: "UTC", Action: "block",
+			},
+		}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan error, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- runForwardingWithReady(ctx, cfg, cfg, configPath, testLogger(), ready)
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("readiness failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for readiness")
+	}
+	quotaPath := filepath.Join(dir, statsstore.DefaultQuotaFilename)
+	if _, err := statsstore.NewQuotaStore(quotaPath).LoadQuotaState(); err != nil {
+		t.Fatalf("load initialized quota state: %v", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
 	}
 }
 
@@ -266,9 +355,10 @@ func TestRunForwardingReportsReadyAfterBindingControlListener(t *testing.T) {
 	ready := make(chan error, 1)
 	done := make(chan error, 1)
 	cfg := config.File{ControlPort: 0}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
 	go func() {
-		done <- runForwardingWithReady(ctx, cfg, cfg, "test-config.yaml", testLogger(), ready)
+		done <- runForwardingWithReady(ctx, cfg, cfg, configPath, testLogger(), ready)
 	}()
 
 	select {
@@ -301,8 +391,9 @@ func TestRunForwardingReportsListenFailureBeforeReady(t *testing.T) {
 	ready := make(chan error, 1)
 	done := make(chan error, 1)
 	cfg := config.File{ControlPort: occupied.Addr().(*net.TCPAddr).Port}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	go func() {
-		done <- runForwardingWithReady(context.Background(), cfg, cfg, "test-config.yaml", testLogger(), ready)
+		done <- runForwardingWithReady(context.Background(), cfg, cfg, configPath, testLogger(), ready)
 	}()
 
 	select {

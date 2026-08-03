@@ -11,11 +11,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
 )
 
 type httpProxyRunner struct {
 	rule      Rule
 	collector *Collector
+	resolver  *dnsresolver.Resolver
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -26,10 +29,18 @@ type httpProxyRunner struct {
 }
 
 func newHTTPProxyRunner(rule Rule, collector *Collector) Runner {
+	return newHTTPProxyRunnerWithResolver(rule, collector, nil)
+}
+
+func newHTTPProxyRunnerWithResolver(rule Rule, collector *Collector, resolver *dnsresolver.Resolver) Runner {
 	ctx, cancel := context.WithCancel(context.Background())
+	if resolver == nil {
+		resolver = dnsresolver.New()
+	}
 	return &httpProxyRunner{
 		rule:      rule,
 		collector: collector,
+		resolver:  resolver,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -136,7 +147,7 @@ func (runner *httpProxyRunner) handleConnect(clientConn net.Conn, br *bufio.Read
 	}
 
 	// Connect to target
-	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	targetConn, err := runner.resolver.DialContext(runner.ctx, &net.Dialer{Timeout: 10 * time.Second}, "tcp", targetAddr)
 	if err != nil {
 		runner.writeError(clientConn, 502, "Bad Gateway")
 		return
@@ -210,7 +221,7 @@ func (runner *httpProxyRunner) handleHTTP(clientConn net.Conn, br *bufio.Reader,
 	}
 
 	// Connect to target
-	targetConn, err := net.DialTimeout("tcp", host, 10*time.Second)
+	targetConn, err := runner.resolver.DialContext(runner.ctx, &net.Dialer{Timeout: 10 * time.Second}, "tcp", host)
 	if err != nil {
 		runner.writeError(clientConn, 502, "Bad Gateway")
 		return

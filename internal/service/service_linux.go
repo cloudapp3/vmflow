@@ -12,14 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cloudapp3/vmflow/internal/appdirs"
 )
 
 const (
 	linuxUnitDir    = "/etc/systemd/system"
-	linuxDefaultCfg = "/etc/vmflow/config.yaml"
+	linuxDefaultCfg = appdirs.LinuxSystemConfigPath
 )
-
-func defaultConfigPath() string { return linuxDefaultCfg }
 
 func unitPath(cfg Config) string {
 	return filepath.Join(linuxUnitDir, cfg.ServiceName+".service")
@@ -30,7 +30,7 @@ func platformInstall(cfg Config, w io.Writer) error {
 		return fmt.Errorf("installing a systemd unit requires root (try sudo)")
 	}
 	if u := strings.TrimSpace(cfg.User); u != "" {
-		if err := ensureSystemUser(u, w); err != nil {
+		if err := ensureSystemUser(u, w, cfg); err != nil {
 			return err
 		}
 	}
@@ -39,9 +39,42 @@ func platformInstall(cfg Config, w io.Writer) error {
 	if err := installSystemdUnit(cfg, path, runCombined); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "installed %s\n", path)
-	fmt.Fprintf(w, "service %s enabled and started\n", cfg.ServiceName)
-	fmt.Fprintf(w, "logs: journalctl -u %s   |   status: vmflow service status\n", cfg.ServiceName)
+	fmt.Fprintln(w, cfg.tf("cli.service.output.installed", path))
+	fmt.Fprintln(w, cfg.tf("cli.service.output.enabled_started", cfg.ServiceName))
+	fmt.Fprintln(w, cfg.tf("cli.service.output.linux_logs", cfg.ServiceName))
+	return nil
+}
+
+func platformStart(cfg Config, w io.Writer) error {
+	info, err := os.Lstat(unitPath(cfg))
+	if os.IsNotExist(err) {
+		return fmt.Errorf("%w: %s", ErrNotInstalled, cfg.ServiceName)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect systemd unit: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("systemd unit path %s is not a regular file", unitPath(cfg))
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("%w (try sudo)", ErrPrivilegesRequired)
+	}
+	if err := startSystemdService(cfg.ServiceName, runCombined); err != nil {
+		return err
+	}
+	fmt.Fprintln(w, cfg.tf("cli.service.output.started", cfg.ServiceName))
+	return nil
+}
+
+func startSystemdService(serviceName string, runner systemdCommandRunner) error {
+	for _, step := range [][]string{
+		{"systemctl", "start", serviceName},
+		{"systemctl", "is-active", "--quiet", serviceName},
+	} {
+		if err := runSystemdCommand(runner, step); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -209,20 +242,71 @@ func platformUninstall(cfg Config, w io.Writer) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("removing a systemd unit requires root (try sudo)")
 	}
-	// best-effort stop+disable; ignore errors if the service is not loaded
-	_, _ = runCombined([]string{"systemctl", "stop", cfg.ServiceName})
-	_, _ = runCombined([]string{"systemctl", "disable", cfg.ServiceName})
+	if err := uninstallSystemdService(cfg.ServiceName, unitPath(cfg), runCombined); err != nil {
+		return err
+	}
+	fmt.Fprintln(w, cfg.tf("cli.service.output.stopped_removed", cfg.ServiceName))
+	fmt.Fprintln(w, cfg.t("cli.service.output.files_preserved"))
+	return nil
+}
 
-	path := unitPath(cfg)
+func uninstallSystemdService(serviceName, path string, runner systemdCommandRunner) error {
+	_, pathErr := os.Lstat(path)
+	if pathErr != nil && !os.IsNotExist(pathErr) {
+		return fmt.Errorf("inspect systemd unit: %w", pathErr)
+	}
+	state, err := systemdActiveState(serviceName, runner)
+	if err != nil {
+		if os.IsNotExist(pathErr) {
+			return nil
+		}
+		return err
+	}
+	if os.IsNotExist(pathErr) && systemdStoppedState(state) {
+		return nil
+	}
+
+	if !systemdStoppedState(state) {
+		if err := runSystemdCommand(runner, []string{"systemctl", "stop", serviceName}); err != nil {
+			return err
+		}
+		state, err = systemdActiveState(serviceName, runner)
+		if err != nil {
+			return fmt.Errorf("verify systemd service stopped: %w", err)
+		}
+		if !systemdStoppedState(state) {
+			return fmt.Errorf("systemd service %s did not stop (active state %q)", serviceName, state)
+		}
+	}
+
+	if err := runSystemdCommand(runner, []string{"systemctl", "disable", serviceName}); err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove unit file: %w", err)
 	}
-	if out, err := runCombined([]string{"systemctl", "daemon-reload"}); err != nil {
-		return fmt.Errorf("systemctl daemon-reload: %w (%s)", err, strings.TrimSpace(string(out)))
+	if err := runSystemdCommand(runner, []string{"systemctl", "daemon-reload"}); err != nil {
+		return err
 	}
-	fmt.Fprintf(w, "service %s stopped and removed\n", cfg.ServiceName)
-	fmt.Fprintln(w, "config and log files were left in place; remove them manually if desired")
 	return nil
+}
+
+func systemdActiveState(serviceName string, runner systemdCommandRunner) (string, error) {
+	argv := []string{"systemctl", "is-active", serviceName}
+	out, err := runner(argv)
+	state := strings.TrimSpace(string(out))
+	switch state {
+	case "active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing", "unknown":
+		return state, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("%s: %w (%s)", strings.Join(argv, " "), err, state)
+	}
+	return "", fmt.Errorf("%s returned unexpected active state %q", strings.Join(argv, " "), state)
+}
+
+func systemdStoppedState(state string) bool {
+	return state == "inactive" || state == "failed" || state == "unknown"
 }
 
 func platformStatus(cfg Config, w io.Writer) error {
@@ -269,7 +353,7 @@ func platformInspect(cfg Config) (Summary, error) {
 
 // ensureSystemUser creates name as a system (no-login) user if it does not
 // already exist, so a non-root systemd unit can run under it.
-func ensureSystemUser(name string, w io.Writer) error {
+func ensureSystemUser(name string, w io.Writer, cfg Config) error {
 	if _, err := user.Lookup(name); err == nil {
 		return nil
 	}
@@ -277,6 +361,6 @@ func ensureSystemUser(name string, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("create system user %s: %w (%s); create it manually then retry", name, err, strings.TrimSpace(string(out)))
 	}
-	fmt.Fprintf(w, "created system user %s\n", name)
+	fmt.Fprintln(w, cfg.tf("cli.service.output.user_created", name))
 	return nil
 }

@@ -71,6 +71,9 @@ func TestDNS01SolverDefaults(t *testing.T) {
 	if solver.pollingInterval != 5*time.Second {
 		t.Fatalf("expected default polling interval 5s, got %s", solver.pollingInterval)
 	}
+	if solver.propagationResolver == nil {
+		t.Fatal("expected the system propagation resolver by default")
+	}
 }
 
 func TestDNS01SolverCustomTimeouts(t *testing.T) {

@@ -23,11 +23,14 @@ import (
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/controlapi"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/appdirs"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/cloudapp3/vmflow/internal/logging"
 	"github.com/cloudapp3/vmflow/internal/service"
 	"github.com/cloudapp3/vmflow/internal/statsstore"
 	"github.com/cloudapp3/vmflow/internal/updater"
 	"github.com/cloudapp3/vmflow/metrics"
+	"github.com/cloudapp3/vmflow/netinfo"
 	"github.com/cloudapp3/vmflow/tui"
 )
 
@@ -38,62 +41,56 @@ var (
 	buildTime = "unknown"
 )
 
-const usageText = `vmflow - L4 port forwarding engine
-
-Usage:
-  vmflow                                                                  Show status and next steps
-  vmflow init          [-config path]                                    Create the first forwarding rule
-  vmflow run           [-config path] [-control-port port]               Start forwarding in foreground
-                                                                         Default config: config.yaml beside vmflow
-  vmflow status        [-config path] [-json]                            Inspect config and daemon status
-  vmflow ctl           [-token token] <health|rules|stats|metrics|precheck|reload> Query running vmflow
-  vmflow tui           [-token token]                                  Terminal UI dashboard
-  vmflow mcp           [-token token]                                  Read-only MCP server over stdio
-  vmflow version       [-json]                                         Show version info
-  vmflow update        [--check] [--version tag]                       Self-update vmflow binary
-  vmflow service       (install|uninstall|status) [--config path]      Register as a native OS service
-                       [--user name] [--log-file path] [--binary path] (systemd / launchd / Windows Service)
-                       [--control-port port]
-                       [--extra-arg=-future-flag=value]...
-  vmflow uninstall     [--dry-run]                                    Uninstall vmflow: remove service, binary,
-                                                                       owned config/cache, logs, and update cache
-
-Aliases: ctl=c, tui=t, version=v, update=u, service=svc, uninstall=remove,rm
-`
-
 func main() {
-	command, args := routeCLI(os.Args[1:])
+	environmentTranslator := i18n.New(i18n.Detect("", "", os.Getenv))
+	explicitLanguage, cliArgs, err := extractLanguageArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", environmentTranslator.Tf("cli.error.invalid_language_arguments", err))
+		os.Exit(2)
+	}
+	if explicitLanguage != "" {
+		if _, ok := i18n.Match(explicitLanguage); !ok {
+			fmt.Fprintf(os.Stderr, "%s\n", environmentTranslator.Tf("cli.error.unsupported_language", explicitLanguage, strings.Join(i18n.SupportedLocales(), ", ")))
+			os.Exit(2)
+		}
+	}
+	command, args := routeCLI(cliArgs)
+	configured := loadConfiguredLanguage(command, args)
+	translator := i18n.New(i18n.Detect(explicitLanguage, configured.Locale, os.Getenv))
+	printInvalidConfiguredLanguage(os.Stderr, configured, translator)
 	switch command {
 	case "guide":
-		runGuide(args)
+		runGuideWithTranslator(args, translator)
 	case "init":
-		runInit(args)
+		runInitWithTranslator(args, translator)
 	case "run":
-		runForeground(args)
+		runForegroundWithTranslator(args, translator)
 	case "foreground":
-		fmt.Fprintln(os.Stderr, "warning: starting vmflow without the 'run' command is deprecated; use 'vmflow run [flags]'")
-		runForeground(args)
+		fmt.Fprintln(os.Stderr, translator.T("cli.warning.legacy_foreground"))
+		runForegroundWithTranslator(args, translator)
 	case "status":
-		runStatus(args)
+		runStatusWithTranslator(args, translator)
 	case "help":
-		fmt.Fprint(os.Stdout, usageText)
+		fmt.Fprint(os.Stdout, usageTextFor(translator))
 	case "ctl", "c":
-		runCtl(args)
+		runCtlWithTranslator(args, translator)
 	case "tui", "t":
-		runTUI(args)
+		runTUIWithTranslator(args, translator)
 	case "mcp":
-		runMCP(args)
+		runMCPWithTranslator(args, translator)
 	case "version", "v":
-		runVersion(args)
+		runVersionWithTranslator(args, translator)
 	case "update", "u":
-		runUpdate(args)
+		runUpdateWithTranslator(args, translator)
 	case "service", "svc":
-		runService(args)
+		runServiceWithTranslator(args, translator)
+	case initServiceHelperCommand:
+		runInitServiceHelper(args, translator)
 	case "uninstall", "remove", "rm":
-		runUninstall(args)
+		runUninstallWithTranslator(args, translator)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
-		fmt.Fprint(os.Stderr, usageText)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.unknown_command", args[0]))
+		fmt.Fprint(os.Stderr, usageTextFor(translator))
 		os.Exit(1)
 	}
 }
@@ -105,7 +102,7 @@ func routeCLI(args []string) (string, []string) {
 	switch args[0] {
 	case "-h", "--help", "help":
 		return "help", args[1:]
-	case "init", "run", "status", "ctl", "c", "tui", "t", "mcp", "version", "v", "update", "u", "service", "svc", "uninstall", "remove", "rm":
+	case "init", "run", "status", "ctl", "c", "tui", "t", "mcp", "version", "v", "update", "u", "service", "svc", "uninstall", "remove", "rm", initServiceHelperCommand:
 		return args[0], args[1:]
 	default:
 		if strings.HasPrefix(args[0], "-") {
@@ -125,24 +122,29 @@ type foregroundOptions struct {
 }
 
 func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, error), output io.Writer) (foregroundOptions, error) {
+	return parseForegroundOptionsWithTranslator(args, resolveDefaultConfig, output, defaultTranslator())
+}
+
+func parseForegroundOptionsWithTranslator(args []string, resolveDefaultConfig func() (string, error), output io.Writer, translator *i18n.Translator) (foregroundOptions, error) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("vmflow", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.Usage = func() {
-		fmt.Fprintln(output, "Usage:\n  vmflow run [flags]\n\nRuns vmflow in the foreground.\n\nOptions:")
+		fmt.Fprintln(output, translator.T("cli.run.usage"))
 		fs.PrintDefaults()
 	}
-	configPath := fs.String("config", "", "config file path (default: config.yaml beside vmflow)")
-	controlPort := fs.Int("control-port", 0, "override the local management port (0 uses config)")
-	logFile := fs.String("log-file", "", "write logs to this file instead of stdout (useful under a service manager)")
-	serviceName := fs.String("service-name", service.DefaultServiceName, "[Windows SCM] registered service name")
+	configPath := fs.String("config", "", translator.T("cli.flag.config"))
+	controlPort := fs.Int("control-port", 0, translator.T("cli.run.flag.control_port"))
+	logFile := fs.String("log-file", "", translator.T("cli.run.flag.log_file"))
+	serviceName := fs.String("service-name", service.DefaultServiceName, translator.T("cli.run.flag.service_name"))
 	if err := fs.Parse(args); err != nil {
 		return foregroundOptions{}, err
 	}
 	if extra := fs.Args(); len(extra) != 0 {
-		return foregroundOptions{}, fmt.Errorf("unexpected argument(s): %v", extra)
+		return foregroundOptions{}, fmt.Errorf("%s", translator.Tf("cli.error.unexpected_arguments", extra))
 	}
 	if *controlPort < 0 || *controlPort > 65535 {
-		return foregroundOptions{}, fmt.Errorf("control-port must be 0 (use config) or between 1 and 65535")
+		return foregroundOptions{}, fmt.Errorf("%s", translator.T("cli.run.error.control_port"))
 	}
 
 	resolvedConfig := strings.TrimSpace(*configPath)
@@ -150,7 +152,7 @@ func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, 
 		var err error
 		resolvedConfig, err = resolveDefaultConfig()
 		if err != nil {
-			return foregroundOptions{}, fmt.Errorf("resolve default config path (use -config to override): %w", err)
+			return foregroundOptions{}, fmt.Errorf("%s", translator.Tf("cli.run.error.resolve_default_config", err))
 		}
 	}
 	return foregroundOptions{
@@ -162,42 +164,27 @@ func parseForegroundOptions(args []string, resolveDefaultConfig func() (string, 
 }
 
 func defaultRuntimeConfigPath() (string, error) {
-	executable, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("determine executable path: %w", err)
-	}
-	return configPathBesideExecutable(executable)
-}
-
-func configPathBesideExecutable(executable string) (string, error) {
-	executable = strings.TrimSpace(executable)
-	if executable == "" {
-		return "", errors.New("empty executable path")
-	}
-	absolute, err := filepath.Abs(executable)
-	if err != nil {
-		return "", fmt.Errorf("make executable path absolute: %w", err)
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return "", fmt.Errorf("resolve executable path %s: %w", absolute, err)
-	}
-	return filepath.Join(filepath.Dir(resolved), "config.yaml"), nil
+	return appdirs.UserConfigPath()
 }
 
 func runForeground(args []string) {
-	opts, err := parseForegroundOptions(args, defaultRuntimeConfigPath, os.Stderr)
+	runForegroundWithTranslator(args, defaultTranslator())
+}
+
+func runForegroundWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
+	opts, err := parseForegroundOptionsWithTranslator(args, defaultRuntimeConfigPath, os.Stderr, translator)
 	if errors.Is(err, flag.ErrHelp) {
 		return
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid runtime arguments: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.invalid_runtime_arguments", err))
 		os.Exit(2)
 	}
 
 	cfg, err := config.Load(opts.configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.load_config", err))
 		os.Exit(1)
 	}
 	startupConfig := cfg
@@ -207,7 +194,7 @@ func runForeground(args []string) {
 
 	logger, err := newLogger(cfg.Log, opts.logFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "init logger failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.init_logger", err))
 		os.Exit(1)
 	}
 	slog.SetDefault(logger)
@@ -228,11 +215,11 @@ func runForeground(args []string) {
 	var reporter func(runtimeReadyInfo)
 	if shouldPrintRuntimeSummary(cfg, opts) {
 		reporter = func(info runtimeReadyInfo) {
-			printRuntimeReady(os.Stdout, info)
+			printRuntimeReadyWithTranslator(os.Stdout, info, translator)
 		}
 	}
 	if err := runForwardingWithReporter(ctx, cfg, startupConfig, opts.configPath, logger, reporter); err != nil {
-		fmt.Fprintf(os.Stderr, "vmflow failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.runtime_failed", err))
 		os.Exit(1)
 	}
 }
@@ -276,7 +263,30 @@ func runForwardingWithReadyAndReporter(ctx context.Context, cfg, startupConfig c
 	}
 
 	collector := engine.NewCollector()
-	manager := engine.NewManagerWithOptions(collector, engine.ManagerOptions{UDPMaxSessions: cfg.UDPMaxSessions})
+	quotaPath := quotaFilePath(cfg, configPath)
+	if samePath, err := statsstore.SameFilePath(quotaPath, configPath); err != nil {
+		return fmt.Errorf("quota state path: %w", err)
+	} else if samePath {
+		return fmt.Errorf("quota state path must differ from config path: %s", quotaPath)
+	}
+	if cfg.Stats.Persist {
+		statsPath := statsFilePath(cfg, configPath)
+		if samePath, err := statsstore.SameFilePath(quotaPath, statsPath); err != nil {
+			return fmt.Errorf("quota state path: %w", err)
+		} else if samePath {
+			return fmt.Errorf("quota state path must differ from stats path: %s", quotaPath)
+		}
+	}
+	quotaLedger, err := engine.NewQuotaLedger(statsstore.NewQuotaStore(quotaPath))
+	if err != nil {
+		return fmt.Errorf("load quota state: %w", err)
+	}
+	if configHasTrafficQuota(cfg) {
+		if err := quotaLedger.SaveExact(); err != nil {
+			return fmt.Errorf("initialize quota state: %w", err)
+		}
+	}
+	manager := engine.NewManagerWithOptions(collector, engine.ManagerOptions{UDPMaxSessions: cfg.UDPMaxSessions, QuotaLedger: quotaLedger})
 
 	var statsStore *statsstore.Store
 	if cfg.Stats.Persist {
@@ -325,6 +335,7 @@ func runForwardingWithReadyAndReporter(ctx context.Context, cfg, startupConfig c
 		Logger:        logger,
 		Auth:          controlapi.NewAuthenticator(cfg.Auth),
 		Metrics:       metricsCollector,
+		HostNetwork:   netinfo.Collect,
 		StartupConfig: &startupConfig,
 	}
 	handler := controlapi.NewHandler(runtime)
@@ -393,6 +404,9 @@ func runForwardingWithReadyAndReporter(ctx context.Context, cfg, startupConfig c
 		_ = server.Close()
 	}
 	manager.StopAll()
+	if err := quotaLedger.SaveExact(); err != nil {
+		logger.Warn("quota state shutdown save failed", "component", "quota", "error", err)
+	}
 	if statsStore != nil {
 		if err := statsStore.Save(manager.SnapshotAll()); err != nil {
 			logger.Warn("stats shutdown flush failed", "component", "stats", "error", err)
@@ -406,6 +420,19 @@ func runForwardingWithReadyAndReporter(ctx context.Context, cfg, startupConfig c
 // state directory, then stats.json beside the config file.
 func statsFilePath(cfg config.File, configPath string) string {
 	return statsstore.ResolvePath(configPath, cfg.Stats.Path, statsStateDirectory())
+}
+
+func quotaFilePath(cfg config.File, configPath string) string {
+	return filepath.Join(filepath.Dir(statsFilePath(cfg, configPath)), statsstore.DefaultQuotaFilename)
+}
+
+func configHasTrafficQuota(cfg config.File) bool {
+	for _, rule := range cfg.Rules {
+		if rule.TrafficQuota != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func statsStateDirectory() string {
@@ -585,17 +612,27 @@ func newLogger(logCfg config.LogConfig, logFile string) (*slog.Logger, error) {
 // ── ctl ─────────────────────────────────────────────────────────────
 
 func runCtl(args []string) {
+	runCtlWithTranslator(args, defaultTranslator())
+}
+
+func runCtlWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("ctl", flag.ExitOnError)
-	defaults := loadManagementDefaults(os.Stderr)
-	addr := fs.String("addr", defaults.Address, "daemon management address")
-	token := fs.String("token", defaults.Token, "daemon management token (or environment/client profile)")
+	defaults := loadManagementDefaultsWithTranslator(os.Stderr, translator)
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), translator.T("cli.ctl.usage"))
+		fs.PrintDefaults()
+	}
+	addr := fs.String("addr", defaults.Address, translator.T("cli.ctl.flag.address"))
+	token := fs.String("token", defaults.Token, translator.T("cli.ctl.flag.token"))
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
+	localizeControlClientFlags(fs, translator)
 	fs.Parse(args)
 
 	cmdArgs := fs.Args()
 	if len(cmdArgs) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: vmflow ctl [-token token] <health|rules|stats|metrics|precheck|reload>")
+		fmt.Fprintln(os.Stderr, translator.T("cli.ctl.usage_short"))
 		os.Exit(1)
 	}
 
@@ -622,13 +659,13 @@ func runCtl(args []string) {
 		method = http.MethodPost
 		path = "/v1/reload"
 	default:
-		fmt.Fprintf(os.Stderr, "unknown action: %s\n", cmdArgs[0])
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.ctl.error.unknown_action", cmdArgs[0]))
 		os.Exit(1)
 	}
 
 	status, body, err := doRequest(*addr, *token, tlsFlags.Opts(), *headerFlags, method, path, reqBody)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.ctl.error.request", err))
 		os.Exit(1)
 	}
 	if status >= 400 {
@@ -674,29 +711,53 @@ func doRequest(baseURL, token string, tlsOpts controlapi.ClientTLSOptions, heade
 // ── tui ─────────────────────────────────────────────────────────────
 
 func runTUI(args []string) {
+	runTUIWithTranslator(args, defaultTranslator())
+}
+
+func runTUIWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("tui", flag.ExitOnError)
-	defaults := loadManagementDefaults(os.Stderr)
-	addr := fs.String("addr", defaults.Address, "daemon management address")
-	token := fs.String("token", defaults.Token, "daemon management token (or environment/client profile)")
+	defaults := loadManagementDefaultsWithTranslator(os.Stderr, translator)
+	addr := fs.String("addr", defaults.Address, translator.T("cli.tui.flag.address"))
+	token := fs.String("token", defaults.Token, translator.T("cli.tui.flag.token"))
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
+	localizeControlClientFlags(fs, translator)
 	fs.Parse(args)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	addressExplicit := false
+	fs.Visit(func(item *flag.Flag) {
+		if item.Name == "addr" {
+			addressExplicit = true
+		}
+	})
 
 	var httpClient *http.Client
 	if tlsFlags.Opts().Any() {
 		hc, err := controlapi.NewHTTPClient(tlsFlags.Opts(), 5*time.Second)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "tls: %v\n", err)
+			fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.tls", err))
 			os.Exit(1)
 		}
 		httpClient = hc
 	}
 
-	if err := tui.Run(ctx, os.Stdout, *addr, *token, httpClient, headerFlags.HTTPHeader()); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	options := tui.RunOptions{Translator: translator}
+	if localServiceControlEligible(*addr, addressExplicit, os.Getenv) {
+		configPath := strings.TrimSpace(defaults.ConfigPath)
+		if configPath == "" {
+			configPath, _ = defaultRuntimeConfigPath()
+		}
+		controller := newTUIServiceController(translator, configPath)
+		if !localTUIServiceReady(context.Background(), os.Stderr, translator, controller) {
+			os.Exit(1)
+		}
+		options.ServiceController = controller
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := tui.RunWithOptions(ctx, os.Stdout, *addr, *token, httpClient, headerFlags.HTTPHeader(), options); err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.tui", err))
 		os.Exit(1)
 	}
 }
@@ -704,37 +765,48 @@ func runTUI(args []string) {
 // ── version ─────────────────────────────────────────────────────────
 
 func runVersion(args []string) {
+	runVersionWithTranslator(args, defaultTranslator())
+}
+
+func runVersionWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("version", flag.ExitOnError)
 	var asJSON bool
-	fs.BoolVar(&asJSON, "json", false, "output as JSON")
+	fs.BoolVar(&asJSON, "json", false, translator.T("cli.version.flag.json"))
 	fs.Parse(args)
 
+	_ = writeVersion(os.Stdout, asJSON, translator)
+}
+
+type versionInfo struct {
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	Commit    string `json:"commit,omitempty"`
+	BuildTime string `json:"build_time,omitempty"`
+}
+
+func writeVersion(w io.Writer, asJSON bool, translator *i18n.Translator) error {
+	translator = translatorOrEnglish(translator)
 	if asJSON {
-		type versionInfo struct {
-			Name      string `json:"name"`
-			Version   string `json:"version"`
-			Commit    string `json:"commit,omitempty"`
-			BuildTime string `json:"build_time,omitempty"`
-		}
 		info := versionInfo{
 			Name:      "vmflow",
 			Version:   version,
 			Commit:    optionalField(commit, "none"),
 			BuildTime: optionalField(buildTime, "unknown"),
 		}
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(info)
-		return
+		return enc.Encode(info)
 	}
 
-	fmt.Printf("vmflow %s\n", version)
+	fmt.Fprintf(w, "vmflow %s\n", version)
 	if commit != "none" && commit != "" {
-		fmt.Printf("commit:     %s\n", commit)
+		fmt.Fprintf(w, "%-11s %s\n", translator.T("cli.version.commit"), commit)
 	}
 	if buildTime != "unknown" && buildTime != "" {
-		fmt.Printf("built:      %s\n", buildTime)
+		fmt.Fprintf(w, "%-11s %s\n", translator.T("cli.version.built"), buildTime)
 	}
+	return nil
 }
 
 func optionalField(value string, markers ...string) string {
@@ -750,28 +822,33 @@ func optionalField(value string, markers ...string) string {
 // ── update ──────────────────────────────────────────────────────────
 
 func runUpdate(args []string) {
+	runUpdateWithTranslator(args, defaultTranslator())
+}
+
+func runUpdateWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage:\n  vmflow update [--check] [--version <tag>]\n\nOptions:\n")
+		fmt.Fprintln(fs.Output(), translator.T("cli.update.usage"))
 		fs.PrintDefaults()
 	}
 	var checkOnly bool
 	var targetVersion string
-	fs.BoolVar(&checkOnly, "check", false, "check for updates without installing")
-	fs.StringVar(&targetVersion, "version", "", "install or inspect a specific release tag")
+	fs.BoolVar(&checkOnly, "check", false, translator.T("cli.update.flag.check"))
+	fs.StringVar(&targetVersion, "version", "", translator.T("cli.update.flag.version"))
 	fs.Parse(args)
 	if len(fs.Args()) != 0 {
-		fmt.Fprintln(os.Stderr, "update does not accept positional args")
+		fmt.Fprintln(os.Stderr, translator.T("cli.update.error.positionals"))
 		os.Exit(1)
 	}
 	if !checkOnly && !updater.SelfUpdateSupported() {
-		fmt.Fprintln(os.Stderr, "self-update is not supported on Windows; install the release ZIP manually")
+		fmt.Fprintln(os.Stderr, translator.T("cli.update.error.windows"))
 		os.Exit(1)
 	}
 
 	currentRaw := strings.TrimSpace(version)
 	if !checkOnly && targetVersion == "" && strings.EqualFold(currentRaw, "dev") {
-		fmt.Fprintf(os.Stderr, "self-update requires a tagged release build; current version is %q (use --version vX.Y.Z to install a specific release)\n", version)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.update.error.tagged_build", version))
 		os.Exit(1)
 	}
 
@@ -797,57 +874,62 @@ func runUpdate(args []string) {
 		result, err = client.CheckForUpdate(ctx)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to check for updates: %v\n", err)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.update.error.check", err))
 		os.Exit(1)
 	}
 	if result == nil {
-		fmt.Fprintln(os.Stderr, "failed to check for updates: empty result")
+		fmt.Fprintln(os.Stderr, translator.T("cli.update.error.empty_result"))
 		os.Exit(1)
 	}
 
 	if checkOnly {
-		writeUpdateCheck(os.Stdout, result, targetTag != "")
+		writeUpdateCheckWithTranslator(os.Stdout, result, targetTag != "", translator)
 		return
 	}
 
 	if !result.UpdateAvailable {
 		if targetTag != "" && normalizeReleaseTag(result.CurrentVersion) == normalizeReleaseTag(result.LatestVersion) {
-			fmt.Printf("already on requested version: %s\n", formatReleaseTag(result.LatestVersion))
+			fmt.Fprintln(os.Stdout, translator.Tf("cli.update.output.requested_current", formatReleaseTag(result.LatestVersion)))
 			return
 		}
 		if targetTag != "" {
-			fmt.Printf("requested version %s is not newer than current %s\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+			fmt.Fprintln(os.Stdout, translator.Tf("cli.update.output.requested_not_newer", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion)))
 			return
 		}
-		fmt.Printf("already up to date: %s\n", formatReleaseTag(result.CurrentVersion))
+		fmt.Fprintln(os.Stdout, translator.Tf("cli.update.output.current", formatReleaseTag(result.CurrentVersion)))
 		return
 	}
 
 	if result.Release == nil {
-		fmt.Fprintln(os.Stderr, "failed to install update: release metadata is unavailable")
+		fmt.Fprintln(os.Stderr, translator.T("cli.update.error.release_unavailable"))
 		os.Exit(1)
 	}
 
-	fmt.Printf("updating from %s to %s\n", formatReleaseTag(result.CurrentVersion), formatReleaseTag(result.LatestVersion))
+	fmt.Fprintln(os.Stdout, translator.Tf("cli.update.output.updating", formatReleaseTag(result.CurrentVersion), formatReleaseTag(result.LatestVersion)))
 	if err := client.DownloadAndInstall(ctx, result.Release, os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to install update: %v\n", err)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.update.error.install", err))
 		os.Exit(1)
 	}
-	fmt.Printf("updated successfully to %s\n", formatReleaseTag(result.LatestVersion))
+	fmt.Fprintln(os.Stdout, translator.Tf("cli.update.output.success", formatReleaseTag(result.LatestVersion)))
 }
 
 func writeUpdateCheck(w io.Writer, result *updater.CheckResult, specific bool) {
+	writeUpdateCheckWithTranslator(w, result, specific, defaultTranslator())
+}
+
+func writeUpdateCheckWithTranslator(w io.Writer, result *updater.CheckResult, specific bool, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	switch {
 	case result.UpdateAvailable && specific:
-		fmt.Fprintf(w, "target release available: %s (current %s)\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+		fmt.Fprintln(w, translator.Tf("cli.update.output.target_available", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion)))
 	case result.UpdateAvailable:
-		fmt.Fprintf(w, "update available: %s (current %s)\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+		fmt.Fprintln(w, translator.Tf("cli.update.output.available", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion)))
 	case specific && normalizeReleaseTag(result.CurrentVersion) == normalizeReleaseTag(result.LatestVersion):
-		fmt.Fprintf(w, "already on requested version: %s\n", formatReleaseTag(result.LatestVersion))
+		fmt.Fprintln(w, translator.Tf("cli.update.output.requested_current", formatReleaseTag(result.LatestVersion)))
 	case specific:
-		fmt.Fprintf(w, "requested version %s is not newer than current %s\n", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion))
+		fmt.Fprintln(w, translator.Tf("cli.update.output.requested_not_newer", formatReleaseTag(result.LatestVersion), formatReleaseTag(result.CurrentVersion)))
 	default:
-		fmt.Fprintf(w, "already up to date: %s\n", formatReleaseTag(result.CurrentVersion))
+		fmt.Fprintln(w, translator.Tf("cli.update.output.current", formatReleaseTag(result.CurrentVersion)))
 	}
 }
 
@@ -883,45 +965,47 @@ func formatReleaseTag(v string) string {
 // ── service ─────────────────────────────────────────────────────────
 
 func runService(args []string) {
+	runServiceWithTranslator(args, defaultTranslator())
+}
+
+func runServiceWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("service", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage:\n  vmflow service (install|uninstall|status) [flags]\n\n")
-		fmt.Fprintf(fs.Output(), "Registers vmflow as a native service that starts at boot and restarts on crash:\n")
-		fmt.Fprintf(fs.Output(), "  Linux:   systemd unit (/etc/systemd/system/<name>.service)\n")
-		fmt.Fprintf(fs.Output(), "  macOS:   launchd daemon (/Library/LaunchDaemons/io.cloudapp.<name>.plist)\n")
-		fmt.Fprintf(fs.Output(), "  Windows: Windows Service (manage via services.msc)\n\nOptions:\n")
+		fmt.Fprintln(fs.Output(), translator.T("cli.service.usage"))
 		fs.PrintDefaults()
 	}
-	configPath := fs.String("config", "", "config file path the service runs with (default: platform system path)")
-	user := fs.String("user", "", "[systemd] run as this user; created if missing (default: root)")
-	logFile := fs.String("log-file", "", "override daemon log destination (Windows default: C:\\ProgramData\\vmflow\\logs\\vmflow.log)")
-	controlPort := fs.Int("control-port", 0, "override the daemon local management port")
+	configPath := fs.String("config", "", translator.T("cli.service.flag.config"))
+	user := fs.String("user", "", translator.T("cli.service.flag.user"))
+	logFile := fs.String("log-file", "", translator.T("cli.service.flag.log_file"))
+	controlPort := fs.Int("control-port", 0, translator.T("cli.service.flag.control_port"))
 	var extraArgs serviceArgList
-	fs.Var(&extraArgs, "extra-arg", "append a future daemon flag as --extra-arg=-flag=value (repeatable; existing flags have dedicated options)")
-	binaryPath := fs.String("binary", "", "path to the vmflow binary (default: this executable; install requires a trusted root/admin-owned absolute path)")
+	fs.Var(&extraArgs, "extra-arg", translator.T("cli.service.flag.extra_arg"))
+	binaryPath := fs.String("binary", "", translator.T("cli.service.flag.binary"))
 
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: vmflow service (install|uninstall|status) [flags]")
+		fmt.Fprintln(os.Stderr, translator.T("cli.service.usage_short"))
 		os.Exit(1)
 	}
 	// The action is the first positional; flags follow it. The flag package
 	// stops parsing at the first non-flag, so peel the action off before Parse.
 	action := args[0]
 	if strings.HasPrefix(action, "-") {
-		fmt.Fprintln(os.Stderr, "usage: vmflow service (install|uninstall|status) [flags]")
+		fmt.Fprintln(os.Stderr, translator.T("cli.service.usage_short"))
 		os.Exit(1)
 	}
 	fs.Parse(args[1:])
 	if *controlPort < 0 || *controlPort > 65535 {
-		fmt.Fprintln(os.Stderr, "control-port must be 0 (use config) or between 1 and 65535")
+		fmt.Fprintln(os.Stderr, translator.T("cli.error.control_port"))
 		os.Exit(2)
 	}
 	if extra := fs.Args(); len(extra) != 0 {
-		fmt.Fprintf(os.Stderr, "unexpected argument(s): %v\n", extra)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.error.unexpected_arguments", extra))
 		os.Exit(1)
 	}
 
 	cfg := service.Config{
+		Translator:  translator,
 		BinaryPath:  *binaryPath,
 		ConfigPath:  *configPath,
 		User:        *user,
@@ -934,16 +1018,18 @@ func runService(args []string) {
 	switch action {
 	case "install":
 		err = service.Install(cfg, os.Stdout)
+	case "start":
+		err = service.Start(cfg, os.Stdout)
 	case "uninstall":
 		err = service.Uninstall(cfg, os.Stdout)
 	case "status":
 		err = service.Status(cfg, os.Stdout)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown service action: %s (expected install|uninstall|status)\n", action)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.service.error.unknown_action", action))
 		os.Exit(1)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "service %s failed: %v\n", action, err)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.service.error.failed", action, err))
 		os.Exit(1)
 	}
 }

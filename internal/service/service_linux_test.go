@@ -6,8 +6,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/cloudapp3/vmflow/internal/i18n"
 )
 
 func TestSystemdUnitContainsRequiredDirectives(t *testing.T) {
@@ -88,6 +91,14 @@ func TestNormalizeResolvesDefaults(t *testing.T) {
 	}
 	if cfg.BinaryPath == "" {
 		t.Errorf("BinaryPath should resolve to current executable")
+	}
+	if got := cfg.tf("cli.service.output.enabled_started", "vmflow"); got != "service vmflow enabled and started" {
+		t.Errorf("default service output = %q, want English compatibility", got)
+	}
+
+	localized := normalize(Config{Translator: i18n.New(i18n.SimplifiedChinese)})
+	if got := localized.tf("cli.service.output.enabled_started", "vmflow"); got != "系统服务 vmflow 已启用并启动" {
+		t.Errorf("Chinese service output = %q", got)
 	}
 }
 
@@ -179,6 +190,179 @@ func TestInstallSystemdUnitRestartsAndVerifiesActive(t *testing.T) {
 	}
 	if !strings.HasSuffix(joined, "systemctl is-active --quiet vmflow\n") {
 		t.Fatalf("active verification was not the final install step: %v", commands)
+	}
+}
+
+func TestStartSystemdServiceStartsAndVerifiesActive(t *testing.T) {
+	var commands []string
+	runner := func(argv []string) ([]byte, error) {
+		commands = append(commands, strings.Join(argv, " "))
+		return nil, nil
+	}
+	if err := startSystemdService("vmflow", runner); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"systemctl start vmflow", "systemctl is-active --quiet vmflow"}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("start commands = %v, want %v", commands, want)
+	}
+}
+
+func TestStartSystemdServiceStopsAfterStartFailure(t *testing.T) {
+	var commands []string
+	runner := func(argv []string) ([]byte, error) {
+		commands = append(commands, strings.Join(argv, " "))
+		return []byte("permission denied"), errors.New("exit status 1")
+	}
+	err := startSystemdService("vmflow", runner)
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("start error = %v", err)
+	}
+	if len(commands) != 1 || commands[0] != "systemctl start vmflow" {
+		t.Fatalf("commands after failed start = %v", commands)
+	}
+}
+
+func TestUninstallSystemdServiceStopsVerifiesAndRemovesUnit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmflow.service")
+	if err := os.WriteFile(path, []byte("unit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var commands []string
+	activeChecks := 0
+	runner := func(argv []string) ([]byte, error) {
+		command := strings.Join(argv, " ")
+		commands = append(commands, command)
+		if command == "systemctl is-active vmflow" {
+			activeChecks++
+			if activeChecks == 1 {
+				return []byte("active\n"), nil
+			}
+			return []byte("inactive\n"), errors.New("exit status 3")
+		}
+		return nil, nil
+	}
+
+	if err := uninstallSystemdService("vmflow", path, runner); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"systemctl is-active vmflow",
+		"systemctl stop vmflow",
+		"systemctl is-active vmflow",
+		"systemctl disable vmflow",
+		"systemctl daemon-reload",
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("uninstall commands = %v, want %v", commands, want)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("systemd unit was not removed: %v", err)
+	}
+}
+
+func TestUninstallSystemdServiceAllowsAlreadyInactiveService(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmflow.service")
+	if err := os.WriteFile(path, []byte("unit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var commands []string
+	runner := func(argv []string) ([]byte, error) {
+		command := strings.Join(argv, " ")
+		commands = append(commands, command)
+		if command == "systemctl is-active vmflow" {
+			return []byte("inactive\n"), errors.New("exit status 3")
+		}
+		return nil, nil
+	}
+
+	if err := uninstallSystemdService("vmflow", path, runner); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"systemctl is-active vmflow",
+		"systemctl disable vmflow",
+		"systemctl daemon-reload",
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("inactive uninstall commands = %v, want %v", commands, want)
+	}
+}
+
+func TestUninstallSystemdServiceIsIdempotentWithoutUnit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-vmflow.service")
+	var commands []string
+	runner := func(argv []string) ([]byte, error) {
+		commands = append(commands, strings.Join(argv, " "))
+		return []byte("inactive\n"), errors.New("exit status 3")
+	}
+
+	if err := uninstallSystemdService("vmflow", path, runner); err != nil {
+		t.Fatalf("idempotent uninstall failed: %v", err)
+	}
+	want := []string{"systemctl is-active vmflow"}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("idempotent uninstall commands = %v, want %v", commands, want)
+	}
+}
+
+func TestUninstallSystemdServicePreservesUnitWhenStopFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmflow.service")
+	if err := os.WriteFile(path, []byte("unit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var commands []string
+	runner := func(argv []string) ([]byte, error) {
+		command := strings.Join(argv, " ")
+		commands = append(commands, command)
+		if command == "systemctl is-active vmflow" {
+			return []byte("active\n"), nil
+		}
+		return []byte("permission denied\n"), errors.New("exit status 1")
+	}
+
+	err := uninstallSystemdService("vmflow", path, runner)
+	if err == nil || !strings.Contains(err.Error(), "systemctl stop vmflow") {
+		t.Fatalf("stop error = %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("systemd unit changed after failed stop: %v", err)
+	}
+	want := []string{"systemctl is-active vmflow", "systemctl stop vmflow"}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("commands after failed stop = %v, want %v", commands, want)
+	}
+}
+
+func TestUninstallSystemdServicePreservesUnitWhenServiceRemainsActive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmflow.service")
+	if err := os.WriteFile(path, []byte("unit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var commands []string
+	runner := func(argv []string) ([]byte, error) {
+		command := strings.Join(argv, " ")
+		commands = append(commands, command)
+		if command == "systemctl is-active vmflow" {
+			return []byte("active\n"), nil
+		}
+		return nil, nil
+	}
+
+	err := uninstallSystemdService("vmflow", path, runner)
+	if err == nil || !strings.Contains(err.Error(), "did not stop") {
+		t.Fatalf("active verification error = %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("systemd unit changed while service remained active: %v", err)
+	}
+	want := []string{
+		"systemctl is-active vmflow",
+		"systemctl stop vmflow",
+		"systemctl is-active vmflow",
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("commands after active verification = %v, want %v", commands, want)
 	}
 }
 

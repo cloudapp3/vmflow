@@ -95,6 +95,48 @@ func TestClientSessionDecodesLegacyPayload(t *testing.T) {
 	}
 }
 
+func TestClientStatsDecodesOptionalHostNetwork(t *testing.T) {
+	client := clientWithResponse(t, http.StatusOK, `{
+		"items": [],
+		"host_network": {
+			"available": true,
+			"collected_time": 1700000000,
+			"hostname": "vm-01",
+			"os": "linux",
+			"arch": "amd64",
+			"interfaces": [{
+				"name": "eth0",
+				"up": true,
+				"running": true,
+				"loopback": false,
+				"addresses": [{"cidr":"10.0.0.2/24","family":"ipv4","scope":"private"}],
+				"counters_available": true,
+				"rx_bytes": 1024,
+				"tx_bytes": 2048
+			}]
+		}
+	}`, nil)
+	response, err := client.Stats(t.Context())
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if response.HostNetwork == nil || response.HostNetwork.Hostname != "vm-01" || len(response.HostNetwork.Interfaces) != 1 {
+		t.Fatalf("host network = %+v", response.HostNetwork)
+	}
+	if response.HostNetwork.Interfaces[0].RXBytes != 1024 || response.HostNetwork.Interfaces[0].Addresses[0].Scope != "private" {
+		t.Fatalf("host interface = %+v", response.HostNetwork.Interfaces[0])
+	}
+
+	legacy := clientWithResponse(t, http.StatusOK, `{"items":[]}`, nil)
+	legacyResponse, err := legacy.Stats(t.Context())
+	if err != nil {
+		t.Fatalf("legacy Stats() error = %v", err)
+	}
+	if legacyResponse.HostNetwork != nil {
+		t.Fatalf("legacy host network = %+v, want nil", legacyResponse.HostNetwork)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

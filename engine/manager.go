@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
 )
 
 type Runner interface {
@@ -27,6 +29,8 @@ type Manager struct {
 	collector     *Collector
 	certMgr       CertProvider
 	udpBudget     *udpSessionBudget
+	quotaLedger   *QuotaLedger
+	resolver      *dnsresolver.Resolver
 	runnerBuilder func(Rule) ([]Runner, error)
 }
 
@@ -45,11 +49,21 @@ func NewManagerWithCertOptions(collector *Collector, certMgr CertProvider, opts 
 	if collector == nil {
 		collector = NewCollector()
 	}
+	ledger := opts.QuotaLedger
+	if ledger == nil {
+		ledger, _ = NewQuotaLedger(nil)
+	}
+	resolver := opts.Resolver
+	if resolver == nil {
+		resolver = dnsresolver.New()
+	}
 	return &Manager{
-		running:   make(map[string]*managedRule),
-		collector: collector,
-		certMgr:   certMgr,
-		udpBudget: newUDPSessionBudget(opts.UDPMaxSessions),
+		running:     make(map[string]*managedRule),
+		collector:   collector,
+		certMgr:     certMgr,
+		udpBudget:   newUDPSessionBudget(opts.UDPMaxSessions),
+		quotaLedger: ledger,
+		resolver:    resolver,
 	}
 }
 
@@ -63,10 +77,20 @@ func NewManagerWithOptions(collector *Collector, opts ManagerOptions) *Manager {
 	if collector == nil {
 		collector = NewCollector()
 	}
+	ledger := opts.QuotaLedger
+	if ledger == nil {
+		ledger, _ = NewQuotaLedger(nil)
+	}
+	resolver := opts.Resolver
+	if resolver == nil {
+		resolver = dnsresolver.New()
+	}
 	return &Manager{
-		running:   make(map[string]*managedRule),
-		collector: collector,
-		udpBudget: newUDPSessionBudget(opts.UDPMaxSessions),
+		running:     make(map[string]*managedRule),
+		collector:   collector,
+		udpBudget:   newUDPSessionBudget(opts.UDPMaxSessions),
+		quotaLedger: ledger,
+		resolver:    resolver,
 	}
 }
 
@@ -101,7 +125,7 @@ func (manager *Manager) startRuleInternal(rule Rule) error {
 	}
 	if !rule.Enabled {
 		if _, running := manager.runningRule(rule.RuleID); !running {
-			manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+			manager.ensureRuleMetadata(rule)
 		}
 		return nil
 	}
@@ -112,7 +136,7 @@ func (manager *Manager) startRuleInternal(rule Rule) error {
 	if exists {
 		return fmt.Errorf("rule already running: %s", rule.RuleID)
 	}
-	manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+	manager.ensureRuleMetadata(rule)
 
 	runners, err := manager.buildRunners(rule)
 	if err != nil {
@@ -144,7 +168,7 @@ func (manager *Manager) restartRuleInternal(rule Rule) error {
 		return err
 	}
 	if !rule.Enabled {
-		manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+		manager.ensureRuleMetadata(rule)
 		manager.stopRuleInternal(rule.RuleID)
 		return nil
 	}
@@ -158,7 +182,7 @@ func (manager *Manager) restartRuleInternal(rule Rule) error {
 		stopRunnerSet(current.runners)
 		manager.collector.SetConns(rule.RuleID, 0)
 	}
-	manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+	manager.ensureRuleMetadata(rule)
 	if err := startRunnerSet(runners); err != nil {
 		return manager.restoreRuleAfterRestartFailure(current, err)
 	}
@@ -192,7 +216,7 @@ func (manager *Manager) restoreRuleAfterRestartFailure(previous *managedRule, ap
 	if previous == nil {
 		return applyErr
 	}
-	manager.collector.EnsureRuleProtocol(previous.rule.RuleID, previous.rule.Protocol)
+	manager.ensureRuleMetadata(previous.rule)
 	runners, err := manager.buildRunners(previous.rule)
 	if err == nil {
 		err = startRunnerSet(runners)
@@ -253,9 +277,7 @@ func (manager *Manager) RunningRules() []Rule {
 	defer manager.mu.RUnlock()
 	rules := make([]Rule, 0, len(manager.running))
 	for _, item := range manager.running {
-		rule := item.rule
-		rule.Domains = append([]string(nil), item.rule.Domains...)
-		rule.SourceIPs = append([]string(nil), item.rule.SourceIPs...)
+		rule := item.rule.Standardize()
 		rules = append(rules, rule)
 	}
 	sort.Slice(rules, func(i, j int) bool { return rules[i].RuleID < rules[j].RuleID })
@@ -269,11 +291,26 @@ func (manager *Manager) RunningCount() int {
 }
 
 func (manager *Manager) Snapshot(ruleID string) TrafficSnapshot {
-	return manager.collector.Snapshot(ruleID)
+	snapshot := manager.collector.Snapshot(ruleID)
+	snapshot.Quota = manager.quotaLedger.snapshot(ruleID, manager.collector.QuotaPolicy(ruleID))
+	return snapshot
 }
 
 func (manager *Manager) SnapshotAll() []TrafficSnapshot {
-	return manager.collector.SnapshotAll()
+	snapshots := manager.collector.SnapshotAll()
+	for index := range snapshots {
+		ruleID := snapshots[index].RuleID
+		snapshots[index].Quota = manager.quotaLedger.snapshot(ruleID, manager.collector.QuotaPolicy(ruleID))
+	}
+	return snapshots
+}
+
+// SaveQuotaStateExact persists actual quota usage after forwarding has stopped.
+func (manager *Manager) SaveQuotaStateExact() error {
+	if manager == nil || manager.quotaLedger == nil {
+		return nil
+	}
+	return manager.quotaLedger.SaveExact()
 }
 
 // RuleProtocols returns protocol metadata for running, stopped, and disabled
@@ -283,6 +320,14 @@ func (manager *Manager) RuleProtocols() map[string]Protocol {
 		return nil
 	}
 	return manager.collector.RuleProtocols()
+}
+
+// BandwidthPolicies reports configured aggregate limits for retained rules.
+func (manager *Manager) BandwidthPolicies() map[string]BandwidthLimit {
+	if manager == nil || manager.collector == nil {
+		return nil
+	}
+	return manager.collector.BandwidthPolicies()
 }
 
 func (manager *Manager) ApplySnapshot(rules []Rule, opts ApplySnapshotOptions) ApplyResult {
@@ -325,7 +370,7 @@ func (manager *Manager) ApplySnapshot(rules []Rule, opts ApplySnapshotOptions) A
 
 		current, running := manager.runningRule(rule.RuleID)
 		if !rule.Enabled {
-			manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+			manager.ensureRuleMetadata(rule)
 			if running {
 				manager.stopRuleInternal(rule.RuleID)
 				item.Action = ApplyActionStopped
@@ -341,7 +386,7 @@ func (manager *Manager) ApplySnapshot(rules []Rule, opts ApplySnapshotOptions) A
 
 		if running && current.rule.RuntimeEqual(rule) {
 			manager.updateRule(rule)
-			manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+			manager.ensureRuleMetadata(rule)
 			item.Action = ApplyActionUnchanged
 			item.Status = "ok"
 			result.Items = append(result.Items, item)
@@ -485,7 +530,7 @@ func (manager *Manager) applySnapshotTransactionalLocked(rules []Rule, opts Appl
 		current, running := manager.runningRule(rule.RuleID)
 
 		if !rule.Enabled {
-			manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+			manager.ensureRuleMetadata(rule)
 			if running {
 				previous := current.rule
 				manager.stopRuleInternal(rule.RuleID)
@@ -509,7 +554,7 @@ func (manager *Manager) applySnapshotTransactionalLocked(rules []Rule, opts Appl
 		if running && current.rule.RuntimeEqual(rule) {
 			previous := current.rule
 			manager.updateRule(rule)
-			manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+			manager.ensureRuleMetadata(rule)
 			journal = append(journal, rollbackStep{
 				ruleID: rule.RuleID,
 				action: ApplyActionUnchanged,
@@ -693,7 +738,7 @@ func (manager *Manager) rollbackSteps(result *RollbackResult, journal []rollback
 	// A failed rollback can leave the last working replacement active. Keep
 	// protocol metadata aligned with the runner that is actually serving.
 	for _, rule := range manager.RunningRules() {
-		manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+		manager.ensureRuleMetadata(rule)
 	}
 }
 
@@ -704,17 +749,22 @@ type ruleCounterState struct {
 	sourceIPDenied     int64
 	udpSessionRejected int64
 	udpPacketsDropped  int64
+	quotaRejectedBytes int64
 }
 
 type collectorStateSnapshot struct {
-	counters  map[string]ruleCounterState
-	protocols map[string]Protocol
+	counters   map[string]ruleCounterState
+	protocols  map[string]Protocol
+	bandwidths map[string]*BandwidthLimit
+	quotas     map[string]*TrafficQuota
 }
 
 func snapshotCollectorState(collector *Collector) collectorStateSnapshot {
 	snapshot := collectorStateSnapshot{
-		counters:  make(map[string]ruleCounterState),
-		protocols: make(map[string]Protocol),
+		counters:   make(map[string]ruleCounterState),
+		protocols:  make(map[string]Protocol),
+		bandwidths: make(map[string]*BandwidthLimit),
+		quotas:     make(map[string]*TrafficQuota),
 	}
 	if collector == nil {
 		return snapshot
@@ -729,10 +779,20 @@ func snapshotCollectorState(collector *Collector) collectorStateSnapshot {
 			sourceIPDenied:     counter.sourceIPDenied.Load(),
 			udpSessionRejected: counter.udpSessionRejected.Load(),
 			udpPacketsDropped:  counter.udpPacketsDropped.Load(),
+			quotaRejectedBytes: counter.quotaRejectedBytes.Load(),
 		}
 	}
 	for ruleID, protocol := range collector.protocols {
 		snapshot.protocols[ruleID] = protocol
+	}
+	for ruleID, limit := range collector.bandwidths {
+		if limit != nil {
+			value := *limit
+			snapshot.bandwidths[ruleID] = &value
+		}
+	}
+	for ruleID, quota := range collector.quotas {
+		snapshot.quotas[ruleID] = cloneTrafficQuota(quota)
 	}
 	return snapshot
 }
@@ -771,10 +831,22 @@ func restoreCollectorState(collector *Collector, snapshot collectorStateSnapshot
 		counter.sourceIPDenied.Add(state.sourceIPDenied)
 		counter.udpSessionRejected.Add(state.udpSessionRejected)
 		counter.udpPacketsDropped.Add(state.udpPacketsDropped)
+		counter.quotaRejectedBytes.Add(state.quotaRejectedBytes)
 	}
 	collector.protocols = make(map[string]Protocol, len(snapshot.protocols))
 	for ruleID, protocol := range snapshot.protocols {
 		collector.protocols[ruleID] = protocol
+	}
+	collector.bandwidths = make(map[string]*BandwidthLimit, len(snapshot.bandwidths))
+	for ruleID, limit := range snapshot.bandwidths {
+		if limit != nil {
+			value := *limit
+			collector.bandwidths[ruleID] = &value
+		}
+	}
+	collector.quotas = make(map[string]*TrafficQuota, len(snapshot.quotas))
+	for ruleID, quota := range snapshot.quotas {
+		collector.quotas[ruleID] = cloneTrafficQuota(quota)
 	}
 }
 
@@ -783,21 +855,28 @@ func (manager *Manager) buildRunners(rule Rule) ([]Runner, error) {
 		return manager.runnerBuilder(rule)
 	}
 	runners := make([]Runner, 0, 2)
+	traffic := newRuleTrafficController(rule, manager.quotaLedger)
 	switch rule.Protocol {
 	case ProtocolTCP:
-		runners = append(runners, newTCPRunner(rule, manager.collector))
+		runners = append(runners, newTCPRunnerWithTrafficAndResolver(rule, manager.collector, traffic, manager.resolver))
 	case ProtocolUDP:
-		runners = append(runners, newUDPRunnerWithBudget(rule, manager.collector, manager.udpBudget))
+		runners = append(runners, newUDPRunnerWithTrafficAndResolver(rule, manager.collector, manager.udpBudget, traffic, manager.resolver))
 	case ProtocolTCPUDP:
-		runners = append(runners, newTCPRunner(rule, manager.collector), newUDPRunnerWithBudget(rule, manager.collector, manager.udpBudget))
+		runners = append(runners, newTCPRunnerWithTrafficAndResolver(rule, manager.collector, traffic, manager.resolver), newUDPRunnerWithTrafficAndResolver(rule, manager.collector, manager.udpBudget, traffic, manager.resolver))
 	case ProtocolHTTP:
-		runners = append(runners, newHTTPProxyRunner(rule, manager.collector))
+		runners = append(runners, newHTTPProxyRunnerWithResolver(rule, manager.collector, manager.resolver))
 	case ProtocolHTTPS:
-		runners = append(runners, newHTTPSRunner(rule, manager.collector, manager.certMgr))
+		runners = append(runners, newHTTPSRunnerWithResolver(rule, manager.collector, manager.certMgr, manager.resolver))
 	default:
 		return nil, fmt.Errorf("invalid protocol: %s", rule.Protocol)
 	}
 	return runners, nil
+}
+
+func (manager *Manager) ensureRuleMetadata(rule Rule) {
+	manager.collector.EnsureRuleProtocol(rule.RuleID, rule.Protocol)
+	manager.collector.SetBandwidthPolicy(rule.RuleID, rule.Bandwidth)
+	manager.collector.SetQuotaPolicy(rule.RuleID, rule.TrafficQuota)
 }
 
 func (manager *Manager) detachRule(ruleID string) *managedRule {

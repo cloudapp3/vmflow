@@ -1,6 +1,10 @@
 package engine
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
+)
 
 const (
 	// DefaultUDPGlobalMaxSessions caps the total number of active UDP sessions
@@ -19,6 +23,14 @@ type ManagerOptions struct {
 	// UDPMaxSessions uses DefaultUDPGlobalMaxSessions when non-positive and is
 	// clamped to MaxUDPGlobalMaxSessions when larger than the supported bound.
 	UDPMaxSessions int
+
+	// QuotaLedger supplies calendar-period accounting and optional strict
+	// persistence. Nil uses an in-memory ledger.
+	QuotaLedger *QuotaLedger
+
+	// Resolver controls outbound target name resolution. Nil uses vmflow's
+	// automatic system-first failover policy.
+	Resolver *dnsresolver.Resolver
 }
 
 type udpSessionBudget struct {

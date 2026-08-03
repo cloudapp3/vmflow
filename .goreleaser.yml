@@ -47,7 +47,7 @@ archives:
       - THIRD_PARTY_NOTICES.md
       - third_party_licenses/**
       - src: examples/config.yaml
-        dst: .
+        dst: examples
         strip_parent: true
 
 checksum:

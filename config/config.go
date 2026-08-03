@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,6 +26,8 @@ const (
 
 type File struct {
 	Version                         int              `json:"version" yaml:"version"`
+	Language                        string           `json:"language,omitempty" yaml:"language,omitempty"`
+	InvalidLanguage                 string           `json:"-" yaml:"-"`
 	ControlPort                     int              `json:"control_port" yaml:"control_port"`
 	DeprecatedControlListenAddr     string           `json:"-" yaml:"control_listen_addr,omitempty"`
 	UsedDeprecatedControlListenAddr bool             `json:"-" yaml:"-"`
@@ -136,6 +139,7 @@ func Parse(raw []byte) (File, error) {
 	if cfg.Version != 1 {
 		return File{}, fmt.Errorf("unsupported config version: %d", cfg.Version)
 	}
+	cfg.Language, cfg.InvalidLanguage = normalizeLanguage(cfg.Language)
 	if err := normalizeControlPort(&cfg); err != nil {
 		return File{}, err
 	}
@@ -172,6 +176,17 @@ func Parse(raw []byte) (File, error) {
 		cfg.Rules[index] = rule
 	}
 	return cfg, nil
+}
+
+func normalizeLanguage(value string) (language, invalid string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return i18n.English, ""
+	}
+	if matched, ok := i18n.Match(value); ok {
+		return matched, ""
+	}
+	return i18n.English, value
 }
 
 func normalizeControlPort(cfg *File) error {

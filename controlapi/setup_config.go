@@ -16,6 +16,7 @@ import (
 // workflow. Existing files retain every other top-level field and unknown YAML
 // node.
 type SetupConfigUpdate struct {
+	Language         string
 	Auth             config.AuthConfig
 	Rules            []engine.Rule
 	RulesHeadComment string
@@ -29,7 +30,7 @@ func SetupConfigCommitted(err error) bool {
 	return errors.As(err, &commitErr) && commitErr.Committed
 }
 
-// SaveSetupConfig validates and persists the auth/rules chosen by the first-run
+// SaveSetupConfig validates and persists the language/auth/rules chosen by the first-run
 // workflow. Existing files use the same guarded atomic replacement as live TUI
 // rule management. A missing file is created exclusively with mode 0600.
 func SaveSetupConfig(path string, update SetupConfigUpdate) (config.File, error) {
@@ -49,7 +50,7 @@ func SaveSetupConfig(path string, update SetupConfigUpdate) (config.File, error)
 		return config.File{}, fmt.Errorf("save setup config: %w", err)
 	}
 
-	firstRaw, err := renderSetupConfig(document.raw, update.Auth, update.Rules, update.RulesHeadComment)
+	firstRaw, err := renderSetupConfig(document.raw, update.Language, update.Auth, update.Rules, update.RulesHeadComment)
 	if err != nil {
 		return config.File{}, fmt.Errorf("save setup config: render candidate: %w", err)
 	}
@@ -57,7 +58,7 @@ func SaveSetupConfig(path string, update SetupConfigUpdate) (config.File, error)
 	if err != nil {
 		return config.File{}, fmt.Errorf("save setup config: validate candidate: %w", err)
 	}
-	raw, err := renderSetupConfig(document.raw, firstConfig.Auth, firstConfig.Rules, update.RulesHeadComment)
+	raw, err := renderSetupConfig(document.raw, firstConfig.Language, firstConfig.Auth, firstConfig.Rules, update.RulesHeadComment)
 	if err != nil {
 		return config.File{}, fmt.Errorf("save setup config: render normalized candidate: %w", err)
 	}
@@ -85,6 +86,7 @@ func SaveSetupConfig(path string, update SetupConfigUpdate) (config.File, error)
 
 type initialSetupDocument struct {
 	Version        int               `yaml:"version"`
+	Language       string            `yaml:"language"`
 	ControlPort    int               `yaml:"control_port"`
 	UDPMaxSessions int               `yaml:"udp_max_sessions"`
 	Log            config.LogConfig  `yaml:"log"`
@@ -95,6 +97,7 @@ type initialSetupDocument struct {
 func createSetupConfig(path string, update SetupConfigUpdate) (config.File, error) {
 	document := initialSetupDocument{
 		Version:        1,
+		Language:       update.Language,
 		ControlPort:    config.DefaultControlPort,
 		UDPMaxSessions: engine.DefaultUDPGlobalMaxSessions,
 		Log: config.LogConfig{
@@ -116,6 +119,7 @@ func createSetupConfig(path string, update SetupConfigUpdate) (config.File, erro
 		return config.File{}, fmt.Errorf("save setup config: validate new config: %w", err)
 	}
 	document.Auth = firstConfig.Auth
+	document.Language = firstConfig.Language
 	document.Rules = firstConfig.Rules
 	document.UDPMaxSessions = firstConfig.UDPMaxSessions
 	raw, err := yaml.Marshal(document)
@@ -161,7 +165,7 @@ func createSetupConfig(path string, update SetupConfigUpdate) (config.File, erro
 	return cfg, nil
 }
 
-func renderSetupConfig(source []byte, auth config.AuthConfig, rules []engine.Rule, rulesHeadComment string) ([]byte, error) {
+func renderSetupConfig(source []byte, language string, auth config.AuthConfig, rules []engine.Rule, rulesHeadComment string) ([]byte, error) {
 	document, err := parseYAMLDocument(source)
 	if err != nil {
 		return nil, err
@@ -170,6 +174,10 @@ func renderSetupConfig(source []byte, auth config.AuthConfig, rules []engine.Rul
 	if rules == nil {
 		rules = []engine.Rule{}
 	}
+	languageNode, err := encodeYAMLNode(strings.TrimSpace(language))
+	if err != nil {
+		return nil, fmt.Errorf("encode language: %w", err)
+	}
 	authNode, err := encodeYAMLNode(auth)
 	if err != nil {
 		return nil, fmt.Errorf("encode auth: %w", err)
@@ -177,6 +185,9 @@ func renderSetupConfig(source []byte, auth config.AuthConfig, rules []engine.Rul
 	rulesNode, err := encodeYAMLNode(rules)
 	if err != nil {
 		return nil, fmt.Errorf("encode rules: %w", err)
+	}
+	if strings.TrimSpace(language) != "" {
+		setTopLevelYAMLNode(root, "language", languageNode)
 	}
 	setTopLevelYAMLNode(root, "auth", authNode)
 	setTopLevelYAMLNode(root, "rules", rulesNode)

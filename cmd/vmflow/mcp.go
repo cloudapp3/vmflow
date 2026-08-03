@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cloudapp3/vmflow/controlapi"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/cloudapp3/vmflow/internal/mcpserver"
 )
 
@@ -27,20 +28,30 @@ type mcpOptions struct {
 }
 
 func runMCP(args []string) {
+	runMCPWithTranslator(args, defaultTranslator())
+}
+
+func runMCPWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := runMCPWithIO(ctx, args, os.Stdin, os.Stdout, os.Stderr); err != nil {
+	if err := runMCPWithIOAndTranslator(ctx, args, os.Stdin, os.Stdout, os.Stderr, translator); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "vmflow MCP server failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.mcp.error.failed", err))
 		os.Exit(1)
 	}
 }
 
 func runMCPWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	opts, err := parseMCPOptions(args, stderr)
+	return runMCPWithIOAndTranslator(ctx, args, stdin, stdout, stderr, defaultTranslator())
+}
+
+func runMCPWithIOAndTranslator(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, translator *i18n.Translator) error {
+	translator = translatorOrEnglish(translator)
+	opts, err := parseMCPOptionsWithTranslator(args, stderr, translator)
 	if err != nil {
 		return err
 	}
@@ -49,7 +60,7 @@ func runMCPWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	if opts.tls.Any() {
 		httpClient, err = controlapi.NewHTTPClient(opts.tls, 35*time.Second)
 		if err != nil {
-			return fmt.Errorf("configure daemon management TLS: %w", err)
+			return fmt.Errorf("%s", translator.Tf("cli.mcp.error.configure_tls", err))
 		}
 	}
 	client := controlapi.NewClient(opts.addr, opts.token)
@@ -57,38 +68,44 @@ func runMCPWithIO(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	client.SetHeaders(opts.headers.HTTPHeader())
 
 	if err := mcpserver.RunStdio(ctx, stdin, stdout, client, version); err != nil {
-		return fmt.Errorf("serve stdio: %w", err)
+		return fmt.Errorf("%s", translator.Tf("cli.mcp.error.serve_stdio", err))
 	}
 	return nil
 }
 
 func parseMCPOptions(args []string, output io.Writer) (mcpOptions, error) {
+	return parseMCPOptionsWithTranslator(args, output, defaultTranslator())
+}
+
+func parseMCPOptionsWithTranslator(args []string, output io.Writer, translator *i18n.Translator) (mcpOptions, error) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(output)
-	defaults := loadManagementDefaults(output)
+	defaults := loadManagementDefaultsWithTranslator(output, translator)
 	fs.Usage = func() {
-		fmt.Fprintln(output, "Usage:\n  vmflow mcp [flags]\n\nStarts a read-only MCP server over stdio for a running local vmflow daemon.\n\nOptions:")
+		fmt.Fprintln(output, translator.T("cli.mcp.usage"))
 		fs.PrintDefaults()
 	}
-	addr := fs.String("addr", defaults.Address, "local daemon management address")
-	token := fs.String("token", defaults.Token, "daemon management token (or environment/client profile)")
+	addr := fs.String("addr", defaults.Address, translator.T("cli.mcp.flag.address"))
+	token := fs.String("token", defaults.Token, translator.T("cli.mcp.flag.token"))
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
+	localizeControlClientFlags(fs, translator)
 	if err := fs.Parse(args); err != nil {
 		return mcpOptions{}, err
 	}
 	if extra := fs.Args(); len(extra) != 0 {
-		return mcpOptions{}, fmt.Errorf("unexpected argument(s): %v", extra)
+		return mcpOptions{}, fmt.Errorf("%s", translator.Tf("cli.error.unexpected_arguments", extra))
 	}
 
-	address, err := normalizeMCPControlAddress(*addr)
+	address, err := normalizeMCPControlAddressWithTranslator(*addr, translator)
 	if err != nil {
 		return mcpOptions{}, err
 	}
 	tlsOpts := tlsFlags.Opts()
 	parsed, _ := url.Parse(address)
 	if tlsOpts.Any() && parsed.Scheme != "https" {
-		return mcpOptions{}, fmt.Errorf("MCP TLS options require an https daemon management address")
+		return mcpOptions{}, fmt.Errorf("%s", translator.T("cli.mcp.error.tls_requires_https"))
 	}
 	return mcpOptions{
 		addr:    address,
@@ -99,33 +116,38 @@ func parseMCPOptions(args []string, output io.Writer) (mcpOptions, error) {
 }
 
 func normalizeMCPControlAddress(raw string) (string, error) {
+	return normalizeMCPControlAddressWithTranslator(raw, defaultTranslator())
+}
+
+func normalizeMCPControlAddressWithTranslator(raw string, translator *i18n.Translator) (string, error) {
+	translator = translatorOrEnglish(translator)
 	raw = strings.TrimSpace(raw)
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid daemon management address: %w", err)
+		return "", fmt.Errorf("%s", translator.Tf("cli.mcp.error.invalid_address", err))
 	}
 	parsed.Scheme = strings.ToLower(strings.TrimSpace(parsed.Scheme))
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("daemon management address must use http or https")
+		return "", fmt.Errorf("%s", translator.T("cli.mcp.error.scheme"))
 	}
 	if parsed.User != nil {
-		return "", fmt.Errorf("daemon management address must not contain credentials")
+		return "", fmt.Errorf("%s", translator.T("cli.mcp.error.credentials"))
 	}
 	host := strings.TrimSpace(parsed.Hostname())
 	if host == "" {
-		return "", fmt.Errorf("daemon management address requires a host")
+		return "", fmt.Errorf("%s", translator.T("cli.mcp.error.host"))
 	}
 	if !strings.EqualFold(host, "localhost") {
 		ip := net.ParseIP(host)
 		if ip == nil || !ip.IsLoopback() {
-			return "", fmt.Errorf("daemon management address must use localhost or a loopback IP")
+			return "", fmt.Errorf("%s", translator.T("cli.mcp.error.loopback"))
 		}
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
-		return "", fmt.Errorf("daemon management address must not contain a path")
+		return "", fmt.Errorf("%s", translator.T("cli.mcp.error.path"))
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("daemon management address must not contain a query or fragment")
+		return "", fmt.Errorf("%s", translator.T("cli.mcp.error.query"))
 	}
 	parsed.Path = ""
 	return strings.TrimRight(parsed.String(), "/"), nil

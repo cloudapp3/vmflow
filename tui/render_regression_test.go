@@ -2,12 +2,16 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/cloudapp3/vmflow/precheck"
 )
 
@@ -63,8 +67,16 @@ func TestOfflineWithoutCachedDataUsesUnavailableState(t *testing.T) {
 
 	m.view = viewRules
 	output = ansi.Strip(m.View())
-	if !strings.Contains(output, "Rules unavailable") || strings.Contains(output, "No configured rules") {
+	if !strings.Contains(output, "Rule state unknown") || strings.Contains(output, "No configured rules") {
 		t.Fatalf("offline rules rendered a confirmed-empty configuration:\n%s", output)
+	}
+	for _, misleading := range []string{"0 rules", "UDP max 0", "[enter]detail"} {
+		if strings.Contains(output, misleading) {
+			t.Fatalf("offline rules rendered unavailable data/action as %q:\n%s", misleading, output)
+		}
+	}
+	if !strings.Contains(output, "[r]efresh") {
+		t.Fatalf("offline rules omitted the recovery action:\n%s", output)
 	}
 }
 
@@ -78,6 +90,48 @@ func TestCellWidthTruncationHandlesCJK(t *testing.T) {
 	}
 	if width := lipgloss.Width(cellColumn("东京", 7)); width != 7 {
 		t.Fatalf("cellColumn width = %d, want 7", width)
+	}
+}
+
+func TestChineseViewsFitRepresentativeTerminalWidths(t *testing.T) {
+	for _, size := range []struct {
+		width  int
+		height int
+	}{{40, 12}, {80, 24}, {120, 32}} {
+		t.Run(fmt.Sprintf("%dx%d", size.width, size.height), func(t *testing.T) {
+			m := managedTestModelWithTranslator(i18n.New(i18n.SimplifiedChinese))
+			m.width = size.width
+			m.height = size.height
+			m.config.Rules[0].Name = "东京主节点"
+			m.config.Rules[1].Name = "上海备用节点"
+			m.rules.Items[0].Name = "东京主节点"
+			m.botConfig = &BotConfigResponse{BotToken: "123:token", BotChat: 42, Running: true}
+
+			views := []viewMode{viewDashboard, viewRules, viewDetail, viewBotConfig}
+			var combined strings.Builder
+			for _, view := range views {
+				m.view = view
+				output := m.View()
+				assertRenderBounds(t, output, size.width, size.height)
+				combined.WriteString(ansi.Strip(output))
+				combined.WriteByte('\n')
+			}
+
+			m.overlay = overlayHelp
+			help := m.View()
+			assertRenderBounds(t, help, size.width, size.height)
+			combined.WriteString(ansi.Strip(help))
+			text := combined.String()
+			if strings.Contains(text, "tui.") || strings.Contains(text, "common.") || strings.Contains(text, "severity.") {
+				t.Fatalf("Chinese TUI leaked a translation key:\n%s", text)
+			}
+			if !strings.Contains(text, "规则") || !strings.Contains(text, "状态") {
+				t.Fatalf("Chinese TUI did not render localized labels:\n%s", text)
+			}
+			if size.width >= 80 && !strings.Contains(text, "◆ 流量") {
+				t.Fatalf("Chinese panel title lost its semantic icon:\n%s", text)
+			}
+		})
 	}
 }
 
@@ -101,10 +155,28 @@ func TestFooterShowsAvailableActionsAndNavigation(t *testing.T) {
 	m := managedTestModel()
 	m.view = viewRules
 	footer := ansi.Strip(m.renderFooter())
-	for _, hint := range []string{"[s]ort", "[P]recheck", "[tab]dashboard", "[q]uit"} {
+	for _, hint := range []string{"[n]ew", "[enter]detail", "[s]ort", "[1]dashboard", "[l]anguage", "[q]uit"} {
 		if !strings.Contains(footer, hint) {
 			t.Fatalf("rules footer omitted %q:\n%s", hint, footer)
 		}
+	}
+	for _, unavailable := range []string{"[P]recheck", "[A]pply", "[u]discard"} {
+		if strings.Contains(footer, unavailable) {
+			t.Fatalf("clean rules footer advertised unavailable action %q:\n%s", unavailable, footer)
+		}
+	}
+
+	m.selectedRuleID = "running"
+	m.stageToggle()
+	footer = ansi.Strip(m.renderFooter())
+	if !strings.Contains(footer, "[enter]precheck") || !strings.Contains(footer, "[u]discard") || strings.Contains(footer, "[enter]detail") {
+		t.Fatalf("draft footer did not prioritize the next valid action:\n%s", footer)
+	}
+	m.sync = syncValidated
+	m.precheckResult = &PrecheckResponse{Precheck: precheck.Result{OK: true}}
+	footer = ansi.Strip(m.renderFooter())
+	if !strings.Contains(footer, "[enter]apply") || strings.Contains(footer, "[enter]precheck") {
+		t.Fatalf("validated footer did not advance its primary action:\n%s", footer)
 	}
 
 	m.view = viewBotConfig
@@ -112,6 +184,89 @@ func TestFooterShowsAvailableActionsAndNavigation(t *testing.T) {
 	footer = ansi.Strip(m.renderFooter())
 	if !strings.Contains(footer, "[x]stop") || strings.Contains(footer, "[s]start") {
 		t.Fatalf("bot footer advertised the wrong lifecycle action:\n%s", footer)
+	}
+}
+
+func TestLanguageSelectorFitsRepresentativeTerminals(t *testing.T) {
+	for _, locale := range []string{i18n.English, i18n.SimplifiedChinese} {
+		for _, size := range []struct {
+			width  int
+			height int
+		}{{40, 12}, {80, 24}} {
+			t.Run(fmt.Sprintf("%s_%dx%d", locale, size.width, size.height), func(t *testing.T) {
+				m := managedTestModelWithTranslator(i18n.New(locale))
+				m.width = size.width
+				m.height = size.height
+				m.overlay = overlayLanguage
+				output := m.View()
+				assertRenderBounds(t, output, size.width, size.height)
+				plain := ansi.Strip(output)
+				for _, expected := range []string{"Language / 语言", "English (en)", "zh-CN", "[Esc]", "╰"} {
+					if !strings.Contains(plain, expected) {
+						t.Fatalf("language selector was cropped or incomplete; missing %q:\n%s", expected, plain)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestChinesePrecheckUsesActionableLocalizedMessage(t *testing.T) {
+	m := managedTestModelWithTranslator(i18n.New(i18n.SimplifiedChinese))
+	m.view = viewPrecheck
+	m.selectedRuleID = "running"
+	m.stageToggle()
+	m.precheckResult = &PrecheckResponse{Precheck: precheck.Result{
+		OK: false, ErrorCount: 1, CheckedRules: 2,
+		Items: []precheck.Item{{
+			Severity: precheck.SeverityError,
+			Check:    "listen_bind",
+			RuleID:   "running",
+			Message:  "cannot bind tcp 0.0.0.0:2201: address already in use",
+		}},
+	}}
+
+	output := ansi.Strip(m.renderPrecheck())
+	if !strings.Contains(output, "监听端口") || !strings.Contains(output, "端口可能已被占用") || strings.Contains(output, "cannot bind") {
+		t.Fatalf("Chinese precheck did not present an actionable localized finding:\n%s", output)
+	}
+	updated, _ := m.handlePrecheckKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	m = updated.(Model)
+	if m.view != viewEditor || m.editor == nil || m.editor.fields[m.editor.focus].key != fieldListenPort {
+		t.Fatalf("precheck edit did not focus the listen port field: view=%v editor=%+v", m.view, m.editor)
+	}
+}
+
+func TestFilterIncludesEndpointsAndRemarks(t *testing.T) {
+	m := managedTestModel()
+	m.config.Rules[0].TargetAddr = "edge.internal"
+	m.config.Rules[1].Remark = "backup route"
+
+	m.filterInput.SetValue("edge.internal")
+	if rules := m.filteredRules(); len(rules) != 1 || rules[0].RuleID != "running" {
+		t.Fatalf("target search result = %+v", rules)
+	}
+	m.filterInput.SetValue("backup route")
+	if rules := m.filteredRules(); len(rules) != 1 || rules[0].RuleID != "disabled" {
+		t.Fatalf("remark search result = %+v", rules)
+	}
+}
+
+func TestIdleHeaderDoesNotRenderBusySpinner(t *testing.T) {
+	m := managedTestModel()
+	m.stats = &StatsResponse{}
+	m.lastStatsAt = time.Time{}
+	if activity := ansi.Strip(m.renderHeaderActivity()); activity != "" {
+		t.Fatalf("idle header activity = %q, want empty", activity)
+	}
+	header := ansi.Strip(m.renderHeader())
+	for _, tab := range []string{"[1 DASHBOARD]", "[2 RULES]", "[3 BOT]"} {
+		if !strings.Contains(header, tab) {
+			t.Fatalf("header omitted navigation tab %q: %s", tab, header)
+		}
+	}
+	if strings.Contains(header, "[4 NET]") {
+		t.Fatalf("header retained standalone network tab: %s", header)
 	}
 }
 
@@ -148,7 +303,7 @@ func TestCompactDashboardAndRulesKeepCompletePanels(t *testing.T) {
 	m.height = 20
 	m.view = viewDashboard
 	output = ansi.Strip(m.View())
-	if strings.Count(output, "╰") != 2 || !strings.Contains(output, "disabled") {
+	if strings.Count(output, "╰") != 2 || !strings.Contains(output, "Forwarding Traffic") || !strings.Contains(output, "Host Network") {
 		t.Fatalf("60x20 dashboard panels were cropped or wrapped:\n%s", output)
 	}
 	assertRenderBounds(t, m.View(), m.width, m.height)
@@ -205,6 +360,82 @@ func TestDetailShowsSourceIPPolicyAndDenials(t *testing.T) {
 	for _, want := range []string{"IP Access", "denylist", "192.0.2.0/24", "IP Denied", "7"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("detail omitted %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestDetailShowsSharedBandwidthAndQuotaStatus(t *testing.T) {
+	m := managedTestModel()
+	m.width = 100
+	m.height = 40
+	m.view = viewDetail
+	for index := range m.config.Rules {
+		if m.config.Rules[index].RuleID != m.selectedRuleID {
+			continue
+		}
+		m.config.Rules[index].Bandwidth = &engine.BandwidthLimit{
+			Upload:   engine.ByteRate(12_500_000),
+			Download: engine.ByteRate(25_000_000),
+		}
+		m.config.Rules[index].TrafficQuota = &engine.TrafficQuota{
+			Daily: engine.ByteSize(100_000_000_000), Monthly: engine.ByteSize(1_000_000_000_000),
+			Timezone: "Asia/Shanghai", Action: "block",
+		}
+	}
+	m.stats = &StatsResponse{Items: []TrafficSnapshot{{
+		RuleID: m.selectedRuleID, QuotaRejectedBytes: 1024,
+		Quota: &engine.TrafficQuotaSnapshot{
+			Blocked: true,
+			Daily: &engine.QuotaPeriodSnapshot{
+				Period: "2026-08-02", UsedBytes: 100_000_000_000, LimitBytes: 100_000_000_000,
+				RemainingBytes: 0, ResetTime: time.Date(2026, 8, 3, 0, 0, 0, 0, time.FixedZone("CST", 8*60*60)).Unix(), Exhausted: true,
+			},
+			Monthly: &engine.QuotaPeriodSnapshot{
+				Period: "2026-08", UsedBytes: 100_000_000_000, LimitBytes: 1_000_000_000_000,
+				RemainingBytes: 900_000_000_000, ResetTime: time.Date(2026, 9, 1, 0, 0, 0, 0, time.FixedZone("CST", 8*60*60)).Unix(),
+			},
+		},
+	}}}
+	output := ansi.Strip(m.renderDetail())
+	for _, want := range []string{
+		"Rule Upload", "100 Mbps", "Rule Download", "200 Mbps",
+		"Quota Status", "blocked", "Daily Quota", "100 GB", "exhausted",
+		"Monthly Quota", "1 TB", "Quota Reject", "1.0K",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("detail omitted %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestDetailShowsUnknownWhenQuotaSnapshotIsMissing(t *testing.T) {
+	m := managedTestModel()
+	m.width = 100
+	m.height = 40
+	m.view = viewDetail
+	for index := range m.config.Rules {
+		if m.config.Rules[index].RuleID == m.selectedRuleID {
+			m.config.Rules[index].TrafficQuota = &engine.TrafficQuota{
+				Daily: 100_000_000_000, Monthly: 1_000_000_000_000,
+				Timezone: "Asia/Shanghai", Action: "block",
+			}
+		}
+	}
+	m.stats = &StatsResponse{Items: []TrafficSnapshot{{RuleID: m.selectedRuleID}}}
+	output := ansi.Strip(m.renderDetail())
+	for _, label := range []string{"Quota Status", "Daily Quota", "Monthly Quota"} {
+		found := false
+		for _, line := range strings.Split(output, "\n") {
+			if !strings.Contains(line, label) {
+				continue
+			}
+			found = true
+			if !strings.Contains(line, "unknown") || strings.Contains(line, "active") {
+				t.Fatalf("%s line did not report unknown state: %q\n%s", label, line, output)
+			}
+		}
+		if !found {
+			t.Fatalf("detail omitted %q:\n%s", label, output)
 		}
 	}
 }
@@ -290,6 +521,52 @@ func TestCompactApplyResultKeepsResultsVisible(t *testing.T) {
 	assertRenderBounds(t, m.View(), m.width, m.height)
 }
 
+func TestChineseApplyResultLocalizesRuntimeOutcome(t *testing.T) {
+	m := managedTestModelWithTranslator(i18n.New(i18n.SimplifiedChinese))
+	m.width = 80
+	m.height = 24
+	m.view = viewApplyResult
+	m.applyResult = &ApplyResponse{
+		Revision: "sha256:55c0b53c89e7ad03c0a6076557008e421b1bf17182e4e7d0cb76546d7f40c536",
+		Result: engine.ApplyResult{
+			TotalRules: 1,
+			Items: []engine.ApplyItemResult{{
+				RuleID: "qa-disabled",
+				Action: engine.ApplyActionUnchanged,
+				Status: "ok",
+			}},
+		},
+	}
+	output := ansi.Strip(m.View())
+	for _, want := range []string{"运行变更", "运行未变", "成功"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("Chinese apply result omitted %q:\n%s", want, output)
+		}
+	}
+	for _, leaked := range []string{"unchanged", " ok"} {
+		if strings.Contains(output, leaked) {
+			t.Fatalf("Chinese apply result leaked %q:\n%s", leaked, output)
+		}
+	}
+	assertRenderBounds(t, m.View(), m.width, m.height)
+}
+
+func TestCompactChineseApplyStatusFitsWithoutTruncation(t *testing.T) {
+	m := managedTestModelWithTranslator(i18n.New(i18n.SimplifiedChinese))
+	m.width = 40
+	m.height = 12
+	m.view = viewApplyResult
+	m.applyResult = &ApplyResponse{Result: engine.ApplyResult{TotalRules: 1}}
+	m.setStatus(m.tf("tui.status.apply_complete", 1, 0))
+
+	output := ansi.Strip(m.View())
+	want := "配置已保存：1 项配置更改，0 条运行变更"
+	if !strings.Contains(output, want) {
+		t.Fatalf("compact apply status was truncated, want %q:\n%s", want, output)
+	}
+	assertRenderBounds(t, m.View(), m.width, m.height)
+}
+
 func TestNarrowStatusShowsActionFeedback(t *testing.T) {
 	m := managedTestModel()
 	m.width = 40
@@ -303,7 +580,7 @@ func TestNarrowStatusShowsActionFeedback(t *testing.T) {
 	assertRenderBounds(t, m.View(), m.width, m.height)
 }
 
-func TestDashboardFallsBackBeforeTopRulesAreCropped(t *testing.T) {
+func TestCrowdedDashboardKeepsAllSectionsScrollable(t *testing.T) {
 	m := managedTestModel()
 	m.width = 60
 	m.height = 20
@@ -311,11 +588,23 @@ func TestDashboardFallsBackBeforeTopRulesAreCropped(t *testing.T) {
 		m.config.Rules = append(m.config.Rules, testRule(id, true, 2300+len(m.config.Rules)))
 	}
 	m.view = viewDashboard
-	output := ansi.Strip(m.View())
-	if !strings.Contains(output, "Overview") || !strings.Contains(output, "configured") {
-		t.Fatalf("crowded dashboard did not switch to a complete summary:\n%s", output)
+	full := ansi.Strip(m.renderDashboard())
+	for _, expected := range []string{"Forwarding Traffic", "Host Network", "Rules", "running"} {
+		if !strings.Contains(full, expected) {
+			t.Fatalf("crowded dashboard omitted %q:\n%s", expected, full)
+		}
 	}
-	assertRenderBounds(t, m.View(), m.width, m.height)
+	if m.contentMaxYOffset() == 0 {
+		t.Fatalf("crowded dashboard unexpectedly fits without scrolling:\n%s", full)
+	}
+	top := m.View()
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnd})
+	m = updated.(Model)
+	bottom := m.View()
+	if top == bottom {
+		t.Fatal("crowded dashboard did not scroll")
+	}
+	assertRenderBounds(t, bottom, m.width, m.height)
 }
 
 func TestCompactApplyConfirmKeepsConfirmationVisible(t *testing.T) {

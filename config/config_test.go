@@ -18,6 +18,9 @@ func TestBundledConfigStartsWithoutForwarding(t *testing.T) {
 	if len(cfg.Rules) == 0 {
 		t.Fatal("bundled config should retain a discoverable example rule")
 	}
+	if cfg.Language != "en" || cfg.InvalidLanguage != "" {
+		t.Fatalf("bundled language = %q, invalid = %q", cfg.Language, cfg.InvalidLanguage)
+	}
 	for _, rule := range cfg.Rules {
 		if rule.Enabled {
 			t.Fatalf("bundled rule %q is enabled", rule.RuleID)
@@ -25,6 +28,32 @@ func TestBundledConfigStartsWithoutForwarding(t *testing.T) {
 		if rule.ListenAddr != "127.0.0.1" {
 			t.Fatalf("bundled rule %q listens on %q, want loopback", rule.RuleID, rule.ListenAddr)
 		}
+	}
+}
+
+func TestParseLanguageDefaultsNormalizesAndFallsBack(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         string
+		want        string
+		wantInvalid string
+	}{
+		{name: "missing defaults English", raw: "version: 1\nrules: []\n", want: "en"},
+		{name: "English", raw: "version: 1\nlanguage: en\nrules: []\n", want: "en"},
+		{name: "Chinese alias", raw: "version: 1\nlanguage: zh\nrules: []\n", want: "zh-CN"},
+		{name: "Chinese locale", raw: "version: 1\nlanguage: zh_CN.UTF-8\nrules: []\n", want: "zh-CN"},
+		{name: "unsupported falls back", raw: "version: 1\nlanguage: de\nrules: []\n", want: "en", wantInvalid: "de"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(test.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Language != test.want || cfg.InvalidLanguage != test.wantInvalid {
+				t.Fatalf("language = %q, invalid = %q; want %q, %q", cfg.Language, cfg.InvalidLanguage, test.want, test.wantInvalid)
+			}
+		})
 	}
 }
 

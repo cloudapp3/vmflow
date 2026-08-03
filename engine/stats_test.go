@@ -56,6 +56,25 @@ func TestRuleProtocolMetadataPersistsUntilRemoval(t *testing.T) {
 	}
 }
 
+func TestBandwidthPolicyMetadataIsIsolatedAndRemoved(t *testing.T) {
+	collector := NewCollector()
+	limit := &BandwidthLimit{Upload: 10, Download: 20}
+	collector.SetBandwidthPolicy("rule", limit)
+	limit.Upload = 99
+	policies := collector.BandwidthPolicies()
+	if got := policies["rule"]; got.Upload != 10 || got.Download != 20 {
+		t.Fatalf("bandwidth policy = %+v", got)
+	}
+	policies["rule"] = BandwidthLimit{Rate: 1}
+	if got := collector.BandwidthPolicies()["rule"]; got.Upload != 10 {
+		t.Fatalf("returned policy map modified collector: %+v", got)
+	}
+	collector.RemoveRule("rule")
+	if _, found := collector.BandwidthPolicies()["rule"]; found {
+		t.Fatal("removed rule bandwidth policy was retained")
+	}
+}
+
 func TestNilCollectorStatsAreNoop(t *testing.T) {
 	var collector *Collector
 	collector.AddUpload("rule", 1)

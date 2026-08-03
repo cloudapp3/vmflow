@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 )
 
 type localRuleDiff struct {
@@ -36,7 +37,7 @@ func (m *Model) acceptConfig(response *ConfigRulesResponse) {
 		if next.Revision != m.draft.BaseRevision {
 			m.remoteRevision = next.Revision
 			m.sync = syncStale
-			m.setStatus("server configuration changed; local draft retained")
+			m.setStatus(m.t("tui.status.server_changed_draft_retained"))
 			return
 		}
 		m.config = &next
@@ -44,7 +45,7 @@ func (m *Model) acceptConfig(response *ConfigRulesResponse) {
 			m.remoteRevision = ""
 			m.precheckResult = nil
 			m.sync = syncDirty
-			m.setStatus("configuration reconciled; precheck the retained draft again")
+			m.setStatus(m.t("tui.status.config_reconciled"))
 		}
 		return
 	}
@@ -110,20 +111,20 @@ func (m Model) writeDeniedReason() string {
 	switch {
 	case m.session == nil:
 		if m.sessionErr != nil {
-			return "management unavailable: " + m.sessionErr.Error()
+			return m.tf("tui.write_denied.management_error", m.friendlyError(m.sessionErr))
 		}
-		return "management unavailable: session not loaded"
+		return m.t("tui.write_denied.session_not_loaded")
 	case !m.session.Capabilities.RulesWrite:
 		if strings.EqualFold(strings.TrimSpace(m.session.Role), "admin") {
-			return "rule writes require configured authenticated admin access"
+			return m.t("tui.write_denied.auth_admin_required")
 		}
-		return "read-only session: admin role required"
+		return m.t("tui.write_denied.admin_required")
 	case m.config == nil:
-		return "management unavailable: configuration not loaded"
+		return m.t("tui.write_denied.config_not_loaded")
 	case !m.config.Writable:
-		return "configuration file is read-only"
+		return m.t("tui.write_denied.config_read_only")
 	default:
-		return "management unavailable"
+		return m.t("tui.write_denied.unavailable")
 	}
 }
 
@@ -172,8 +173,14 @@ func (m Model) handleManagementKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.beginTransientDraft()
-		defaults := RuleInfo{Protocol: engine.ProtocolTCP, ListenAddr: "0.0.0.0", Enabled: true}
-		m.editor = newRuleEditor(editorCreate, defaults, m.editableRules())
+		defaults := RuleInfo{
+			RuleID:     newRuleID(m.editableRules()),
+			Protocol:   engine.ProtocolTCP,
+			ListenAddr: "0.0.0.0",
+			Enabled:    true,
+		}
+		m.editor = newRuleEditorWithTranslator(editorCreate, defaults, m.editableRules(), m.tr)
+		m.editor.autoRuleID = defaults.RuleID
 		m.view = viewEditor
 	case "e":
 		if !m.prepareWrite() {
@@ -181,15 +188,15 @@ func (m Model) handleManagementKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		rule := m.selectedRule()
 		if rule == nil {
-			m.setStatus("select a rule first")
+			m.setStatus(m.t("tui.status.select_rule"))
 			return m, nil
 		}
 		if m.isDeleted(rule.RuleID) {
-			m.setStatus("rule is staged for deletion")
+			m.setStatus(m.t("tui.status.rule_staged_deletion"))
 			return m, nil
 		}
 		m.beginTransientDraft()
-		m.editor = newRuleEditor(editorEdit, *rule, m.editableRules())
+		m.editor = newRuleEditorWithTranslator(editorEdit, *rule, m.editableRules(), m.tr)
 		m.view = viewEditor
 	case "c":
 		if !m.prepareWrite() {
@@ -197,16 +204,16 @@ func (m Model) handleManagementKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		rule := m.selectedRule()
 		if rule == nil {
-			m.setStatus("select a rule first")
+			m.setStatus(m.t("tui.status.select_rule"))
 			return m, nil
 		}
 		if m.isDeleted(rule.RuleID) {
-			m.setStatus("rule is staged for deletion")
+			m.setStatus(m.t("tui.status.rule_staged_deletion"))
 			return m, nil
 		}
 		m.beginTransientDraft()
 		copy := copyRule(*rule, m.editableRules())
-		m.editor = newRuleEditor(editorCopy, copy, m.editableRules())
+		m.editor = newRuleEditorWithTranslator(editorCopy, copy, m.editableRules(), m.tr)
 		m.view = viewEditor
 	case " ":
 		if !m.prepareWrite() {
@@ -219,9 +226,9 @@ func (m Model) handleManagementKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		rule := m.selectedRule()
 		if rule == nil {
-			m.setStatus("select a rule first")
+			m.setStatus(m.t("tui.status.select_rule"))
 		} else if m.isDeleted(rule.RuleID) {
-			m.setStatus("rule is already staged for deletion")
+			m.setStatus(m.t("tui.status.rule_already_staged_deletion"))
 		} else {
 			m.overlay = overlayDelete
 		}
@@ -229,21 +236,21 @@ func (m Model) handleManagementKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.startPrecheck()
 	case "A":
 		if m.operation != operationIdle {
-			m.setStatus("wait for the current operation to finish")
+			m.setStatus(m.t("tui.status.wait_operation"))
 		} else if m.configBarrierID != 0 {
-			m.setStatus("wait for the shared configuration refresh to finish")
+			m.setStatus(m.t("tui.status.wait_config_refresh"))
 		} else if m.sync == syncStale {
-			m.setStatus("server configuration changed; discard or refresh before applying")
+			m.setStatus(m.t("tui.status.server_changed_before_apply"))
 		} else if m.sync != syncValidated || m.precheckResult == nil || !m.precheckResult.Precheck.OK {
-			m.setStatus("precheck the current draft first (P)")
+			m.setStatus(m.t("tui.status.precheck_first"))
 		} else {
 			m.overlay = overlayApply
 		}
 	case "u":
 		if m.operation != operationIdle {
-			m.setStatus("wait for the current operation to finish")
+			m.setStatus(m.t("tui.status.wait_operation"))
 		} else if m.draft == nil {
-			m.setStatus("no local draft")
+			m.setStatus(m.t("tui.status.no_draft"))
 		} else {
 			m.overlay = overlayDiscardDraft
 		}
@@ -265,17 +272,17 @@ func (m Model) handlePendingOperationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bo
 		return m, nil, false
 	}
 	switch msg.String() {
-	case "q", "ctrl+c", "esc", "tab", "enter", "y", "n", "e", "c", " ", "d", "P", "A", "u", "g", "R", "b", "s", "x", "ctrl+s", "?", "f1":
-		operation := "operation"
+	case "q", "ctrl+c", "esc", "tab", "enter", "y", "n", "e", "c", " ", "d", "P", "A", "u", "g", "R", "b", "s", "x", "1", "2", "3", "ctrl+s", "?", "f1":
+		operation := m.t("tui.operation.operation")
 		switch m.operation {
 		case operationPrechecking:
-			operation = "precheck"
+			operation = m.t("tui.operation.precheck")
 		case operationApplying:
-			operation = "apply"
+			operation = m.t("tui.operation.apply")
 		case operationReloading:
-			operation = "reload"
+			operation = m.t("tui.operation.reload")
 		}
-		m.setStatus(operation + " in progress; wait for the result before leaving or changing configuration")
+		m.setStatus(m.tf("tui.status.operation_in_progress", operation))
 		return m, nil, true
 	default:
 		return m, nil, false
@@ -284,7 +291,7 @@ func (m Model) handlePendingOperationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd, bo
 
 func (m Model) openBotConfig() (tea.Model, tea.Cmd) {
 	if m.operation != operationIdle {
-		m.setStatus("wait for the current operation to finish")
+		m.setStatus(m.t("tui.status.wait_operation"))
 		return m, nil
 	}
 	if !m.canWrite() {
@@ -292,7 +299,7 @@ func (m Model) openBotConfig() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.botOperation != botOperationIdle {
-		m.setStatus("wait for the current bot operation to finish")
+		m.setStatus(m.t("tui.status.wait_bot_operation"))
 		return m, nil
 	}
 	m.view = viewBotConfig
@@ -311,62 +318,64 @@ func (m Model) handleBotConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?", "f1":
 		m.overlayYOffset = 0
 		m.overlay = overlayHelp
+	case "l":
+		m.openLanguageSelector()
 	case "esc":
 		m.view = viewRules
 	case "r":
 		if m.botOperation != botOperationIdle {
-			m.setStatus("wait for the current bot operation to finish")
+			m.setStatus(m.t("tui.status.wait_bot_operation"))
 			return m, nil
 		}
 		requestID := m.beginBotOperation(botOperationFetching)
 		return m, fetchBotConfigCmd(m.ctx, m.client, requestID)
 	case "e":
 		if m.botOperation != botOperationIdle {
-			m.setStatus("wait for the current bot operation to finish")
+			m.setStatus(m.t("tui.status.wait_bot_operation"))
 			return m, nil
 		}
 		if m.botConfigErr != nil {
-			m.setStatus("refresh bot state before editing configuration")
+			m.setStatus(m.t("tui.status.refresh_bot_before_edit"))
 			return m, nil
 		}
 		if m.draft != nil {
-			m.setStatus("apply or discard the rules draft before editing bot config")
+			m.setStatus(m.t("tui.status.resolve_rules_draft_before_bot"))
 			return m, nil
 		}
 		if m.botConfig == nil {
-			m.setStatus("bot config not loaded yet")
+			m.setStatus(m.t("tui.status.bot_not_loaded"))
 			return m, nil
 		}
-		m.botEditor = newBotConfigEditor(m.botConfig)
+		m.botEditor = newBotConfigEditorWithTranslator(m.botConfig, m.tr)
 		m.view = viewBotEditor
 	case "s":
 		if m.botOperation != botOperationIdle {
-			m.setStatus("wait for the current bot operation to finish")
+			m.setStatus(m.t("tui.status.wait_bot_operation"))
 			return m, nil
 		}
 		if m.botConfigErr != nil {
-			m.setStatus("refresh bot state before starting the bot")
+			m.setStatus(m.t("tui.status.refresh_bot_before_start"))
 			return m, nil
 		}
 		if m.botConfig != nil && m.botConfig.Running {
-			m.setStatus("bot is already running")
+			m.setStatus(m.t("tui.status.bot_already_running"))
 			return m, nil
 		}
 		if !botReadyToStart(m.botConfig) {
-			m.setStatus("configure a bot token and chat ID before starting")
+			m.setStatus(m.t("tui.status.configure_bot_before_start"))
 			return m, nil
 		}
 		requestID := m.beginBotOperation(botOperationStarting)
 		return m, startBotCmd(m.ctx, m.client, requestID)
 	case "x":
 		if m.botOperation != botOperationIdle {
-			m.setStatus("wait for the current bot operation to finish")
+			m.setStatus(m.t("tui.status.wait_bot_operation"))
 		} else if m.botConfigErr != nil {
-			m.setStatus("refresh bot state before stopping the bot")
+			m.setStatus(m.t("tui.status.refresh_bot_before_stop"))
 		} else if m.botConfig != nil && m.botConfig.Running {
 			m.overlay = overlayBotStop
 		} else {
-			m.setStatus("bot is not running")
+			m.setStatus(m.t("tui.status.bot_not_running"))
 		}
 	}
 	return m, nil
@@ -384,17 +393,17 @@ func (m Model) handleBotEditorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+r":
 		if m.botOperation != botOperationIdle {
-			m.setStatus("wait for the current bot operation to finish")
+			m.setStatus(m.t("tui.status.wait_bot_operation"))
 			return m, nil
 		}
 		m.botRebasePending = true
-		m.botEditor.formError = "Loading the latest remote configuration..."
-		m.setStatus("refreshing bot config for rebase")
+		m.botEditor.formError = m.t("tui.status.loading_latest_config")
+		m.setStatus(m.t("tui.status.refreshing_bot_rebase"))
 		requestID := m.beginBotOperation(botOperationFetching)
 		return m, fetchBotConfigCmd(m.ctx, m.client, requestID)
 	case "esc", "ctrl+c", "ctrl+s":
 		if m.botOperation != botOperationIdle {
-			m.setStatus("wait for the current bot operation to finish")
+			m.setStatus(m.t("tui.status.wait_bot_operation"))
 			return m, nil
 		}
 		if msg.String() == "esc" || msg.String() == "ctrl+c" {
@@ -408,8 +417,8 @@ func (m Model) handleBotEditorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.botRebasePending || m.botConfigErr != nil {
-			m.botEditor.formError = "Load the latest remote configuration with Ctrl+R before saving."
-			m.setStatus("rebase the latest bot config before saving")
+			m.botEditor.formError = m.t("tui.status.load_latest_before_save")
+			m.setStatus(m.t("tui.status.rebase_before_save"))
 			return m, nil
 		}
 		req, err := m.botEditor.request()
@@ -418,17 +427,17 @@ func (m Model) handleBotEditorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		etag := m.botEditor.etag
-		m.setStatus("applying bot config...")
+		m.setStatus(m.t("tui.status.applying_bot_config"))
 		requestID := m.beginBotOperation(botOperationSaving)
 		return m, applyBotConfigCmd(m.ctx, m.client, requestID, etag, req)
 	default:
 		if m.botOperation != botOperationIdle {
-			m.setStatus("wait for the current bot operation to finish")
+			m.setStatus(m.t("tui.status.wait_bot_operation"))
 			return m, nil
 		}
 		cmd := m.botEditor.update(msg)
 		if m.botRebasePending {
-			m.botEditor.formError = "Latest remote configuration is required; press Ctrl+R to retry."
+			m.botEditor.formError = m.t("tui.status.latest_required_retry")
 		}
 		return m, cmd
 	}
@@ -507,6 +516,28 @@ func botConfigUnavailableState(err error) (message string, refresh, committed bo
 	return "bot config failed; current state is uncertain; refreshing", true, false
 }
 
+func (m Model) botConfigUnavailableState(err error) (message string, refresh, committed bool) {
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		return m.t("tui.status.bot_config_uncertain"), true, false
+	}
+	var payload struct {
+		Committed  bool  `json:"committed"`
+		RollbackOK *bool `json:"rollback_ok"`
+	}
+	_ = json.Unmarshal(apiErr.Body, &payload)
+	if payload.Committed {
+		return m.t("tui.status.bot_config_committed_uncertain"), true, true
+	}
+	if payload.RollbackOK != nil && !*payload.RollbackOK {
+		return m.t("tui.status.bot_config_rollback_uncertain"), true, false
+	}
+	if strings.Contains(strings.ToLower(apiErr.Message), "readiness") {
+		return m.t("tui.status.bot_readiness_previous_unchanged"), false, false
+	}
+	return m.t("tui.status.bot_config_uncertain"), true, false
+}
+
 func rulesApplyUnavailableState(err error) (message string, reconcile, committed, handled bool) {
 	apiErr, ok := err.(*APIError)
 	if !ok {
@@ -532,6 +563,31 @@ func rulesApplyUnavailableState(err error) (message string, reconcile, committed
 	return "", false, false, false
 }
 
+func (m Model) rulesApplyUnavailableState(err error) (message string, reconcile, committed, handled bool) {
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		return m.t("tui.status.apply_uncertain"), true, false, true
+	}
+	var payload struct {
+		Committed  bool  `json:"committed"`
+		RollbackOK *bool `json:"rollback_ok"`
+	}
+	_ = json.Unmarshal(apiErr.Body, &payload)
+	if payload.Committed {
+		return m.t("tui.status.apply_committed_uncertain"), true, true, true
+	}
+	if payload.RollbackOK != nil {
+		if *payload.RollbackOK {
+			return m.t("tui.status.apply_rolled_back"), false, false, true
+		}
+		return m.t("tui.status.apply_rollback_uncertain"), true, false, true
+	}
+	if apiErr.StatusCode == http.StatusServiceUnavailable {
+		return m.t("tui.status.apply_state_uncertain"), true, false, true
+	}
+	return "", false, false, false
+}
+
 func (m *Model) beginTransientDraft() {
 	if m.draft != nil {
 		m.transientDraft = false
@@ -544,15 +600,15 @@ func (m *Model) beginTransientDraft() {
 
 func (m *Model) prepareWrite() bool {
 	if m.operation != operationIdle {
-		m.setStatus("wait for the current operation to finish")
+		m.setStatus(m.t("tui.status.wait_operation"))
 		return false
 	}
 	if m.configBarrierID != 0 {
-		m.setStatus("wait for the shared configuration refresh to finish")
+		m.setStatus(m.t("tui.status.wait_config_refresh"))
 		return false
 	}
 	if m.sync == syncStale {
-		m.setStatus("local draft is stale; discard it before editing")
+		m.setStatus(m.t("tui.status.stale_draft_before_edit"))
 		return false
 	}
 	if !m.canWrite() {
@@ -590,6 +646,9 @@ func (m Model) handleEditorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.overlayYOffset = 0
 		m.overlay = overlayHelp
 		return m, nil
+	case "f2":
+		m.editor.toggleAdvanced()
+		return m, nil
 	case "ctrl+c":
 		if m.editor.dirty() {
 			m.overlay = overlayCancelEditor
@@ -609,7 +668,7 @@ func (m Model) handleEditorKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+s":
 		rule, ok := m.editor.rule()
 		if !ok {
-			m.setStatus("fix the highlighted fields before saving")
+			m.setStatus(m.t("tui.status.fix_fields"))
 			return m, nil
 		}
 		m.stageEditorRule(rule)
@@ -640,28 +699,28 @@ func (m *Model) stageEditorRule(rule RuleInfo) {
 	m.editor = nil
 	m.view = viewRules
 	m.refreshDraftState()
-	m.setStatus("rule saved to local draft")
+	m.setStatus(m.t("tui.status.rule_saved_draft"))
 }
 
 func (m *Model) stageToggle() {
 	rule := m.selectedRule()
 	if rule == nil {
-		m.setStatus("select a rule first")
+		m.setStatus(m.t("tui.status.select_rule"))
 		return
 	}
 	if m.isDeleted(rule.RuleID) || !m.ensureDraft() {
-		m.setStatus("rule is staged for deletion")
+		m.setStatus(m.t("tui.status.rule_staged_deletion"))
 		return
 	}
 	for index := range m.draft.Rules {
 		if m.draft.Rules[index].RuleID == rule.RuleID {
 			m.draft.Rules[index].Enabled = !m.draft.Rules[index].Enabled
-			state := "disabled"
+			state := m.t("tui.state.disabled")
 			if m.draft.Rules[index].Enabled {
-				state = "enabled"
+				state = m.t("tui.state.enabled")
 			}
 			m.refreshDraftState()
-			m.setStatus("rule staged as " + state)
+			m.setStatus(m.tf("tui.status.rule_staged_as", state))
 			return
 		}
 	}
@@ -684,7 +743,7 @@ func (m *Model) stageDelete() {
 		m.draft.Deleted[rule.RuleID] = *rule
 	}
 	m.refreshDraftState()
-	m.setStatus("rule staged for deletion")
+	m.setStatus(m.t("tui.status.rule_staged_deletion"))
 }
 
 func (m Model) baselineRule(ruleID string) *RuleInfo {
@@ -716,7 +775,7 @@ func (m *Model) openUDPSettings() {
 func (m *Model) stageUDPSettings() bool {
 	value, err := strconv.Atoi(strings.TrimSpace(m.udpInput.Value()))
 	if err != nil || value < 0 || value > engine.MaxUDPGlobalMaxSessions {
-		m.udpInputError = fmt.Sprintf("enter 0-%d (0 uses the server default)", engine.MaxUDPGlobalMaxSessions)
+		m.udpInputError = m.tf("tui.validation.udp_sessions", engine.MaxUDPGlobalMaxSessions)
 		return false
 	}
 	if !m.ensureDraft() {
@@ -727,7 +786,7 @@ func (m *Model) stageUDPSettings() bool {
 	m.udpInput.Blur()
 	m.overlay = overlayNone
 	m.refreshDraftState()
-	m.setStatus("UDP session limit saved to local draft")
+	m.setStatus(m.t("tui.status.udp_saved_draft"))
 	return true
 }
 
@@ -736,11 +795,11 @@ func (m Model) startPrecheck() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.draft == nil {
-		m.setStatus("no local changes to precheck")
+		m.setStatus(m.t("tui.status.no_changes_precheck"))
 		return m, nil
 	}
 	m.operation = operationPrechecking
-	m.setStatus("prechecking local draft...")
+	m.setStatus(m.t("tui.status.prechecking_draft"))
 	return m, precheckCmd(m.ctx, m.client, m.draft.BaseETag, m.draft.request())
 }
 
@@ -749,9 +808,9 @@ func (m Model) handlePrecheckResult(msg precheckMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		if apiStatus(msg.err) == http.StatusPreconditionFailed {
 			m.sync = syncStale
-			m.setStatus("precheck conflict: server configuration changed")
+			m.setStatus(m.t("tui.status.precheck_conflict"))
 		} else {
-			m.setStatus("precheck failed: " + msg.err.Error())
+			m.setStatus(m.tf("tui.status.precheck_failed", msg.err.Error()))
 		}
 		return m, nil
 	}
@@ -759,17 +818,17 @@ func (m Model) handlePrecheckResult(msg precheckMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.sync == syncStale || m.remoteRevision != "" {
-		m.setStatus("precheck result ignored: server configuration changed")
+		m.setStatus(m.t("tui.status.precheck_ignored"))
 		return m, nil
 	}
 	if msg.resp == nil {
-		m.setStatus("precheck returned an empty response")
+		m.setStatus(m.t("tui.status.precheck_empty"))
 		return m, nil
 	}
 	if msg.resp.Revision != "" && msg.resp.Revision != m.draft.BaseRevision {
 		m.remoteRevision = msg.resp.Revision
 		m.sync = syncStale
-		m.setStatus("precheck conflict: server configuration changed")
+		m.setStatus(m.t("tui.status.precheck_conflict"))
 		return m, nil
 	}
 	m.precheckResult = msg.resp
@@ -777,10 +836,10 @@ func (m Model) handlePrecheckResult(msg precheckMsg) (tea.Model, tea.Cmd) {
 	m.view = viewPrecheck
 	if msg.resp.Precheck.OK {
 		m.sync = syncValidated
-		m.setStatus(fmt.Sprintf("precheck passed with %d warning(s)", msg.resp.Precheck.WarningCount))
+		m.setStatus(m.tf("tui.status.precheck_passed", msg.resp.Precheck.WarningCount))
 	} else {
 		m.sync = syncDirty
-		m.setStatus(fmt.Sprintf("precheck found %d error(s)", msg.resp.Precheck.ErrorCount))
+		m.setStatus(m.tf("tui.status.precheck_errors", msg.resp.Precheck.ErrorCount))
 	}
 	return m, nil
 }
@@ -800,6 +859,8 @@ func (m Model) handlePrecheckKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?", "f1":
 		m.overlayYOffset = 0
 		m.overlay = overlayHelp
+	case "l":
+		m.openLanguageSelector()
 	case "esc":
 		m.view = viewRules
 	case "up", "k":
@@ -814,26 +875,17 @@ func (m Model) handlePrecheckKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.resultSelected = 0
 	case "end":
 		m.resultSelected = max(items-1, 0)
-	case "enter", "e":
-		if !m.prepareWrite() {
+	case "enter":
+		if m.precheckResult != nil && m.precheckResult.Precheck.OK && m.sync == syncValidated {
+			m.overlay = overlayApply
 			return m, nil
 		}
-		if m.precheckResult == nil || m.resultSelected >= items {
-			return m, nil
-		}
-		ruleID := m.precheckResult.Precheck.Items[m.resultSelected].RuleID
-		if ruleID == "" {
-			return m, nil
-		}
-		m.selectedRuleID = ruleID
-		rule := m.selectedRule()
-		if rule != nil && !m.isDeleted(rule.RuleID) {
-			m.editor = newRuleEditor(editorEdit, *rule, m.editableRules())
-			m.view = viewEditor
-		}
+		return m.openSelectedPrecheckFinding(items)
+	case "e":
+		return m.openSelectedPrecheckFinding(items)
 	case "A":
 		if m.operation != operationIdle {
-			m.setStatus("wait for the current operation to finish")
+			m.setStatus(m.t("tui.status.wait_operation"))
 		} else if m.sync == syncValidated && m.precheckResult != nil && m.precheckResult.Precheck.OK {
 			m.overlay = overlayApply
 		}
@@ -843,10 +895,52 @@ func (m Model) handlePrecheckKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) openSelectedPrecheckFinding(items int) (tea.Model, tea.Cmd) {
+	if !m.prepareWrite() {
+		return m, nil
+	}
+	if m.precheckResult == nil || m.resultSelected < 0 || m.resultSelected >= items {
+		m.setStatus(m.t("tui.status.select_finding"))
+		return m, nil
+	}
+	finding := m.precheckResult.Precheck.Items[m.resultSelected]
+	if finding.RuleID == "" {
+		m.setStatus(m.t("tui.status.finding_not_editable"))
+		return m, nil
+	}
+	m.selectedRuleID = finding.RuleID
+	rule := m.selectedRule()
+	if rule == nil || m.isDeleted(rule.RuleID) {
+		m.setStatus(m.t("tui.status.finding_not_editable"))
+		return m, nil
+	}
+	m.editor = newRuleEditorWithTranslator(editorEdit, *rule, m.editableRules(), m.tr)
+	if field := precheckEditorField(finding.Check); field != "" {
+		m.editor.focusField(field)
+	}
+	m.view = viewEditor
+	return m, nil
+}
+
+func precheckEditorField(check string) string {
+	switch strings.ToLower(strings.TrimSpace(check)) {
+	case "duplicate_rule_id":
+		return fieldRuleID
+	case "privileged_port", "listen_conflict", "listen_bind":
+		return fieldListenPort
+	case "target_resolve":
+		return fieldTargetAddr
+	case "source_ip_duplicate", "source_ip_redundant":
+		return fieldSourceIPs
+	default:
+		return ""
+	}
+}
+
 func (m Model) handleApplyResult(msg applyMsg) (tea.Model, tea.Cmd) {
 	m.operation = operationIdle
 	if msg.err != nil {
-		message, reconcile, committed, handled := rulesApplyUnavailableState(msg.err)
+		message, reconcile, committed, handled := m.rulesApplyUnavailableState(msg.err)
 		if handled {
 			m.precheckResult = nil
 			m.applyResult = nil
@@ -880,16 +974,16 @@ func (m Model) handleApplyResult(msg applyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.sync == syncStale && apiStatus(msg.err) != http.StatusPreconditionFailed {
-			m.setStatus("apply failed after server configuration changed; draft retained")
+			m.setStatus(m.t("tui.status.apply_failed_after_change"))
 			m.view = viewRules
 			return m, nil
 		}
 		switch apiStatus(msg.err) {
 		case http.StatusPreconditionFailed:
 			m.sync = syncStale
-			m.setStatus("apply conflict: server configuration changed; draft retained")
+			m.setStatus(m.t("tui.status.apply_conflict"))
 		case http.StatusForbidden:
-			m.setStatus("apply denied: admin role required; draft retained")
+			m.setStatus(m.t("tui.status.apply_denied"))
 		case http.StatusUnprocessableEntity:
 			if apiErr, ok := msg.err.(*APIError); ok {
 				var checked PrecheckResponse
@@ -899,25 +993,26 @@ func (m Model) handleApplyResult(msg applyMsg) (tea.Model, tea.Cmd) {
 					m.resultSelected = 0
 					m.sync = syncDirty
 					m.view = viewPrecheck
-					m.setStatus("apply blocked by a new precheck finding; draft retained")
+					m.setStatus(m.t("tui.status.apply_new_finding"))
 					return m, nil
 				}
 			}
 			m.sync = syncDirty
-			m.setStatus("apply blocked by precheck; draft retained")
+			m.setStatus(m.t("tui.status.apply_blocked"))
 		default:
 			if m.sync != syncStale {
 				m.sync = syncDirty
 			}
-			m.setStatus("apply failed: " + msg.err.Error() + "; draft retained")
+			m.setStatus(m.tf("tui.status.apply_failed", msg.err.Error()))
 		}
 		m.view = viewRules
 		return m, nil
 	}
 	if msg.resp == nil {
-		m.setStatus("apply returned an empty response; draft retained")
+		m.setStatus(m.t("tui.status.apply_empty"))
 		return m, nil
 	}
+	configChanges := m.dirtyChangeCount()
 	m.applyResult = msg.resp
 	nextConfig := msg.resp.Snapshot()
 	if nextConfig != nil && !nextConfig.Writable && m.config != nil {
@@ -933,7 +1028,8 @@ func (m Model) handleApplyResult(msg applyMsg) (tea.Model, tea.Cmd) {
 	m.view = viewApplyResult
 	m.resultSelected = 0
 	m.reconcileSelection()
-	m.setStatus(fmt.Sprintf("apply complete: %d rule(s) changed", msg.resp.Result.AppliedRules+msg.resp.Result.StoppedRules))
+	runtimeChanges := msg.resp.Result.AppliedRules + msg.resp.Result.StoppedRules
+	m.setStatus(m.tf("tui.status.apply_complete", configChanges, runtimeChanges))
 	statsRequestID := m.beginStatsRequest()
 	rulesRequestID := m.beginRulesRequest()
 	return m, tea.Batch(
@@ -949,6 +1045,8 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc", "n", "?", "f1", "enter":
 			m.overlay = overlayNone
 			m.overlayYOffset = 0
+		case "l":
+			m.openLanguageSelector()
 		case "up", "k":
 			m.scrollHelp(-1)
 		case "down", "j":
@@ -961,6 +1059,17 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlayYOffset = 0
 		case "end":
 			m.overlayYOffset = m.helpMaxYOffset()
+		}
+		return m, nil
+	}
+	if m.overlay == overlayLanguage {
+		switch key {
+		case "esc":
+			m.overlay = overlayNone
+		case "1":
+			m.setLanguage(i18n.English)
+		case "2":
+			m.setLanguage(i18n.SimplifiedChinese)
 		}
 		return m, nil
 	}
@@ -999,17 +1108,17 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key == "enter" || key == "y" {
 			if m.operation != operationIdle {
 				m.overlay = overlayNone
-				m.setStatus("wait for the current operation to finish")
+				m.setStatus(m.t("tui.status.wait_operation"))
 				return m, nil
 			}
 			if m.draft == nil || m.sync != syncValidated {
 				m.overlay = overlayNone
-				m.setStatus("draft must pass precheck before apply")
+				m.setStatus(m.t("tui.status.draft_precheck_required"))
 				return m, nil
 			}
 			m.overlay = overlayNone
 			m.operation = operationApplying
-			m.setStatus("applying local draft...")
+			m.setStatus(m.t("tui.status.applying_draft"))
 			return m, applyCmd(m.ctx, m.client, m.draft.BaseETag, m.draft.request())
 		}
 	case overlayDiscardDraft:
@@ -1019,7 +1128,7 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.overlay = overlayNone
 			if wasStale {
 				m.sync = syncUnavailable
-				m.setStatus("local draft discarded; refreshing server configuration")
+				m.setStatus(m.t("tui.status.draft_discarded_refreshing"))
 				requestID := m.beginConfigBarrier()
 				return m, fetchConfigRulesCmd(m.ctx, m.client, requestID)
 			}
@@ -1046,12 +1155,20 @@ func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if key == "enter" || key == "y" {
 			if m.botOperation != botOperationIdle {
 				m.overlay = overlayNone
-				m.setStatus("wait for the current bot operation to finish")
+				m.setStatus(m.t("tui.status.wait_bot_operation"))
 				return m, nil
 			}
 			m.overlay = overlayNone
 			requestID := m.beginBotOperation(botOperationStopping)
 			return m, stopBotCmd(m.ctx, m.client, requestID)
+		}
+	case overlayStartService:
+		if key == "enter" || key == "y" {
+			return m.startService()
+		}
+	case overlayElevateService:
+		if key == "enter" || key == "y" {
+			return m.startServiceElevated()
 		}
 	}
 	return m, nil
@@ -1070,7 +1187,7 @@ func (m *Model) discardDraft() {
 	}
 	m.view = viewRules
 	m.reconcileSelection()
-	m.setStatus("local draft discarded")
+	m.setStatus(m.t("tui.status.draft_discarded"))
 }
 
 func (m Model) cancelTransientDraft() (tea.Model, tea.Cmd) {
@@ -1090,7 +1207,7 @@ func (m Model) cancelTransientDraft() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.sync = syncUnavailable
-	m.setStatus("local draft discarded; refreshing server configuration")
+	m.setStatus(m.t("tui.status.draft_discarded_refreshing"))
 	requestID := m.beginConfigBarrier()
 	return m, fetchConfigRulesCmd(m.ctx, m.client, requestID)
 }
@@ -1153,7 +1270,7 @@ func (m Model) ruleChange(ruleID string) string {
 		return ""
 	}
 	if _, ok := m.draft.Deleted[ruleID]; ok {
-		return "- DELETE"
+		return m.t("tui.change.delete")
 	}
 	current := findRule(m.draft.Rules, ruleID)
 	baseline := findRule(m.config.Rules, ruleID)
@@ -1161,7 +1278,7 @@ func (m Model) ruleChange(ruleID string) string {
 		return ""
 	}
 	if baseline == nil {
-		return "+ ADD"
+		return m.t("tui.change.add")
 	}
 	if reflect.DeepEqual(*baseline, *current) {
 		return ""
@@ -1169,9 +1286,9 @@ func (m Model) ruleChange(ruleID string) string {
 	left, right := *baseline, *current
 	left.Enabled = right.Enabled
 	if reflect.DeepEqual(left, right) {
-		return "TOGGLE"
+		return m.t("tui.change.toggle")
 	}
-	return "~ EDIT"
+	return m.t("tui.change.edit")
 }
 
 func findRule(rules []RuleInfo, ruleID string) *RuleInfo {
@@ -1185,41 +1302,41 @@ func findRule(rules []RuleInfo, ruleID string) *RuleInfo {
 
 func (m Model) ruleState(rule RuleInfo) string {
 	if m.rulesErr != nil {
-		return "UNKNOWN"
+		return m.t("tui.state.unknown")
 	}
 	runtimeRule := m.runtimeRule(rule.RuleID)
 	baseline := m.baselineRule(rule.RuleID)
 	if m.rules == nil {
 		if (baseline != nil && !baseline.Enabled) || (baseline == nil && !rule.Enabled) {
-			return "DISABLED"
+			return m.t("tui.state.disabled")
 		}
-		return "PENDING"
+		return m.t("tui.state.pending")
 	}
 	if baseline == nil {
 		if m.config == nil && runtimeRule != nil && runtimeRule.RuntimeEqual(rule) {
-			return "RUNNING"
+			return m.t("tui.state.running")
 		}
 		if runtimeRule != nil {
-			return "DRIFT"
+			return m.t("tui.state.drift")
 		}
 		if rule.Enabled {
-			return "PENDING"
+			return m.t("tui.state.pending")
 		}
-		return "DISABLED"
+		return m.t("tui.state.disabled")
 	}
 	if !baseline.Enabled {
 		if runtimeRule != nil {
-			return "DRIFT"
+			return m.t("tui.state.drift")
 		}
-		return "DISABLED"
+		return m.t("tui.state.disabled")
 	}
 	if runtimeRule == nil {
-		return "ERROR"
+		return m.t("tui.state.error")
 	}
 	if !runtimeRule.RuntimeEqual(*baseline) {
-		return "DRIFT"
+		return m.t("tui.state.drift")
 	}
-	return "RUNNING"
+	return m.t("tui.state.running")
 }
 
 func (m Model) runtimeRule(ruleID string) *RuleInfo {
@@ -1232,28 +1349,28 @@ func (m Model) runtimeRule(ruleID string) *RuleInfo {
 func (m Model) syncLabel() string {
 	switch m.sync {
 	case syncClean:
-		return "SYNCED"
+		return m.t("tui.sync.synced")
 	case syncDirty:
-		return fmt.Sprintf("DRAFT %d", m.dirtyChangeCount())
+		return m.tf("tui.sync.draft_count", m.dirtyChangeCount())
 	case syncValidated:
-		return fmt.Sprintf("VALIDATED %d", m.dirtyChangeCount())
+		return m.tf("tui.sync.validated_count", m.dirtyChangeCount())
 	case syncStale:
-		return "STALE"
+		return m.t("tui.sync.stale")
 	default:
-		return "CONFIG UNAVAILABLE"
+		return m.t("tui.sync.unavailable")
 	}
 }
 
 func (m Model) roleLabel() string {
 	if m.session == nil {
-		return "NO SESSION"
+		return m.t("tui.role.no_session")
 	}
 	role := strings.ToUpper(strings.TrimSpace(m.session.Role))
 	if role == "" {
-		role = "UNKNOWN"
+		role = m.t("tui.state.unknown")
 	}
 	if !m.canWrite() {
-		role += " READ ONLY"
+		role += " " + m.t("tui.state.read_only")
 	}
 	return role
 }
@@ -1279,12 +1396,59 @@ func sortedDiffValues(diff localRuleDiff) []string {
 	return items
 }
 
+func (m Model) sortedDiffValues(diff localRuleDiff) []string {
+	items := make([]string, 0, diff.changeCount())
+	for _, item := range diff.Added {
+		items = append(items, m.tf("tui.diff.add", item))
+	}
+	for _, item := range diff.Updated {
+		items = append(items, m.tf("tui.diff.update", item))
+	}
+	for _, item := range diff.Enabled {
+		items = append(items, m.tf("tui.diff.enable", item))
+	}
+	for _, item := range diff.Disabled {
+		items = append(items, m.tf("tui.diff.disable", item))
+	}
+	for _, item := range diff.Deleted {
+		items = append(items, m.tf("tui.diff.delete", item))
+	}
+	sort.Strings(items)
+	return items
+}
+
 func precheckDiffValues(diff []ConfigRuleDiff) []string {
 	items := make([]string, 0, len(diff))
 	for _, item := range diff {
 		line := fmt.Sprintf("%-9s %-20s", item.ConfigAction, item.RuleID)
 		if item.RuntimeAction != "" && item.RuntimeAction != "none" {
 			line += "  runtime: " + item.RuntimeAction
+		}
+		items = append(items, line)
+	}
+	sort.Strings(items)
+	return items
+}
+
+func (m Model) precheckDiffValues(diff []ConfigRuleDiff) []string {
+	items := make([]string, 0, len(diff))
+	for _, item := range diff {
+		action := item.ConfigAction
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "add", "added":
+			action = m.t("tui.action.add")
+		case "update", "updated", "edit":
+			action = m.t("tui.action.update")
+		case "delete", "deleted":
+			action = m.t("tui.action.delete")
+		case "enable", "enabled":
+			action = m.t("tui.action.enable")
+		case "disable", "disabled":
+			action = m.t("tui.action.disable")
+		}
+		line := cellColumn(action, 9) + " " + cellColumn(item.RuleID, 20)
+		if item.RuntimeAction != "" && item.RuntimeAction != "none" {
+			line += m.tf("tui.diff.runtime", m.localizedApplyAction(engine.ApplyAction(item.RuntimeAction)))
 		}
 		items = append(items, line)
 	}

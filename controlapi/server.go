@@ -1,6 +1,7 @@
 package controlapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/engine"
 	"github.com/cloudapp3/vmflow/metrics"
+	"github.com/cloudapp3/vmflow/netinfo"
 	"github.com/cloudapp3/vmflow/precheck"
 )
 
@@ -36,6 +38,9 @@ type Runtime struct {
 	PrecheckOptions *precheck.Options
 	CertStore       *certstore.Store
 	CertReviewer    *certreview.Reviewer
+	// HostNetwork returns a snapshot of the daemon host. It is optional so
+	// embedders can omit host-level inspection from their control surface.
+	HostNetwork func(context.Context) (netinfo.Snapshot, error)
 	// Bot controls the Telegram bot lifecycle at runtime. May be nil when bot
 	// support is disabled; bot config endpoints report unavailable then.
 	Bot BotController
@@ -89,9 +94,15 @@ func NewHandler(runtime *Runtime) http.Handler {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"items": runtime.snapshots(),
-		})
+		response := StatsResponse{Items: runtime.snapshots()}
+		if runtime.HostNetwork != nil {
+			hostNetwork, err := runtime.HostNetwork(r.Context())
+			response.HostNetwork = &hostNetwork
+			if err != nil {
+				runtime.log(r).Debug("host network snapshot incomplete", "component", "controlapi", "event", "host_network_partial", "error", err)
+			}
+		}
+		writeJSON(w, http.StatusOK, response)
 	})
 	runtime.registerConfigManagementHandlers(mux)
 	runtime.registerCertificateHandlers(mux)
@@ -308,11 +319,16 @@ func (runtime *Runtime) rules() []engine.Rule {
 	return runtime.Manager.RunningRules()
 }
 
-func (runtime *Runtime) snapshots() []engine.TrafficSnapshot {
+func (runtime *Runtime) snapshots() []TrafficSnapshot {
 	if runtime == nil || runtime.Manager == nil {
 		return nil
 	}
-	return runtime.Manager.SnapshotAll()
+	snapshots := runtime.Manager.SnapshotAll()
+	items := make([]TrafficSnapshot, len(snapshots))
+	for index := range snapshots {
+		items[index] = TrafficSnapshot(snapshots[index])
+	}
+	return items
 }
 
 func (runtime *Runtime) metricsHandler() http.Handler {

@@ -11,15 +11,15 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cloudapp3/vmflow/internal/appdirs"
 )
 
 const (
 	darwinPlistDir   = "/Library/LaunchDaemons"
-	darwinDefaultCfg = "/usr/local/etc/vmflow/config.yaml"
+	darwinDefaultCfg = appdirs.DarwinSystemConfigPath
 	darwinLogDir     = "/var/log/vmflow"
 )
-
-func defaultConfigPath() string { return darwinDefaultCfg }
 
 func plistPath(cfg Config) string {
 	return filepath.Join(darwinPlistDir, launchdLabel(cfg)+".plist")
@@ -37,11 +37,33 @@ func platformInstall(cfg Config, w io.Writer) error {
 	if err := installLaunchdDaemon(cfg, path, runCombined); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "installed %s\n", path)
+	fmt.Fprintln(w, cfg.tf("cli.service.output.installed", path))
 
 	label := launchdLabel(cfg)
-	fmt.Fprintf(w, "daemon %s loaded and started\n", label)
-	fmt.Fprintf(w, "logs: %s , %s   |   status: vmflow service status\n", logStdout(cfg), logStderr(cfg))
+	fmt.Fprintln(w, cfg.tf("cli.service.output.daemon_started", label))
+	fmt.Fprintln(w, cfg.tf("cli.service.output.darwin_logs", logStdout(cfg), logStderr(cfg)))
+	return nil
+}
+
+func platformStart(cfg Config, w io.Writer) error {
+	path := plistPath(cfg)
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("%w: %s", ErrNotInstalled, cfg.ServiceName)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect launchd plist: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("launchd plist path %s is not a regular file", path)
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("%w (try sudo)", ErrPrivilegesRequired)
+	}
+	if err := startLaunchdDaemon(cfg, path, runCombined); err != nil {
+		return err
+	}
+	fmt.Fprintln(w, cfg.tf("cli.service.output.started", cfg.ServiceName))
 	return nil
 }
 
@@ -50,15 +72,11 @@ func platformUninstall(cfg Config, w io.Writer) error {
 		return fmt.Errorf("removing a launchd daemon requires root (try sudo)")
 	}
 	label := launchdLabel(cfg)
-	if out, err := runCombined([]string{"launchctl", "bootout", "system/" + label}); err != nil {
-		fmt.Fprintf(w, "note: launchctl bootout: %s\n", strings.TrimSpace(string(out)))
+	if err := uninstallLaunchdDaemon(cfg, plistPath(cfg), runCombined); err != nil {
+		return err
 	}
-	path := plistPath(cfg)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove plist: %w", err)
-	}
-	fmt.Fprintf(w, "daemon %s stopped and removed\n", label)
-	fmt.Fprintln(w, "config and log files were left in place; remove them manually if desired")
+	fmt.Fprintln(w, cfg.tf("cli.service.output.daemon_removed", label))
+	fmt.Fprintln(w, cfg.t("cli.service.output.files_preserved"))
 	return nil
 }
 

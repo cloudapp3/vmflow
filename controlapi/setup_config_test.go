@@ -14,7 +14,8 @@ import (
 func TestSaveSetupConfigCreatesSecureValidatedFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.yaml")
 	update := SetupConfigUpdate{
-		Auth: config.AuthConfig{Enabled: true, Tokens: []config.AuthToken{{Name: "local-admin", Token: "secret", Role: config.AuthRoleAdmin}}},
+		Language: "zh-CN",
+		Auth:     config.AuthConfig{Enabled: true, Tokens: []config.AuthToken{{Name: "local-admin", Token: "secret", Role: config.AuthRoleAdmin}}},
 		Rules: []engine.Rule{{
 			RuleID: "ssh", Name: "ssh", Protocol: engine.ProtocolTCP,
 			ListenAddr: "127.0.0.1", ListenPort: 2201,
@@ -25,8 +26,15 @@ func TestSaveSetupConfigCreatesSecureValidatedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SaveSetupConfig: %v", err)
 	}
-	if !got.Auth.Enabled || len(got.Rules) != 1 || !got.Rules[0].Enabled {
+	if got.Language != "zh-CN" || !got.Auth.Enabled || len(got.Rules) != 1 || !got.Rules[0].Enabled {
 		t.Fatalf("saved config = %+v", got)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "language: zh-CN") {
+		t.Fatalf("saved config does not contain language:\n%s", raw)
 	}
 	if runtime.GOOS != "windows" {
 		info, err := os.Stat(path)
@@ -41,12 +49,13 @@ func TestSaveSetupConfigCreatesSecureValidatedFile(t *testing.T) {
 
 func TestSaveSetupConfigPreservesUnknownFieldsCommentsAndMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	raw := []byte("version: 1\ncustom_field: keep-me # custom\nauth:\n  enabled: false\nrules: [] # rules-comment\n")
+	raw := []byte("version: 1\nlanguage: zh-CN # display-language\ncustom_field: keep-me # custom\nauth:\n  enabled: false\nrules: [] # rules-comment\n")
 	if err := os.WriteFile(path, raw, 0o640); err != nil {
 		t.Fatal(err)
 	}
 	update := SetupConfigUpdate{
-		Auth: config.AuthConfig{Enabled: true, Tokens: []config.AuthToken{{Name: "admin", Token: "secret", Role: config.AuthRoleAdmin}}},
+		Language: "en",
+		Auth:     config.AuthConfig{Enabled: true, Tokens: []config.AuthToken{{Name: "admin", Token: "secret", Role: config.AuthRoleAdmin}}},
 		Rules: []engine.Rule{{
 			RuleID: "dns", Name: "dns", Protocol: engine.ProtocolUDP,
 			ListenAddr: "127.0.0.1", ListenPort: 5353,
@@ -61,7 +70,7 @@ func TestSaveSetupConfigPreservesUnknownFieldsCommentsAndMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(saved)
-	if !strings.Contains(text, "custom_field: keep-me # custom") || !strings.Contains(text, "# rules-comment") {
+	if !strings.Contains(text, "language: en # display-language") || !strings.Contains(text, "custom_field: keep-me # custom") || !strings.Contains(text, "# rules-comment") {
 		t.Fatalf("unknown field or comments lost:\n%s", text)
 	}
 	if runtime.GOOS != "windows" {

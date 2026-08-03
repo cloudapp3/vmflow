@@ -117,6 +117,7 @@ func (c *Collector) Write(w io.Writer) error {
 	rules := c.runningRules()
 	snapshots := c.snapshots()
 	protocols := c.ruleProtocols()
+	bandwidths := c.bandwidthPolicies()
 	controlRequests, reloads, applyActions := c.copyCounters()
 
 	if _, err := fmt.Fprintf(w, "# HELP vmflow_build_info Static build info for vmflow.\n# TYPE vmflow_build_info gauge\nvmflow_build_info 1\n"); err != nil {
@@ -168,6 +169,75 @@ func (c *Collector) Write(w io.Writer) error {
 	for _, sample := range snapshots {
 		protocol := protocolForRule(protocols, sample.RuleID)
 		if _, err := fmt.Fprintf(w, "vmflow_rule_download_bytes_total{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.DownloadBytes); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprint(w, "# HELP vmflow_rule_bandwidth_limit_bytes_per_second Configured aggregate bandwidth limit by rule and direction; zero means unlimited.\n# TYPE vmflow_rule_bandwidth_limit_bytes_per_second gauge\n"); err != nil {
+		return err
+	}
+	for _, sample := range snapshots {
+		limit, configured := bandwidths[sample.RuleID]
+		if !configured {
+			continue
+		}
+		protocol := protocolForRule(protocols, sample.RuleID)
+		if _, err := fmt.Fprintf(w, "vmflow_rule_bandwidth_limit_bytes_per_second{rule_id=%q,protocol=%q,direction=%q} %d\n", sample.RuleID, protocol, "upload", limit.UploadBytesPerSecond()); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "vmflow_rule_bandwidth_limit_bytes_per_second{rule_id=%q,protocol=%q,direction=%q} %d\n", sample.RuleID, protocol, "download", limit.DownloadBytesPerSecond()); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprint(w, "# HELP vmflow_rule_quota_used_bytes Payload bytes charged to the current quota period.\n# TYPE vmflow_rule_quota_used_bytes gauge\n# HELP vmflow_rule_quota_limit_bytes Configured payload byte limit for the current quota period.\n# TYPE vmflow_rule_quota_limit_bytes gauge\n# HELP vmflow_rule_quota_remaining_bytes Payload bytes remaining in the current quota period.\n# TYPE vmflow_rule_quota_remaining_bytes gauge\n"); err != nil {
+		return err
+	}
+	for _, sample := range snapshots {
+		if sample.Quota == nil {
+			continue
+		}
+		protocol := protocolForRule(protocols, sample.RuleID)
+		for _, period := range []struct {
+			name     string
+			snapshot *engine.QuotaPeriodSnapshot
+		}{{"daily", sample.Quota.Daily}, {"monthly", sample.Quota.Monthly}} {
+			if period.snapshot == nil {
+				continue
+			}
+			labels := fmt.Sprintf("rule_id=%q,protocol=%q,period=%q", sample.RuleID, protocol, period.name)
+			if _, err := fmt.Fprintf(w, "vmflow_rule_quota_used_bytes{%s} %d\nvmflow_rule_quota_limit_bytes{%s} %d\nvmflow_rule_quota_remaining_bytes{%s} %d\n", labels, period.snapshot.UsedBytes, labels, period.snapshot.LimitBytes, labels, period.snapshot.RemainingBytes); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := fmt.Fprint(w, "# HELP vmflow_rule_quota_blocked Whether a rule is currently blocked by any traffic quota.\n# TYPE vmflow_rule_quota_blocked gauge\n"); err != nil {
+		return err
+	}
+	for _, sample := range snapshots {
+		if sample.Quota == nil {
+			continue
+		}
+		blocked := 0
+		if sample.Quota.Blocked {
+			blocked = 1
+		}
+		protocol := protocolForRule(protocols, sample.RuleID)
+		if _, err := fmt.Fprintf(w, "vmflow_rule_quota_blocked{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, blocked); err != nil {
+			return err
+		}
+	}
+
+	if _, err := fmt.Fprint(w, "# HELP vmflow_rule_quota_rejected_bytes_total Total payload bytes rejected by traffic quota enforcement.\n# TYPE vmflow_rule_quota_rejected_bytes_total counter\n"); err != nil {
+		return err
+	}
+	for _, sample := range snapshots {
+		if sample.Quota == nil && sample.QuotaRejectedBytes == 0 {
+			continue
+		}
+		protocol := protocolForRule(protocols, sample.RuleID)
+		if _, err := fmt.Fprintf(w, "vmflow_rule_quota_rejected_bytes_total{rule_id=%q,protocol=%q} %d\n", sample.RuleID, protocol, sample.QuotaRejectedBytes); err != nil {
 			return err
 		}
 	}
@@ -260,6 +330,13 @@ func (c *Collector) ruleProtocols() map[string]engine.Protocol {
 		return nil
 	}
 	return c.manager.RuleProtocols()
+}
+
+func (c *Collector) bandwidthPolicies() map[string]engine.BandwidthLimit {
+	if c == nil || c.manager == nil {
+		return nil
+	}
+	return c.manager.BandwidthPolicies()
 }
 
 func (c *Collector) snapshots() []engine.TrafficSnapshot {

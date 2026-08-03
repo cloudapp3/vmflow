@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"sync"
 
+	"github.com/cloudapp3/vmflow/dnsresolver"
 	"github.com/cloudapp3/vmflow/engine"
 )
 
@@ -40,6 +41,14 @@ type Options struct {
 	// Non-positive values use engine.DefaultUDPGlobalMaxSessions; larger values
 	// are clamped to engine.MaxUDPGlobalMaxSessions.
 	UDPMaxSessions int
+
+	// QuotaLedger lets an embedding host provide durable quota state. Nil keeps
+	// quota enforcement in memory; standalone vmflow injects a persistent ledger.
+	QuotaLedger *engine.QuotaLedger
+
+	// Resolver controls outbound name resolution. Nil uses vmflow's automatic
+	// system-first failover policy.
+	Resolver *dnsresolver.Resolver
 }
 
 // NewRuntime creates a new embeddable forwarding runtime.
@@ -49,7 +58,7 @@ func NewRuntime(opts Options) *Runtime {
 		collector = engine.NewCollector()
 	}
 
-	managerOpts := engine.ManagerOptions{UDPMaxSessions: opts.UDPMaxSessions}
+	managerOpts := engine.ManagerOptions{UDPMaxSessions: opts.UDPMaxSessions, QuotaLedger: opts.QuotaLedger, Resolver: opts.Resolver}
 	var manager *engine.Manager
 	if opts.CertProvider != nil {
 		manager = engine.NewManagerWithCertOptions(collector, opts.CertProvider, managerOpts)
@@ -162,6 +171,7 @@ func (r *Runtime) Close() error {
 
 	if manager != nil {
 		manager.StopAll()
+		return manager.SaveQuotaStateExact()
 	}
 	return nil
 }

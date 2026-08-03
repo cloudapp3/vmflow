@@ -27,6 +27,13 @@ func TestValidateServiceExtraArgsAllowsFutureFlagTokens(t *testing.T) {
 	}
 }
 
+func TestPlanInstallRejectsUntrustedRelativePaths(t *testing.T) {
+	_, err := PlanInstall(Config{BinaryPath: "vmflow", ConfigPath: "config.yaml"})
+	if err == nil || !strings.Contains(err.Error(), "binary path must be absolute") {
+		t.Fatalf("PlanInstall error = %v", err)
+	}
+}
+
 func TestForegroundArgsUseDirectRuntimeEntry(t *testing.T) {
 	cfg := Config{ConfigPath: "/etc/vmflow/config.yaml"}
 	args := foregroundArgs(cfg, false)

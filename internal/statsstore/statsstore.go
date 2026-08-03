@@ -115,6 +115,7 @@ type record struct {
 	SourceIPDenied     int64  `json:"source_ip_denied,omitempty"`
 	UDPSessionRejected int64  `json:"udp_session_rejected,omitempty"`
 	UDPPacketsDropped  int64  `json:"udp_packets_dropped,omitempty"`
+	QuotaRejectedBytes int64  `json:"quota_rejected_bytes,omitempty"`
 }
 
 type document struct {
@@ -133,6 +134,7 @@ func toRecords(snapshots []engine.TrafficSnapshot) []record {
 			SourceIPDenied:     s.SourceIPDenied,
 			UDPSessionRejected: s.UDPSessionRejected,
 			UDPPacketsDropped:  s.UDPPacketsDropped,
+			QuotaRejectedBytes: s.QuotaRejectedBytes,
 		})
 	}
 	return records
@@ -148,6 +150,7 @@ func fromRecords(records []record) []engine.TrafficSnapshot {
 			SourceIPDenied:     r.SourceIPDenied,
 			UDPSessionRejected: r.UDPSessionRejected,
 			UDPPacketsDropped:  r.UDPPacketsDropped,
+			QuotaRejectedBytes: r.QuotaRejectedBytes,
 		})
 	}
 	return snapshots

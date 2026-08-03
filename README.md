@@ -25,6 +25,8 @@ Documentation: [Website](https://vmflow.bestcheapvps.org/) · [中文](https://v
 ## TCP/UDP port forwarding features
 
 - TCP, UDP, and `tcp+udp` port forwarding
+- Aggregate per-rule upload/download bandwidth limits with human-readable units
+- Durable daily and monthly upload-plus-download traffic quotas
 - Per-rule IPv4/IPv6 source allowlists and denylists with CIDR support
 - Configurable TCP connection limits and bounded UDP sessions, with rejection/drop counters
 - Rule lifecycle management: start, stop, restart, and full snapshot apply
@@ -49,12 +51,12 @@ Documentation: [Website](https://vmflow.bestcheapvps.org/) · [中文](https://v
 
 ## Quick start
 
-Install the current MCP-enabled prerelease and a colocated config (Linux/macOS):
+Install the current stable release (Linux/macOS):
 
 ```bash
 VMFLOW_BIN_DIR="$(
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-    | bash -s -- --version v0.2.0-rc.4 --print-install-dir
+    | bash -s -- --version v0.3.0 --print-install-dir
 )" \
   && [ -n "$VMFLOW_BIN_DIR" ] \
   && [ "${VMFLOW_BIN_DIR#/}" != "$VMFLOW_BIN_DIR" ] \
@@ -62,14 +64,12 @@ VMFLOW_BIN_DIR="$(
   && export PATH="$VMFLOW_BIN_DIR:$PATH"
 ```
 
-Omit `--version v0.2.0-rc.4` to follow the latest stable release instead. The
-unversioned installer currently resolves to `v0.1.1`, which predates the MCP
-and Source IP policy features documented on this branch. The installer accepts
-that release's legacy `examples/config.yaml` archive layout as well as the
-top-level `config.yaml` layout used by current releases.
+Omit `--version v0.3.0` to follow the latest stable release automatically.
+Release archives keep `examples/config.yaml` as a reference; the installer
+never activates or copies it.
 
 Without an explicit `--dir`, the installer first reuses a conventional existing
-vmflow installation so upgrades keep its colocated config. A fresh root install
+vmflow installation directory. A fresh root install
 uses `/usr/local/bin`; an unprivileged user prefers `~/.local/bin` or `~/bin`
 when either is already in `PATH`, then falls back to `~/.local/bin`. For an
 automatic home-directory install, the installer adds an idempotent entry to the
@@ -78,11 +78,10 @@ prints the exact reload command; other shells receive a warning. The captured
 directory and `export` above make the selected binary available in the current
 shell without guessing its location.
 
-The first install creates `config.yaml` beside the binary with mode `0600`.
-Reinstalling or upgrading replaces only the binary and preserves the existing
-config. `vmflow` shows status and next steps, while `vmflow run` starts the
-foreground process. Both `init` and `run` use the colocated config by default;
-`-config` overrides that path.
+The installer writes only the `vmflow` executable. `vmflow init` creates the
+active configuration after the user chooses system-service or foreground mode.
+`vmflow run` uses the current user's config by default; `-config PATH` always
+overrides automatic path selection.
 
 The bundled SSH forwarding example is disabled and listens on loopback only.
 Run the first-use wizard to replace that untouched example with a validated,
@@ -95,6 +94,22 @@ vmflow init
 The wizard also enables authenticated management with a random admin token and
 saves a mode-`0600` local client profile. `vmflow ctl` and `vmflow tui` use that
 profile automatically, so the token is not placed in shell history.
+
+Before loading or writing configuration, an interactive wizard offers three run modes: install
+the native system service and run in the background (recommended), run in the
+current terminal, or do not start yet. System-service installation shows the
+resolved binary and config paths and requires explicit confirmation before any
+administrator handoff. For scripts, `-start` retains its foreground behavior;
+use `-install-service` to explicitly install or update the native service and
+start it in the background. The two flags are mutually exclusive.
+
+The first wizard prompt displays numbered choices for English and Simplified
+Chinese. Select `1` or `2`; pressing Enter keeps the shown default. The choice
+is saved as the top-level `language` value in `config.yaml`. The prompt also
+accepts `en` or `zh-CN` for compatibility. To change it later, set that field
+to `en` or `zh-CN`. For a one-off override, use
+`vmflow --lang zh-CN <command>` or set `VMFLOW_LANG`. Resolution order is
+`--lang`, `VMFLOW_LANG`, `config.yaml`, then English.
 
 Start vmflow in one terminal after setup:
 
@@ -125,17 +140,15 @@ sudo only to prepare, inspect, and write the target directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-  | bash -s -- --version v0.2.0-rc.4 --system
+  | bash -s -- --version v0.3.0 --system
 ```
 
-When a non-root user requests `--system`, a newly created colocated config stays
-root-owned with mode `0600`; the installer therefore prints sudo/root commands
-for verification and startup. The default quick start above uses a per-user
-install instead and makes `vmflow` directly runnable in the current shell.
+`--system` changes only the executable installation directory. Configuration is
+still created later by `vmflow init`, which requests administrator privileges
+only when the system-service choice needs the system config path.
 
 The installer downloads GitHub Release archives, verifies `checksums.txt` with
-SHA-256 by default, and installs `vmflow` plus, only when absent, a colocated
-`config.yaml`. Override the automatic directory with `--dir PATH` or
+SHA-256 by default, and installs only `vmflow`. Override the automatic directory with `--dir PATH` or
 `VMFLOW_INSTALL_DIR`; explicit directories never modify shell startup files.
 Use `--no-modify-path` to disable startup-file changes for an automatic user
 install, `--print-install-dir` for machine-readable PATH integration, and
@@ -148,7 +161,6 @@ Or build from source:
 git clone https://github.com/cloudapp3/vmflow.git
 cd vmflow
 go build -trimpath -o vmflow ./cmd/vmflow
-cp -n examples/config.yaml config.yaml
 ./vmflow init
 ./vmflow run
 ```
@@ -157,8 +169,21 @@ cp -n examples/config.yaml config.yaml
 
 See [`examples/config.yaml`](examples/config.yaml):
 
+Default active config paths are scope-specific:
+
+| Platform | System service | User / foreground |
+| --- | --- | --- |
+| Linux | `/etc/vmflow/config.yaml` | `${XDG_CONFIG_HOME:-$HOME/.config}/vmflow/config.yaml` |
+| macOS | `/Library/Application Support/vmflow/config.yaml` | `~/Library/Application Support/vmflow/config.yaml` |
+| Windows | `%ProgramData%\vmflow\config.yaml` | `%LocalAppData%\vmflow\config.yaml` |
+
+`vmflow init --install-service` and `vmflow service install` use the system
+path. `vmflow init --start` and `vmflow run` use the user path. An explicit
+`-config PATH` wins in every mode.
+
 ```yaml
 version: 1
+language: en                       # CLI/TUI: en or zh-CN
 control_port: 19090                  # management always binds to 127.0.0.1
 udp_max_sessions: 256              # all UDP sessions in this process
 
@@ -187,6 +212,18 @@ rules:
     target_addr: 127.0.0.1
     target_port: 22
     enabled: false
+    bandwidth_limit:
+      rate: 100 Mbps                 # shared by all connections, per direction
+    # For asymmetric limits, omit rate and use either or both fields:
+    # bandwidth_limit:
+    #   upload: 50 Mbps
+    #   download: 200 Mbps
+    traffic_quota:
+      daily: 100 GB                  # successful upload + download payload
+      monthly: 1 TB
+      timezone: Asia/Shanghai        # calendar day/month reset boundary
+      action: block                  # optional; block is the default
+    speed_limit: 0                   # legacy per-connection B/s limit
     max_conn: 0                     # TCP: unlimited; UDP: default of 256
     source_ip_mode: allowlist       # off, allowlist, or denylist
     source_ips:                     # literal IPv4/IPv6 or CIDR; max 256
@@ -194,6 +231,49 @@ rules:
       - 198.51.100.0/24
       - 2001:db8:100::/48
 ```
+
+DNS failover is automatic and has no configuration surface. Init target checks,
+precheck, and TCP/UDP/HTTP/HTTPS outbound connections try the operating system
+resolver first. On timeout or network failure, vmflow falls back in order to
+`223.5.5.5:53` and `119.29.29.29:53`. A failed source is skipped for 30 seconds,
+then retried automatically so recovered system DNS becomes primary again.
+Definitive `NXDOMAIN` responses do not trigger public fallback, which avoids
+leaking invalid or internal names. Literal IP targets bypass DNS entirely.
+
+`bandwidth_limit` limits the aggregate traffic of one `rule_id`, rather than
+each connection separately. Upload and download have independent token buckets.
+`rate` applies the same configured rate to both buckets; it cannot be combined
+with `upload` or `download`. With directional limits, an omitted direction is
+unlimited. Every TCP connection and UDP session in the rule shares these
+buckets, and a `tcp+udp` rule shares them across both protocols. vmflow permits
+an automatically sized burst equal to roughly 100 ms of configured traffic,
+clamped between 64 KiB and 4 MiB. The older integer `speed_limit` remains a
+per-connection byte-per-second limit for compatibility.
+
+Rate units are explicit and case-sensitive. Network-style `bps`, `Kbps`,
+`Mbps`, `Gbps`, and `Tbps` are bits per second, so `100 Mbps` is
+`12,500,000 B/s`. Byte-rate units include `B/s`, `KB/s`, `MB/s`, `GB/s`,
+`TB/s`, and the binary forms `KiB/s`, `MiB/s`, `GiB/s`, `TiB/s`. Bare integer
+values remain accepted as bytes per second for compatibility; ambiguous values
+such as `100M` or `100mb` are rejected.
+
+`traffic_quota` charges successful application payload bytes in both directions
+to the same daily and monthly totals. `GB` and `TB` are decimal provider units;
+`GiB` and `TiB` are binary units. `B`, `KB`, `MB`, `KiB`, and `MiB` are also
+accepted, as are legacy bare integer byte counts. Calendar periods reset at
+midnight or month start in the configured IANA timezone. TCP can forward the
+final remaining bytes before closing; UDP datagrams are admitted whole or
+dropped whole. Exhausted quotas block new traffic and automatically reopen in
+the next period. Removing and re-adding a rule with the same `rule_id` retains
+its current-period usage, so a configuration rewrite cannot reset allowance.
+`block` is currently the only action.
+
+Quota enforcement is durable even when `stats.persist` is false. vmflow stores
+strict `quota-state.json` state beside the resolved stats file (or beside the
+config when no stats path is configured), refuses path collisions, and fails
+closed if quota state cannot be read or written. To prevent a crash or power
+loss from restoring consumed allowance, runtime persistence reserves a small
+conservative credit ahead of writes; a clean shutdown records exact usage.
 
 `source_ip_mode` controls admission independently for each forwarding rule.
 With `allowlist`, only peers matching `source_ips` are accepted; with
@@ -252,10 +332,22 @@ are read-only. In the Rules view use `n`/`e`/`c` to create,
 edit, or copy, `space` to toggle, `d` to delete, `g` for the global UDP limit,
 `P` to precheck, `A` to apply, and `u` to discard the draft.
 The rule editor's Source IPs / CIDRs field accepts comma-separated entries.
+Shared bandwidth, daily quota, and monthly quota are in the basic editor;
+directional bandwidth and quota timezone are under the advanced settings.
+
+The Dashboard separates vmflow forwarding traffic from the connected daemon's
+Host Network data. The host section includes interface state, MTU, IPv4/IPv6
+CIDRs, cumulative RX/TX counters, and rates calculated from the existing
+three-second stats polling interval. This remains the daemon host when the TUI
+connects over an SSH tunnel or another remote transport. Press `4` to jump to
+the Host Network section, `a` to switch between active physical interfaces and
+all interfaces, and use the normal scroll keys for longer Dashboards. Interface
+totals may include virtual-interface traffic; they are not vmflow port quotas,
+a public-IP lookup, link-speed measurement, or bandwidth test.
 
 Apply writes the validated draft to the config loaded by the running process,
-which is the `config.yaml` beside the resolved vmflow binary by default (or the
-explicit `-config` path). Auth, TLS, logging, and other process settings still
+which is the platform user config by default (or the explicit `-config` path).
+Auth, TLS, logging, and other process settings still
 require editing YAML and restarting vmflow.
 
 ## Commands
@@ -263,6 +355,7 @@ require editing YAML and restarting vmflow.
 ```bash
 vmflow
 vmflow init          [-config path] [-protocol tcp] [-listen-port PORT] [-target-port PORT]
+                     [-start | -install-service]
 vmflow run           [-config path] [-control-port 19090]
 vmflow status        [-config path] [-json]
 vmflow ctl           [-token TOKEN] <health|rules|stats|metrics|precheck|reload>
@@ -270,7 +363,7 @@ vmflow tui           [-token TOKEN]
 vmflow mcp           [-token TOKEN]
 vmflow version       [-json]
 vmflow update        [--check] [--version tag]
-vmflow service       (install|uninstall|status) [--config path] [--binary path] [--user name] [--log-file path]
+vmflow service       (install|start|uninstall|status) [--config path] [--binary path] [--user name] [--log-file path]
                      [--control-port port] [--extra-arg value]...
 vmflow uninstall     [--dry-run]
 ```
@@ -289,8 +382,13 @@ works with a deprecation warning. New scripts and service definitions should use
 Register vmflow as a native OS service so it starts at boot and restarts on crash — one command on every platform:
 
 ```bash
-sudo vmflow service install --config /usr/local/bin/config.yaml
+vmflow init --install-service
 ```
+
+The interactive `vmflow init` wizard offers this background-service flow before
+it chooses or writes a config. It verifies the target, hands the prepared config
+to an administrator process for an atomic system-path write, then checks both
+native-service state and the local management endpoint before reporting success.
 
 For safety, `service install` refuses to register a service that points at a
 relative path, a user-writable binary or config file, or either file under
@@ -298,8 +396,9 @@ user-writable parent directories (symlinks are resolved first). Install
 `vmflow` into a protected root/admin-owned path such as
 `/usr/local/bin/vmflow`, `/opt/vmflow/vmflow`, or
 `C:\Program Files\vmflow\vmflow.exe`, and keep the service config in a protected
-root/admin-owned location such as `/usr/local/bin/config.yaml` or
-`/etc/vmflow/config.yaml`; pass `--binary` if you need to point at the installed
+root/admin-owned location such as `/etc/vmflow/config.yaml`,
+`/Library/Application Support/vmflow/config.yaml`, or
+`C:\ProgramData\vmflow\config.yaml`; pass `--binary` if you need to point at the installed
 binary explicitly. A service running as a dedicated user needs explicit read
 access to the root-owned config (for example, owner `root`, group `vmflow`, mode
 `0640`).
@@ -308,6 +407,18 @@ The config is parsed before the OS service definition is changed. Running
 `service install` again updates the existing definition and restarts the
 service with the new settings.
 
+Start an installed but stopped service without changing its definition or
+configuration:
+
+```bash
+sudo vmflow service start
+```
+
+When `vmflow tui` uses its default local management address and finds an
+installed service stopped, the offline screen offers the same start operation
+and reconnects automatically. Explicit `-addr`, `VMFLOW_CONTROL_ADDR`, and
+custom `VMFLOW_CLIENT_CONFIG` targets never start the local service.
+
 - **Linux**: writes and reloads a systemd unit, enables it, restarts the service, and verifies it is active. Logs go to journald (`journalctl -u vmflow`). The unit runs as root by default with `CAP_NET_BIND_SERVICE` (so it can bind privileged ports), `Restart=on-failure`, and a writable `/var/lib/vmflow` state directory. Pass `--user vmflow` to run under a dedicated account (created if missing).
 - **macOS**: writes a launchd daemon (`KeepAlive` restarts on crash) and bootstraps it. Logs land under `/var/log/vmflow/` (override with `--log-file`).
 - **Windows**: registers a Windows Service (`start=auto`, restart-on-failure) visible in `services.msc`. Because the SCM provides no stdout, logs default to `C:\ProgramData\vmflow\logs\vmflow.log`; override with `--log-file` if needed.
@@ -315,13 +426,15 @@ service with the new settings.
 Uninstall with `sudo vmflow service uninstall` (config and logs are left in place). Inspect with `vmflow service status`.
 
 For a complete removal, run `sudo vmflow uninstall`. It prints the full plan
-and requires confirmation before removing the service, binary, platform-default
-config, installer-owned colocated config, persistent traffic statistics, logs,
+and requires confirmation before removing the service, binary, vmflow-managed
+system/user config directories, persistent traffic statistics and quota state,
+logs,
 the local management client profile, update cache, and vmflow-owned certificate
-caches. Stats files and the client profile are parsed and
+caches. Stats/quota files and the client profile are parsed and
 revalidated immediately before removal; changed or unrecognized files are kept.
-An unowned colocated `config.yaml` is preserved. External TLS certificate and key
-files are never removed because they may be shared with other services. Custom
+Config directories without a valid `.vmflow-managed` marker and custom
+`-config` paths are preserved. External TLS certificate and key files are never
+removed because they may be shared with other services. Custom
 certificate cache directories are left in place unless the directory is
 exclusively owned by vmflow and contains a `.vmflow-owned` marker; use
 `--dry-run` to inspect the plan without changing the system.
@@ -368,6 +481,12 @@ admission-attempt failures and rate-limit queue-capacity drops are exposed as
 `vmflow_udp_session_rejected_total` and
 `vmflow_udp_packets_dropped_total` metrics. Manager-wide usage is exposed as
 `vmflow_udp_sessions_active` and `vmflow_udp_sessions_limit`.
+Aggregate limits and quota enforcement are exposed as
+`vmflow_rule_bandwidth_limit_bytes_per_second`,
+`vmflow_rule_quota_used_bytes`, `vmflow_rule_quota_limit_bytes`,
+`vmflow_rule_quota_remaining_bytes`, `vmflow_rule_quota_blocked`, and
+`vmflow_rule_quota_rejected_bytes_total`. The `direction` and `period` labels
+use fixed values (`upload`/`download` and `daily`/`monthly`).
 
 ## MCP server
 
@@ -380,10 +499,10 @@ Available tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `get_vmflow_status` | Connection, version, authorization, rule-count, traffic, and degraded-state summary |
-| `list_forwarding_rules` | Filtered rule summaries without endpoint or source-policy details |
+| `get_vmflow_status` | Connection, version, authorization, rule-count, traffic, quota-rejection, and degraded-state summary |
+| `list_forwarding_rules` | Filtered rule summaries with bandwidth/quota policy but without endpoint or source-policy details |
 | `get_forwarding_rule` | Full configuration, running state, and statistics for one rule |
-| `get_traffic_stats` | Filtered and sorted per-rule counters plus aggregate totals |
+| `get_traffic_stats` | Filtered and sorted per-rule counters, quota status, and aggregate totals |
 | `run_config_precheck` | Read-only validation of the daemon's current persisted configuration |
 
 Use a dedicated viewer token when daemon authentication is enabled. Prefer the

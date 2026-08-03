@@ -3,27 +3,31 @@ package tui
 import (
 	"github.com/cloudapp3/vmflow/controlapi"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/netinfo"
 )
 
 // Client and API types alias controlapi so the TUI, vmflow ctl, and the
 // Telegram bot share one client implementation.
 
 type (
-	Client              = controlapi.Client
-	StatsResponse       = controlapi.StatsResponse
-	TrafficSnapshot     = controlapi.TrafficSnapshot
-	RulesResponse       = controlapi.RulesResponse
-	ReloadResponse      = controlapi.ReloadResponse
-	SessionCapabilities = controlapi.SessionCapabilities
-	SessionResponse     = controlapi.SessionResponse
-	ConfigRulesResponse = controlapi.ConfigRulesResponse
-	ConfigRulesRequest  = controlapi.ConfigRulesRequest
-	ConfigRuleDiff      = controlapi.ConfigRuleDiff
-	PrecheckResponse    = controlapi.PrecheckResponse
-	ApplyResponse       = controlapi.ApplyResponse
-	BotConfigResponse   = controlapi.BotConfigResponse
-	BotConfigRequest    = controlapi.BotConfigRequest
-	APIError            = controlapi.APIError
+	Client               = controlapi.Client
+	StatsResponse        = controlapi.StatsResponse
+	TrafficSnapshot      = controlapi.TrafficSnapshot
+	RulesResponse        = controlapi.RulesResponse
+	ReloadResponse       = controlapi.ReloadResponse
+	SessionCapabilities  = controlapi.SessionCapabilities
+	SessionResponse      = controlapi.SessionResponse
+	ConfigRulesResponse  = controlapi.ConfigRulesResponse
+	ConfigRulesRequest   = controlapi.ConfigRulesRequest
+	ConfigRuleDiff       = controlapi.ConfigRuleDiff
+	PrecheckResponse     = controlapi.PrecheckResponse
+	ApplyResponse        = controlapi.ApplyResponse
+	BotConfigResponse    = controlapi.BotConfigResponse
+	BotConfigRequest     = controlapi.BotConfigRequest
+	APIError             = controlapi.APIError
+	HostNetworkSnapshot  = netinfo.Snapshot
+	HostNetworkInterface = netinfo.Interface
+	HostNetworkAddress   = netinfo.Address
 )
 
 // RuleInfo is engine.Rule, kept for TUI-internal readability.

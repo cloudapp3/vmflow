@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -409,6 +410,91 @@ func TestUDPUnlimitedBasicForwarding(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("traffic snapshot = %+v", collector.Snapshot(rule.RuleID))
+}
+
+func TestUDPQuotaBlocksWholeDatagramsAndReopensNextDay(t *testing.T) {
+	target, stopTarget := startUDPEchoTarget(t)
+	defer stopTarget()
+
+	var nowUnix atomic.Int64
+	nowUnix.Store(time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC).Unix())
+	ledger, err := newQuotaLedger(nil, func() time.Time { return time.Unix(nowUnix.Load(), 0) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("quota")
+	rule := udpTestRule("udp-quota", target)
+	rule.TrafficQuota = &TrafficQuota{
+		Daily: ByteSize(2 * len(payload)), Timezone: "UTC", Action: "block",
+	}
+	collector := NewCollector()
+	runner := newUDPRunnerWithTraffic(
+		rule,
+		collector,
+		newUDPSessionBudget(DefaultUDPGlobalMaxSessions),
+		newRuleTrafficController(rule, ledger),
+	).(*udpRunner)
+	if err := runner.Start(); err != nil {
+		t.Fatalf("start UDP quota runner: %v", err)
+	}
+	defer runner.Stop()
+
+	client := listenUDPClient(t)
+	defer client.Close()
+	forwardAddr := runner.ln.LocalAddr().(*net.UDPAddr).AddrPort()
+	sendAndReceive := func() {
+		t.Helper()
+		if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.WriteToUDPAddrPort(payload, forwardAddr); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, len(payload))
+		n, _, err := client.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			t.Fatalf("read quota echo: %v", err)
+		}
+		if string(buf[:n]) != string(payload) {
+			t.Fatalf("quota echo = %q, want %q", buf[:n], payload)
+		}
+	}
+	waitForPeriod := func(period string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			snapshot := ledger.snapshot(rule.RuleID, rule.TrafficQuota)
+			if snapshot != nil && snapshot.Blocked && snapshot.Daily != nil && snapshot.Daily.Period == period && snapshot.Daily.UsedBytes == int64(2*len(payload)) {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("quota period did not become exhausted: %+v", ledger.snapshot(rule.RuleID, rule.TrafficQuota))
+	}
+
+	sendAndReceive()
+	waitForPeriod("2026-08-02")
+	if err := client.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.WriteToUDPAddrPort(payload, forwardAddr); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(payload))
+	if _, _, err := client.ReadFromUDPAddrPort(buf); err == nil {
+		t.Fatal("quota-exhausted UDP datagram unexpectedly received a response")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for collector.Snapshot(rule.RuleID).QuotaRejectedBytes < int64(len(payload)) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := collector.Snapshot(rule.RuleID).QuotaRejectedBytes; got != int64(len(payload)) {
+		t.Fatalf("quota rejected bytes = %d, want %d", got, len(payload))
+	}
+
+	nowUnix.Add(int64(24 * time.Hour / time.Second))
+	sendAndReceive()
+	waitForPeriod("2026-08-03")
 }
 
 func TestUDPForwardsZeroLengthDatagram(t *testing.T) {

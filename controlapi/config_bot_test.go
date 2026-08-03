@@ -95,6 +95,7 @@ func (f *fakeBotController) Running() bool {
 
 func botConfigYAML(token string, chat int64, control string) string {
 	return fmt.Sprintf(`version: 1
+language: zh-CN
 control_port: 19090
 auth:
   enabled: true
@@ -169,6 +170,13 @@ func TestPutBotConfigWritesAndApplies(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "999:xyz") || !strings.Contains(string(raw), "222") {
 		t.Fatalf("config not persisted: %s", raw)
+	}
+	loaded, err := config.Load(rt.ConfigPath)
+	if err != nil {
+		t.Fatalf("load persisted config: %v", err)
+	}
+	if loaded.Language != "zh-CN" {
+		t.Fatalf("bot write changed language = %q", loaded.Language)
 	}
 }
 

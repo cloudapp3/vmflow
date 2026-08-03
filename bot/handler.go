@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	tg "github.com/cloudapp3/tgbot"
@@ -187,30 +188,7 @@ func (b *Bot) handleDetail(ctx context.Context, c *ext.Context) error {
 	}
 
 	snap := b.manager.Snapshot(ruleID)
-	text := fmt.Sprintf(
-		"*Rule Detail*\n\n"+
-			"ID: `%s`\n"+
-			"Name: %s\n"+
-			"Protocol: %s\n"+
-			"Listen: %s:%d\n"+
-			"Target: %s:%d\n"+
-			"Speed Limit: %s\n"+
-			"Max Conns: %s\n\n"+
-			"*Traffic*\n"+
-			"Upload: %s\n"+
-			"Download: %s\n"+
-			"Connections: %d",
-		found.RuleID,
-		found.Name,
-		strings.ToUpper(string(found.Protocol)),
-		found.ListenAddr, found.ListenPort,
-		found.TargetAddr, found.TargetPort,
-		speedLimitStr(found.SpeedLimit),
-		maxConnStr(found.MaxConn),
-		formatBytes(snap.UploadBytes),
-		formatBytes(snap.DownloadBytes),
-		snap.Conns,
-	)
+	text := formatRuleDetail(*found, snap)
 
 	msg := c.EffectiveMessage()
 	_, err := b.bot.SendMessage(ctx, &tg.SendMessageParams{
@@ -668,6 +646,107 @@ func maxConnStr(n int) string {
 		return "unlimited"
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+func formatRuleDetail(rule engine.Rule, snap engine.TrafficSnapshot) string {
+	var text strings.Builder
+	fmt.Fprintf(&text,
+		"*Rule Detail*\n\n"+
+			"ID: `%s`\n"+
+			"Name: %s\n"+
+			"Protocol: %s\n"+
+			"Listen: %s:%d\n"+
+			"Target: %s:%d\n"+
+			"Speed Limit: %s\n"+
+			"Max Conns: %s\n",
+		rule.RuleID,
+		rule.Name,
+		strings.ToUpper(string(rule.Protocol)),
+		rule.ListenAddr, rule.ListenPort,
+		rule.TargetAddr, rule.TargetPort,
+		speedLimitStr(rule.SpeedLimit),
+		maxConnStr(rule.MaxConn),
+	)
+	if rule.Bandwidth != nil {
+		fmt.Fprintf(&text, "Rule Bandwidth: upload %s, download %s\n",
+			aggregateRateStr(rule.Bandwidth.UploadBytesPerSecond()),
+			aggregateRateStr(rule.Bandwidth.DownloadBytesPerSecond()),
+		)
+	}
+	if rule.TrafficQuota != nil {
+		fmt.Fprintf(&text, "Traffic Quota: %s (%s)\n", quotaConfigStr(rule.TrafficQuota), rule.TrafficQuota.Timezone)
+	}
+	fmt.Fprintf(&text,
+		"\n*Traffic*\n"+
+			"Upload: %s\n"+
+			"Download: %s\n"+
+			"Connections: %d",
+		formatBytes(snap.UploadBytes),
+		formatBytes(snap.DownloadBytes),
+		snap.Conns,
+	)
+	if rule.TrafficQuota != nil {
+		status := "active"
+		if snap.Quota != nil && snap.Quota.Blocked {
+			status = "blocked"
+		}
+		fmt.Fprintf(&text, "\nQuota Status: %s", status)
+		if snap.Quota == nil {
+			text.WriteString("\nQuota Usage: unavailable")
+		} else {
+			if snap.Quota.Daily != nil {
+				fmt.Fprintf(&text, "\nDaily Quota: %s", botQuotaPeriodStr(snap.Quota.Daily, rule.TrafficQuota.Timezone))
+			}
+			if snap.Quota.Monthly != nil {
+				fmt.Fprintf(&text, "\nMonthly Quota: %s", botQuotaPeriodStr(snap.Quota.Monthly, rule.TrafficQuota.Timezone))
+			}
+		}
+		fmt.Fprintf(&text, "\nQuota Rejected: %s", formatBytes(snap.QuotaRejectedBytes))
+	}
+	return text.String()
+}
+
+func aggregateRateStr(bytesPerSecond int64) string {
+	if bytesPerSecond <= 0 {
+		return "unlimited"
+	}
+	return engine.ByteRate(bytesPerSecond).String()
+}
+
+func quotaConfigStr(quota *engine.TrafficQuota) string {
+	if quota == nil {
+		return "none"
+	}
+	parts := make([]string, 0, 2)
+	if quota.Daily > 0 {
+		parts = append(parts, "daily "+quota.Daily.String())
+	}
+	if quota.Monthly > 0 {
+		parts = append(parts, "monthly "+quota.Monthly.String())
+	}
+	return strings.Join(parts, ", ")
+}
+
+func botQuotaPeriodStr(period *engine.QuotaPeriodSnapshot, timezone string) string {
+	if period == nil {
+		return "unavailable"
+	}
+	location, err := time.LoadLocation(strings.TrimSpace(timezone))
+	if err != nil {
+		location = time.UTC
+	}
+	status := "active"
+	if period.Exhausted {
+		status = "exhausted"
+	}
+	return fmt.Sprintf(
+		"%s used / %s, %s remaining, resets %s, %s",
+		formatBytes(period.UsedBytes),
+		engine.ByteSize(period.LimitBytes).String(),
+		formatBytes(period.RemainingBytes),
+		time.Unix(period.ResetTime, 0).In(location).Format("2006-01-02 15:04 MST"),
+		status,
+	)
 }
 
 func buildRuleMessages(rules []engine.Rule, statsMap map[string]engine.TrafficSnapshot) []string {

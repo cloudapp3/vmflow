@@ -534,6 +534,39 @@ func TestBuildRuleMessagesSplitsAtTelegramLimit(t *testing.T) {
 	}
 }
 
+func TestFormatRuleDetailIncludesBandwidthAndQuota(t *testing.T) {
+	rule := engine.Rule{
+		RuleID: "limited", Name: "Limited", Protocol: engine.ProtocolTCPUDP,
+		ListenAddr: "127.0.0.1", ListenPort: 2201, TargetAddr: "127.0.0.1", TargetPort: 22,
+		Bandwidth: &engine.BandwidthLimit{Upload: 12_500_000, Download: 25_000_000},
+		TrafficQuota: &engine.TrafficQuota{
+			Daily: 100_000_000_000, Monthly: 1_000_000_000_000, Timezone: "Asia/Shanghai", Action: "block",
+		},
+	}
+	snapshot := engine.TrafficSnapshot{
+		RuleID: "limited", QuotaRejectedBytes: 1024,
+		Quota: &engine.TrafficQuotaSnapshot{
+			Blocked: true,
+			Daily: &engine.QuotaPeriodSnapshot{
+				UsedBytes: 100_000_000_000, LimitBytes: 100_000_000_000, ResetTime: 1_785_686_400, Exhausted: true,
+			},
+			Monthly: &engine.QuotaPeriodSnapshot{
+				UsedBytes: 100_000_000_000, LimitBytes: 1_000_000_000_000, RemainingBytes: 900_000_000_000, ResetTime: 1_788_192_000,
+			},
+		},
+	}
+	text := formatRuleDetail(rule, snapshot)
+	for _, want := range []string{
+		"Rule Bandwidth: upload 100 Mbps, download 200 Mbps",
+		"Traffic Quota: daily 100 GB, monthly 1 TB (Asia/Shanghai)",
+		"Quota Status: blocked", "Daily Quota:", "exhausted", "Monthly Quota:", "Quota Rejected: 1.0K",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("detail omitted %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestSendRuleMessagesReturnsTelegramError(t *testing.T) {
 	recorder := &telegramRecorder{failMethod: "sendMessage"}
 	srv := newFakeTelegramServer(t, recorder)

@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"strings"
 	"time"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
 )
 
 // DNSProvider sets and removes DNS TXT records for ACME dns-01 challenges.
@@ -24,7 +25,7 @@ type DNS01Solver struct {
 	provider            DNSProvider
 	propagationTimeout  time.Duration
 	pollingInterval     time.Duration
-	propagationResolver *net.Resolver
+	propagationResolver *dnsresolver.Resolver
 }
 
 // DNS01Options configures DNS-01 challenge behavior.
@@ -36,6 +37,10 @@ type DNS01Options struct {
 	// PollingInterval is how often to check for DNS propagation.
 	// Defaults to 5 seconds.
 	PollingInterval time.Duration
+
+	// Resolver controls TXT propagation lookups. Nil uses vmflow's automatic
+	// system-first failover policy.
+	Resolver *dnsresolver.Resolver
 }
 
 // NewDNS01Solver creates a DNS-01 challenge solver backed by the given provider.
@@ -47,13 +52,9 @@ func NewDNS01Solver(provider DNSProvider, opts DNS01Options) *DNS01Solver {
 		opts.PollingInterval = 5 * time.Second
 	}
 
-	// Use a public DNS resolver for propagation checks
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
-			return d.DialContext(ctx, "udp", "8.8.8.8:53")
-		},
+	resolver := opts.Resolver
+	if resolver == nil {
+		resolver = dnsresolver.New()
 	}
 
 	return &DNS01Solver{
@@ -96,7 +97,7 @@ func (s *DNS01Solver) PropagationWait(ctx context.Context, fqdn, expectedValue s
 		default:
 		}
 
-		// Look up TXT records using public DNS
+		// Use the shared automatic DNS policy for propagation checks.
 		records, err := s.propagationResolver.LookupTXT(ctx, fqdn)
 		if err == nil {
 			for _, r := range records {

@@ -1,6 +1,7 @@
 package precheck
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cloudapp3/vmflow/config"
+	"github.com/cloudapp3/vmflow/dnsresolver"
 	"github.com/cloudapp3/vmflow/engine"
 )
 
@@ -72,6 +74,7 @@ func CheckConfig(cfg config.File, running []engine.Rule, opts Options) Result {
 		seen:             make(map[string]struct{}, len(cfg.Rules)),
 		endpoints:        newEndpointIndex(),
 		runningEndpoints: indexRunningEndpoints(running),
+		resolver:         dnsresolver.New(),
 	}
 	checker.checkRules()
 	checker.checkACME()
@@ -100,6 +103,7 @@ type checker struct {
 	items            []Item
 	errors           int
 	warnings         int
+	resolver         *dnsresolver.Resolver
 }
 
 type endpoint struct {
@@ -231,15 +235,17 @@ func (c *checker) checkBind(ep endpoint) {
 }
 
 func (c *checker) checkTargetResolve(rule engine.Rule) {
+	ctx := context.Background()
+	target := net.JoinHostPort(rule.TargetAddr, strconv.Itoa(rule.TargetPort))
 	switch rule.Protocol {
 	case engine.ProtocolHTTP:
 		return
 	case engine.ProtocolUDP:
-		if _, err := net.ResolveUDPAddr("udp", net.JoinHostPort(rule.TargetAddr, strconv.Itoa(rule.TargetPort))); err != nil {
+		if _, err := c.resolver.ResolveUDPAddr(ctx, "udp", target); err != nil {
 			c.addError("target_resolve", rule.RuleID, fmt.Sprintf("cannot resolve udp target: %v", err))
 		}
 	default:
-		if _, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(rule.TargetAddr, strconv.Itoa(rule.TargetPort))); err != nil {
+		if _, err := c.resolver.ResolveTCPAddr(ctx, "tcp", target); err != nil {
 			c.addError("target_resolve", rule.RuleID, fmt.Sprintf("cannot resolve tcp target: %v", err))
 		}
 	}

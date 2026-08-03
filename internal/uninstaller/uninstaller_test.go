@@ -3,13 +3,19 @@
 package uninstaller
 
 import (
+	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/appdirs"
 	"github.com/cloudapp3/vmflow/internal/clientconfig"
+	"github.com/cloudapp3/vmflow/internal/i18n"
+	"github.com/cloudapp3/vmflow/internal/service"
 	"github.com/cloudapp3/vmflow/internal/statsstore"
 )
 
@@ -64,25 +70,32 @@ func TestCleanupPathsFromConfigUnparseable(t *testing.T) {
 	}
 }
 
-func TestColocatedConfigRequiresOwnershipMarker(t *testing.T) {
-	dir := t.TempDir()
-	binaryPath := filepath.Join(dir, "vmflow")
-	configPath := filepath.Join(dir, colocatedConfigName)
-	markerPath := filepath.Join(dir, colocatedConfigMarkerName)
+func TestAppendManagedConfigPlanRequiresOwnershipMarker(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	configPath, err := appdirs.UserConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(dir, appdirs.ManagedMarkerName)
 	if err := os.WriteFile(configPath, []byte("version: 1\nrules: []\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	gotConfig, gotMarker, owned := colocatedConfig(binaryPath)
-	if gotConfig != configPath || gotMarker != markerPath || owned {
-		t.Fatalf("colocatedConfig without marker = (%q, %q, %v)", gotConfig, gotMarker, owned)
+	items, warnings := appendManagedConfigPlan(nil, nil, configPath)
+	if len(items) != 0 || !strings.Contains(strings.Join(warnings, "\n"), appdirs.ManagedMarkerName) {
+		t.Fatalf("unmarked config plan = %+v, warnings = %v", items, warnings)
 	}
 	if err := os.WriteFile(markerPath, []byte("vmflow\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, owned = colocatedConfig(binaryPath)
-	if !owned {
-		t.Fatal("regular ownership marker was not recognized")
+	items, warnings = appendManagedConfigPlan(nil, nil, configPath)
+	if len(warnings) != 0 || len(items) != 1 || items[0].Kind != kindManagedConfig || items[0].Path != dir {
+		t.Fatalf("managed config plan = %+v, warnings = %v", items, warnings)
 	}
 	if err := os.Remove(markerPath); err != nil {
 		t.Fatal(err)
@@ -90,9 +103,97 @@ func TestColocatedConfigRequiresOwnershipMarker(t *testing.T) {
 	if err := os.Symlink(configPath, markerPath); err != nil {
 		t.Fatal(err)
 	}
-	_, _, owned = colocatedConfig(binaryPath)
-	if owned {
-		t.Fatal("symlink ownership marker must not be trusted")
+	items, _ = appendManagedConfigPlan(nil, nil, configPath)
+	if len(items) != 0 {
+		t.Fatalf("symlink marker was trusted: %+v", items)
+	}
+}
+
+func TestManagedConfigDirectoryPlanCoversContainedStatsAndClientProfile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	configPath, err := appdirs.UserConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("version: 1\nrules: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, appdirs.ManagedMarkerName), []byte("vmflow\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statsPath := filepath.Join(dir, statsstore.DefaultFilename)
+	if err := statsstore.New(statsPath).Save(nil); err != nil {
+		t.Fatal(err)
+	}
+	profilePath := filepath.Join(dir, "client.yaml")
+	if err := clientconfig.Save(profilePath, clientconfig.Profile{Address: "http://127.0.0.1:19090", Token: "secret-token", ConfigPath: configPath}); err != nil {
+		t.Fatal(err)
+	}
+
+	items, warnings := appendManagedConfigPlan(nil, nil, configPath)
+	items, warnings = appendStatsPlan(items, warnings, statsPath)
+	items, warnings = appendClientProfilePlan(items, warnings, profilePath)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	if len(items) != 1 || items[0].Kind != kindManagedConfig || items[0].Path != dir {
+		t.Fatalf("contained paths produced duplicate plan items: %+v", items)
+	}
+}
+
+func TestManagedConfigDirectoryPreservesReferencedTLSInsideDirectory(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	configPath, err := appdirs.UserConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	certPath := filepath.Join(dir, "control.crt")
+	keyPath := filepath.Join(dir, "control.key")
+	for _, path := range []string{certPath, keyPath} {
+		if err := os.WriteFile(path, []byte("external TLS material\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configBody := "version: 1\ncontrol_tls:\n  cert_file: " + certPath + "\n  key_file: " + keyPath + "\nrules: []\n"
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, appdirs.ManagedMarkerName), []byte("vmflow\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	items, warnings := appendManagedConfigPlan(nil, nil, configPath)
+	if len(items) != 0 || !strings.Contains(strings.Join(warnings, "\n"), certPath) {
+		t.Fatalf("referenced TLS plan = %+v, warnings = %v", items, warnings)
+	}
+	if err := Execute(io.Discard, []Item{{Kind: kindManagedConfig, Path: dir}}); err == nil {
+		t.Fatal("execution did not recheck referenced TLS")
+	}
+	for _, path := range []string{configPath, certPath, keyPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preserved path %s changed: %v", path, err)
+		}
+	}
+}
+
+func TestPlanRemovesPathDoesNotTreatSiblingPrefixAsChild(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "vmflow")
+	items := []Item{{Kind: kindManagedConfig, Path: dir}}
+	if !planRemovesPath(items, filepath.Join(dir, "client.yaml")) {
+		t.Fatal("managed directory did not cover a child path")
+	}
+	if planRemovesPath(items, dir+"-backup/config.yaml") {
+		t.Fatal("sibling path sharing a prefix was treated as a child")
 	}
 }
 
@@ -204,6 +305,31 @@ func TestExecuteStatsFileRevalidatesBeforeRemoval(t *testing.T) {
 	}
 	if !pathLexists(statsPath) {
 		t.Fatal("changed stats file was removed")
+	}
+}
+
+func TestExecuteQuotaFileRevalidatesBeforeRemoval(t *testing.T) {
+	dir := t.TempDir()
+	quotaPath := filepath.Join(dir, statsstore.DefaultQuotaFilename)
+	store := statsstore.NewQuotaStore(quotaPath)
+	if err := store.SaveQuotaState([]engine.QuotaPersistentState{{RuleID: "limited", Daily: map[string]int64{"2026-08-02": 10}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Execute(io.Discard, []Item{{Kind: kindQuotaFile, Path: quotaPath}}); err != nil {
+		t.Fatalf("remove valid quota state: %v", err)
+	}
+	if pathLexists(quotaPath) {
+		t.Fatal("valid quota state was not removed")
+	}
+
+	if err := os.WriteFile(quotaPath, []byte("not vmflow quota state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Execute(io.Discard, []Item{{Kind: kindQuotaFile, Path: quotaPath}}); err == nil {
+		t.Fatal("changed quota state should not be removed")
+	}
+	if !pathLexists(quotaPath) {
+		t.Fatal("changed quota state was removed")
 	}
 }
 
@@ -336,6 +462,45 @@ func TestExecuteRemovesFilesAndDirs(t *testing.T) {
 	}
 }
 
+func TestExecuteStopsBeforeRemovingFilesWhenServiceUninstallFails(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	binaryPath := filepath.Join(dir, "vmflow")
+	for _, path := range []string{configPath, binaryPath} {
+		if err := os.WriteFile(path, []byte("keep\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items := []Item{
+		{Kind: kindFile, Path: configPath},
+		{Kind: kindService},
+		{Kind: kindBinary, Path: binaryPath},
+	}
+	serviceCalls := 0
+	var output bytes.Buffer
+	err := executeWithServiceUninstaller(&output, items, i18n.New(i18n.English), func(cfg service.Config, w io.Writer) error {
+		serviceCalls++
+		if cfg.ServiceName != service.DefaultServiceName {
+			t.Fatalf("service name = %q", cfg.ServiceName)
+		}
+		return errors.New("stop failed")
+	})
+	if err == nil || !strings.Contains(err.Error(), "stopped before file removal") {
+		t.Fatalf("service uninstall error = %v", err)
+	}
+	if serviceCalls != 1 {
+		t.Fatalf("service uninstall calls = %d, want 1", serviceCalls)
+	}
+	for _, path := range []string{configPath, binaryPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s changed after service stop failure: %v", path, err)
+		}
+	}
+	if got := output.String(); !strings.Contains(got, "native service may still be running") || strings.Contains(got, "removed ") {
+		t.Fatalf("unexpected fail-closed output:\n%s", got)
+	}
+}
+
 func TestExecuteIsIdempotent(t *testing.T) {
 	// Removing a non-existent path is not an error.
 	items := []Item{
@@ -382,32 +547,48 @@ func TestExecuteRefusesDirectoryPresentedAsFile(t *testing.T) {
 	}
 }
 
-func TestExecuteOwnedConfigRechecksMarker(t *testing.T) {
+func TestExecuteManagedConfigRechecksMarker(t *testing.T) {
 	t.Run("regular marker", func(t *testing.T) {
-		dir := t.TempDir()
-		cfg := filepath.Join(dir, colocatedConfigName)
-		marker := filepath.Join(dir, colocatedConfigMarkerName)
+		root := t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", root)
+		cfg, err := appdirs.UserConfigPath()
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Dir(cfg)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(dir, appdirs.ManagedMarkerName)
 		if err := os.WriteFile(cfg, []byte("version: 1\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(marker, []byte("vmflow\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := Execute(io.Discard, []Item{{Kind: kindOwnedConfig, Path: cfg}}); err != nil {
+		if err := Execute(io.Discard, []Item{{Kind: kindManagedConfig, Path: dir}}); err != nil {
 			t.Fatalf("Execute: %v", err)
 		}
-		if pathLexists(cfg) {
-			t.Fatal("owned config should have been removed")
+		if pathLexists(dir) {
+			t.Fatal("managed config directory should have been removed")
 		}
 	})
 
 	t.Run("marker removed after planning", func(t *testing.T) {
-		dir := t.TempDir()
-		cfg := filepath.Join(dir, colocatedConfigName)
+		root := t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", root)
+		cfg, err := appdirs.UserConfigPath()
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Dir(cfg)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(cfg, []byte("version: 1\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := Execute(io.Discard, []Item{{Kind: kindOwnedConfig, Path: cfg}}); err == nil {
+		if err := Execute(io.Discard, []Item{{Kind: kindManagedConfig, Path: dir}}); err == nil {
 			t.Fatal("expected changed marker to block config removal")
 		}
 		if !pathLexists(cfg) {
@@ -416,16 +597,24 @@ func TestExecuteOwnedConfigRechecksMarker(t *testing.T) {
 	})
 
 	t.Run("marker replaced by symlink", func(t *testing.T) {
-		dir := t.TempDir()
-		cfg := filepath.Join(dir, colocatedConfigName)
-		marker := filepath.Join(dir, colocatedConfigMarkerName)
+		root := t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", root)
+		cfg, err := appdirs.UserConfigPath()
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Dir(cfg)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(dir, appdirs.ManagedMarkerName)
 		if err := os.WriteFile(cfg, []byte("version: 1\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(cfg, marker); err != nil {
 			t.Fatal(err)
 		}
-		if err := Execute(io.Discard, []Item{{Kind: kindOwnedConfig, Path: cfg}}); err == nil {
+		if err := Execute(io.Discard, []Item{{Kind: kindManagedConfig, Path: dir}}); err == nil {
 			t.Fatal("expected symlink marker to block config removal")
 		}
 		if !pathLexists(cfg) {
@@ -470,6 +659,35 @@ func TestConfirm(t *testing.T) {
 		if got != c.want {
 			t.Errorf("Confirm(%q)=%v want %v", c.in, got, c.want)
 		}
+	}
+}
+
+func TestPrintWithTranslatorLocalizesPlanAndPreservesDiagnostics(t *testing.T) {
+	var output bytes.Buffer
+	PrintWithTranslator(&output, []Item{
+		{Kind: kindService, Note: "stop and remove native service (systemd / launchd / Windows Service)"},
+		{Kind: kindBinary, Path: "/usr/local/bin/vmflow", Note: "vmflow binary", Self: true},
+	}, []string{"diagnostic text"}, i18n.New(i18n.SimplifiedChinese))
+
+	got := output.String()
+	for _, want := range []string{"警告：", "diagnostic text", "将删除以下内容：", "停止并删除原生系统服务", "/usr/local/bin/vmflow", "vmflow 二进制"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("localized uninstall plan missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestConfirmWithTranslatorAcceptsChineseYes(t *testing.T) {
+	var output bytes.Buffer
+	confirmed, err := ConfirmWithTranslator(&output, strings.NewReader("是\n"), i18n.New(i18n.SimplifiedChinese))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !confirmed {
+		t.Fatal("Chinese affirmative response was not accepted")
+	}
+	if got := output.String(); !strings.Contains(got, "确认卸载") {
+		t.Fatalf("Chinese confirmation prompt = %q", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/cloudapp3/vmflow/internal/uninstaller"
 )
 
@@ -13,39 +14,42 @@ import (
 // binary, and owned config/log/cache artifacts. External TLS files are kept.
 // `--dry-run` prints the plan without removing anything.
 func runUninstall(args []string) {
+	runUninstallWithTranslator(args, defaultTranslator())
+}
+
+func runUninstallWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage:\n  vmflow uninstall [--dry-run]\n\n")
-		fmt.Fprintf(fs.Output(), "Removes the native service, the vmflow binary, and purges config, logs,\n")
-		fmt.Fprintf(fs.Output(), "vmflow-owned cache artifacts, and the self-update cache. External TLS files are preserved.\n\nOptions:\n")
+		fmt.Fprintln(fs.Output(), translator.T("cli.uninstall.usage"))
 		fs.PrintDefaults()
 	}
 	var dryRun bool
-	fs.BoolVar(&dryRun, "dry-run", false, "print what would be removed without removing it")
+	fs.BoolVar(&dryRun, "dry-run", false, translator.T("cli.uninstall.flag.dry_run"))
 	fs.Parse(args)
 	if extra := fs.Args(); len(extra) != 0 {
-		fmt.Fprintf(os.Stderr, "unexpected argument(s): %v\n", extra)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.error.unexpected_arguments", extra))
 		os.Exit(1)
 	}
 
 	items, warnings := uninstaller.Plan()
-	uninstaller.Print(os.Stdout, items, warnings)
+	uninstaller.PrintWithTranslator(os.Stdout, items, warnings, translator)
 
 	if dryRun || len(items) == 0 {
 		return
 	}
 
-	ok, err := uninstaller.Confirm(os.Stdout, os.Stdin)
+	ok, err := uninstaller.ConfirmWithTranslator(os.Stdout, os.Stdin, translator)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "confirm: %v\n", err)
+		fmt.Fprintln(os.Stderr, translator.Tf("cli.uninstall.error.confirm", err))
 		os.Exit(1)
 	}
 	if !ok {
-		fmt.Println("aborted")
+		fmt.Fprintln(os.Stdout, translator.T("cli.uninstall.aborted"))
 		return
 	}
 
-	if err := uninstaller.Execute(os.Stdout, items); err != nil {
+	if err := uninstaller.ExecuteWithTranslator(os.Stdout, items, translator); err != nil {
 		os.Exit(1)
 	}
 }

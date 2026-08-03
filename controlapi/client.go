@@ -12,25 +12,18 @@ import (
 	"time"
 
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/netinfo"
 	"github.com/cloudapp3/vmflow/precheck"
 )
 
 // API response types.
 
 type StatsResponse struct {
-	Items []TrafficSnapshot `json:"items"`
+	Items       []TrafficSnapshot `json:"items"`
+	HostNetwork *netinfo.Snapshot `json:"host_network,omitempty"`
 }
 
-type TrafficSnapshot struct {
-	RuleID             string `json:"rule_id"`
-	UploadBytes        int64  `json:"upload_bytes"`
-	DownloadBytes      int64  `json:"download_bytes"`
-	Conns              int64  `json:"conns"`
-	SourceIPDenied     int64  `json:"source_ip_denied_total,omitempty"`
-	UDPSessionRejected int64  `json:"udp_session_rejected_total,omitempty"`
-	UDPPacketsDropped  int64  `json:"udp_packets_dropped_total,omitempty"`
-	UpdatedTime        int64  `json:"updated_time"`
-}
+type TrafficSnapshot = engine.TrafficSnapshot
 
 // RulesResponse is the legacy runtime-only rule endpoint. ConfigRulesResponse
 // is the source of truth for management because it also contains disabled
@@ -441,6 +434,14 @@ func CloneRules(rules []engine.Rule) []engine.Rule {
 	for index := range result {
 		result[index].Domains = append([]string(nil), rules[index].Domains...)
 		result[index].SourceIPs = append([]string(nil), rules[index].SourceIPs...)
+		if rules[index].Bandwidth != nil {
+			value := *rules[index].Bandwidth
+			result[index].Bandwidth = &value
+		}
+		if rules[index].TrafficQuota != nil {
+			value := *rules[index].TrafficQuota
+			result[index].TrafficQuota = &value
+		}
 	}
 	return result
 }

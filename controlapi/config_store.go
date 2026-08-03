@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -118,7 +119,11 @@ func (document *configDocument) BuildCandidate(draft rulesConfigDraft) (*configC
 
 	// Parse and render twice. The first pass validates and standardizes draft
 	// rules through config.Parse; the second persists those normalized values.
-	firstRaw, err := renderManagedConfig(document.raw, draft.Rules, draft.UDPMaxSessions)
+	source := rulesConfigDraft{
+		Rules:          document.Config.Rules,
+		UDPMaxSessions: document.Config.UDPMaxSessions,
+	}
+	firstRaw, err := renderManagedConfig(document.raw, source, draft)
 	if err != nil {
 		return nil, fmt.Errorf("build config candidate: %w", err)
 	}
@@ -127,7 +132,11 @@ func (document *configDocument) BuildCandidate(draft rulesConfigDraft) (*configC
 		return nil, fmt.Errorf("build config candidate: validate candidate: %w", err)
 	}
 
-	raw, err := renderManagedConfig(document.raw, firstConfig.Rules, firstConfig.UDPMaxSessions)
+	normalized := rulesConfigDraft{
+		Rules:          firstConfig.Rules,
+		UDPMaxSessions: firstConfig.UDPMaxSessions,
+	}
+	raw, err := renderManagedConfig(document.raw, source, normalized)
 	if err != nil {
 		return nil, fmt.Errorf("build config candidate: render normalized candidate: %w", err)
 	}
@@ -357,28 +366,31 @@ func configRevision(raw []byte) string {
 	return fmt.Sprintf("sha256:%x", sum)
 }
 
-func renderManagedConfig(source []byte, rules []engine.Rule, udpMaxSessions int) ([]byte, error) {
+func renderManagedConfig(source []byte, current, desired rulesConfigDraft) ([]byte, error) {
+	rulesChanged := !rulesYAMLEqual(current.Rules, desired.Rules)
+	udpChanged := current.UDPMaxSessions != desired.UDPMaxSessions
+	if !rulesChanged && !udpChanged {
+		return append([]byte(nil), source...), nil
+	}
+
 	document, err := parseYAMLDocument(source)
 	if err != nil {
 		return nil, err
 	}
 	root := document.Content[0]
 
-	normalizedRules := append([]engine.Rule(nil), rules...)
-	if normalizedRules == nil {
-		normalizedRules = []engine.Rule{}
+	if rulesChanged {
+		if err := mergeRulesYAML(root, current.Rules, desired.Rules); err != nil {
+			return nil, fmt.Errorf("merge rules: %w", err)
+		}
 	}
-	rulesNode, err := encodeYAMLNode(normalizedRules)
-	if err != nil {
-		return nil, fmt.Errorf("encode rules: %w", err)
+	if udpChanged {
+		udpNode, err := encodeYAMLNode(desired.UDPMaxSessions)
+		if err != nil {
+			return nil, fmt.Errorf("encode udp_max_sessions: %w", err)
+		}
+		setTopLevelYAMLNode(root, "udp_max_sessions", udpNode)
 	}
-	udpNode, err := encodeYAMLNode(udpMaxSessions)
-	if err != nil {
-		return nil, fmt.Errorf("encode udp_max_sessions: %w", err)
-	}
-
-	setTopLevelYAMLNode(root, "rules", rulesNode)
-	setTopLevelYAMLNode(root, "udp_max_sessions", udpNode)
 
 	var output bytes.Buffer
 	encoder := yaml.NewEncoder(&output)
@@ -390,6 +402,225 @@ func renderManagedConfig(source []byte, rules []engine.Rule, udpMaxSessions int)
 		return nil, err
 	}
 	return output.Bytes(), nil
+}
+
+type ruleYAMLField struct {
+	name  string
+	index int
+}
+
+var managedRuleYAMLFields = func() []ruleYAMLField {
+	ruleType := reflect.TypeOf(engine.Rule{})
+	fields := make([]ruleYAMLField, 0, ruleType.NumField())
+	for index := 0; index < ruleType.NumField(); index++ {
+		field := ruleType.Field(index)
+		name := strings.Split(field.Tag.Get("yaml"), ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		fields = append(fields, ruleYAMLField{name: name, index: index})
+	}
+	return fields
+}()
+
+func rulesYAMLEqual(current, desired []engine.Rule) bool {
+	if len(current) != len(desired) {
+		return false
+	}
+	for index := range current {
+		if !reflect.DeepEqual(current[index], desired[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeRulesYAML(root *yaml.Node, current, desired []engine.Rule) error {
+	rulesNode, found := yamlMappingValue(root, "rules")
+	if !found {
+		replacement, err := encodeYAMLNode(nonNilRules(desired))
+		if err != nil {
+			return fmt.Errorf("encode rules: %w", err)
+		}
+		setTopLevelYAMLNode(root, "rules", replacement)
+		return nil
+	}
+	if rulesNode.Kind == yaml.AliasNode {
+		return fmt.Errorf("top-level rules alias cannot be edited safely")
+	}
+	if rulesNode.Kind == yaml.ScalarNode && rulesNode.Tag == "!!null" && len(current) == 0 {
+		replacement, err := encodeYAMLNode(nonNilRules(desired))
+		if err != nil {
+			return fmt.Errorf("encode rules: %w", err)
+		}
+		setTopLevelYAMLNode(root, "rules", replacement)
+		return nil
+	}
+	if rulesNode.Kind != yaml.SequenceNode {
+		return fmt.Errorf("rules YAML node must be a sequence")
+	}
+
+	currentByID := make(map[string]engine.Rule, len(current))
+	for _, rule := range current {
+		currentByID[rule.RuleID] = rule
+	}
+	nodeByID := make(map[string]*yaml.Node, len(rulesNode.Content))
+	for _, node := range rulesNode.Content {
+		ruleID, err := yamlRuleID(node)
+		if err != nil {
+			return err
+		}
+		if _, duplicate := nodeByID[ruleID]; duplicate {
+			return fmt.Errorf("duplicate rule id in YAML: %s", ruleID)
+		}
+		nodeByID[ruleID] = node
+	}
+
+	merged := make([]*yaml.Node, 0, len(desired))
+	seen := make(map[string]struct{}, len(desired))
+	for _, rule := range desired {
+		ruleID := strings.TrimSpace(rule.RuleID)
+		if _, duplicate := seen[ruleID]; duplicate {
+			return fmt.Errorf("duplicate rule id: %s", ruleID)
+		}
+		seen[ruleID] = struct{}{}
+
+		currentRule, exists := currentByID[ruleID]
+		node, nodeExists := nodeByID[ruleID]
+		if exists != nodeExists {
+			return fmt.Errorf("rule %q does not match source YAML", ruleID)
+		}
+		if !exists {
+			encoded, err := encodeYAMLNode(rule)
+			if err != nil {
+				return fmt.Errorf("encode rule %q: %w", ruleID, err)
+			}
+			merged = append(merged, encoded)
+			continue
+		}
+		if node.Kind == yaml.AliasNode {
+			if !reflect.DeepEqual(currentRule, rule) {
+				return fmt.Errorf("rule %q is a YAML alias and cannot be edited safely", ruleID)
+			}
+			merged = append(merged, node)
+			continue
+		}
+		if node.Kind != yaml.MappingNode {
+			return fmt.Errorf("rule %q YAML node must be a mapping", ruleID)
+		}
+		if err := mergeRuleYAML(node, currentRule, rule); err != nil {
+			return fmt.Errorf("rule %q: %w", ruleID, err)
+		}
+		merged = append(merged, node)
+	}
+	rulesNode.Content = merged
+	return nil
+}
+
+func mergeRuleYAML(node *yaml.Node, current, desired engine.Rule) error {
+	currentValue := reflect.ValueOf(current)
+	desiredValue := reflect.ValueOf(desired)
+	for _, field := range managedRuleYAMLFields {
+		before := currentValue.Field(field.index)
+		after := desiredValue.Field(field.index)
+		if reflect.DeepEqual(before.Interface(), after.Interface()) {
+			continue
+		}
+		if after.Kind() == reflect.Slice && after.IsNil() {
+			after = reflect.MakeSlice(after.Type(), 0, 0)
+		}
+		replacement, err := encodeYAMLNode(after.Interface())
+		if err != nil {
+			return fmt.Errorf("encode %s: %w", field.name, err)
+		}
+		setYAMLMappingNode(node, field.name, replacement)
+	}
+	return nil
+}
+
+func yamlRuleID(node *yaml.Node) (string, error) {
+	var identity struct {
+		RuleID string `yaml:"rule_id"`
+	}
+	if err := node.Decode(&identity); err != nil {
+		return "", fmt.Errorf("decode rule identity: %w", err)
+	}
+	ruleID := strings.TrimSpace(identity.RuleID)
+	if ruleID == "" {
+		return "", fmt.Errorf("rule YAML node is missing rule_id")
+	}
+	return ruleID, nil
+}
+
+func yamlMappingValue(mapping *yaml.Node, key string) (*yaml.Node, bool) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil, false
+	}
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			return mapping.Content[index+1], true
+		}
+	}
+	return nil, false
+}
+
+func setYAMLMappingNode(mapping *yaml.Node, key string, replacement *yaml.Node) {
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value != key {
+			continue
+		}
+		keyNode := mapping.Content[index]
+		previous := mapping.Content[index+1]
+		if keyNode.LineComment != "" && previous.LineComment == "" && replacement.LineComment == "" {
+			replacement.LineComment = keyNode.LineComment
+			keyNode.LineComment = ""
+		}
+		mapping.Content[index+1] = replaceYAMLNode(previous, replacement)
+		return
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		replacement,
+	)
+}
+
+func replaceYAMLNode(previous, replacement *yaml.Node) *yaml.Node {
+	previousKind := previous.Kind
+	headComment := previous.HeadComment
+	lineComment := previous.LineComment
+	footComment := previous.FootComment
+	if replacement.HeadComment != "" {
+		headComment = replacement.HeadComment
+	}
+	if replacement.LineComment != "" {
+		lineComment = replacement.LineComment
+	}
+	if replacement.FootComment != "" {
+		footComment = replacement.FootComment
+	}
+	style := previous.Style
+	anchor := previous.Anchor
+
+	if previousKind == yaml.AliasNode {
+		replacement.HeadComment = headComment
+		replacement.LineComment = lineComment
+		replacement.FootComment = footComment
+		return replacement
+	}
+	*previous = *replacement
+	previous.HeadComment = headComment
+	previous.LineComment = lineComment
+	previous.FootComment = footComment
+	if previous.Kind == previousKind {
+		previous.Style = style
+	}
+	if (previous.Kind == yaml.SequenceNode || previous.Kind == yaml.MappingNode) && len(previous.Content) == 0 {
+		previous.Style = yaml.FlowStyle
+	}
+	if previous.Anchor == "" {
+		previous.Anchor = anchor
+	}
+	return previous
 }
 
 func parseYAMLDocument(raw []byte) (*yaml.Node, error) {
@@ -420,22 +651,5 @@ func encodeYAMLNode(value any) (*yaml.Node, error) {
 }
 
 func setTopLevelYAMLNode(root *yaml.Node, key string, replacement *yaml.Node) {
-	for index := 0; index+1 < len(root.Content); index += 2 {
-		if root.Content[index].Value != key {
-			continue
-		}
-		previous := root.Content[index+1]
-		replacement.HeadComment = previous.HeadComment
-		replacement.LineComment = previous.LineComment
-		replacement.FootComment = previous.FootComment
-		if replacement.Kind == previous.Kind {
-			replacement.Style = previous.Style
-		}
-		root.Content[index+1] = replacement
-		return
-	}
-	root.Content = append(root.Content,
-		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
-		replacement,
-	)
+	setYAMLMappingNode(root, key, replacement)
 }

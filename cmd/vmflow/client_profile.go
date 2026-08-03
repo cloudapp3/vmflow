@@ -8,6 +8,7 @@ import (
 
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/internal/clientconfig"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 )
 
 type managementDefaults struct {
@@ -19,6 +20,11 @@ type managementDefaults struct {
 }
 
 func loadManagementDefaults(w io.Writer) managementDefaults {
+	return loadManagementDefaultsWithTranslator(w, defaultTranslator())
+}
+
+func loadManagementDefaultsWithTranslator(w io.Writer, translator *i18n.Translator) managementDefaults {
+	translator = translatorOrEnglish(translator)
 	defaults := managementDefaults{
 		Address: "http://" + config.DefaultControlListenAddr,
 		Token:   strings.TrimSpace(os.Getenv("VMFLOW_CONTROL_TOKEN")),
@@ -32,7 +38,7 @@ func loadManagementDefaults(w io.Writer) managementDefaults {
 	defaults.ProfilePath = path
 	if err != nil {
 		if !os.IsNotExist(err) && w != nil {
-			fmt.Fprintf(w, "warning: client profile ignored: %v\n", err)
+			fmt.Fprintf(w, "%s\n", translator.Tf("cli.client_profile.warning_ignored", err))
 		}
 		return defaults
 	}

@@ -153,7 +153,7 @@ func TestRulesConfigPutPersistsAndReturnsNewRevision(t *testing.T) {
 	runtime, handler, configPath := newManagementTestHandler(t, managementConfig("old-rule"))
 	defer runtime.Manager.StopAll()
 	get := authenticatedManagementRequest(t, handler, http.MethodGet, "/v1/config/rules", "", "")
-	body := `{"udp_max_sessions":128,"rules":[{"rule_id":"new-rule","name":"new rule","protocol":"udp","listen_addr":"127.0.0.1","listen_port":24002,"target_addr":"127.0.0.1","target_port":53,"enabled":false,"source_ip_mode":"allowlist","source_ips":["127.0.0.1","2001:db8::/32"],"remark":"managed"}]}`
+	body := `{"udp_max_sessions":128,"rules":[{"rule_id":"new-rule","name":"new rule","protocol":"udp","listen_addr":"127.0.0.1","listen_port":24002,"target_addr":"127.0.0.1","target_port":53,"enabled":false,"bandwidth_limit":{"rate":"100 Mbps"},"traffic_quota":{"daily":"100 GB","monthly":"1 TiB","timezone":"Asia/Shanghai"},"source_ip_mode":"allowlist","source_ips":["127.0.0.1","2001:db8::/32"],"remark":"managed"}]}`
 	put := authenticatedManagementRequest(t, handler, http.MethodPut, "/v1/config/rules", body, get.Header().Get("ETag"))
 	if put.Code != http.StatusOK {
 		t.Fatalf("put status = %d, want 200; body=%s", put.Code, put.Body.String())
@@ -168,8 +168,14 @@ func TestRulesConfigPutPersistsAndReturnsNewRevision(t *testing.T) {
 	if loaded.UDPMaxSessions != 128 || len(loaded.Rules) != 1 || loaded.Rules[0].RuleID != "new-rule" {
 		t.Fatalf("persisted configuration = %+v", loaded)
 	}
+	if loaded.Language != "zh-CN" {
+		t.Fatalf("managed rule write changed language = %q", loaded.Language)
+	}
 	if loaded.Rules[0].SourceIPMode != engine.SourceIPModeAllowlist || len(loaded.Rules[0].SourceIPs) != 2 {
 		t.Fatalf("persisted source IP policy = %+v", loaded.Rules[0])
+	}
+	if loaded.Rules[0].Bandwidth == nil || loaded.Rules[0].Bandwidth.Rate != 12_500_000 || loaded.Rules[0].TrafficQuota == nil || loaded.Rules[0].TrafficQuota.Daily != 100_000_000_000 || loaded.Rules[0].TrafficQuota.Monthly != 1<<40 || loaded.Rules[0].TrafficQuota.Action != "block" {
+		t.Fatalf("persisted traffic controls = %+v", loaded.Rules[0])
 	}
 	if loaded.Rules[0].Revision != 1 || loaded.Rules[0].CreatedTime == 0 || loaded.Rules[0].UpdatedTime == 0 {
 		t.Fatalf("server metadata was not assigned: %+v", loaded.Rules[0])
@@ -181,14 +187,27 @@ func TestRulesConfigPutPersistsAndReturnsNewRevision(t *testing.T) {
 	if !strings.Contains(string(raw), "custom_unknown: preserved") || !strings.Contains(string(raw), "# preserve this comment") {
 		t.Fatalf("managed write discarded unmanaged YAML content:\n%s", raw)
 	}
+	for _, want := range []string{"rate: 100 Mbps", "daily: 100 GB", "monthly: 1 TiB", "timezone: Asia/Shanghai", "action: block"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("managed write omitted %q:\n%s", want, raw)
+		}
+	}
 }
 
-func TestCloneRulesDeepCopiesSourceIPs(t *testing.T) {
-	original := []engine.Rule{{RuleID: "one", SourceIPs: []string{"192.0.2.1"}}}
+func TestCloneRulesDeepCopiesNestedRuleData(t *testing.T) {
+	original := []engine.Rule{{
+		RuleID: "one", SourceIPs: []string{"192.0.2.1"},
+		Bandwidth: &engine.BandwidthLimit{Rate: 12_500_000},
+		TrafficQuota: &engine.TrafficQuota{
+			Daily: 100_000_000_000, Timezone: "UTC", Action: "block",
+		},
+	}}
 	cloned := CloneRules(original)
 	cloned[0].SourceIPs[0] = "198.51.100.1"
-	if original[0].SourceIPs[0] != "192.0.2.1" {
-		t.Fatalf("CloneRules shared source IP storage: %+v", original)
+	cloned[0].Bandwidth.Rate = 1
+	cloned[0].TrafficQuota.Daily = 1
+	if original[0].SourceIPs[0] != "192.0.2.1" || original[0].Bandwidth.Rate != 12_500_000 || original[0].TrafficQuota.Daily != 100_000_000_000 {
+		t.Fatalf("CloneRules shared nested storage: %+v", original)
 	}
 }
 
@@ -436,6 +455,7 @@ func authenticatedManagementRequest(t *testing.T, handler http.Handler, method, 
 func managementConfig(ruleID string) string {
 	return fmt.Sprintf(`# preserve this comment
 version: 1
+language: zh-CN
 udp_max_sessions: 64
 custom_unknown: preserved
 auth:

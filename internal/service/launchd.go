@@ -169,6 +169,64 @@ type launchdServiceState struct {
 	sourcePath string
 }
 
+func startLaunchdDaemon(cfg Config, path string, runner launchdCommandRunner) error {
+	label := launchdLabel(cfg)
+	state, err := probeLaunchdService(label, runner)
+	if err != nil {
+		return fmt.Errorf("inspect launchd daemon %s: %w", label, err)
+	}
+	if state.loaded {
+		if !sameLaunchdPlistPath(state.sourcePath, path) {
+			return fmt.Errorf("launchd daemon %s is loaded from %q, not %s", label, state.sourcePath, path)
+		}
+		if err := runLaunchdCommand(runner, []string{"launchctl", "kickstart", "-k", "system/" + label}); err != nil {
+			return err
+		}
+	} else if err := runLaunchdCommand(runner, []string{"launchctl", "bootstrap", "system", path}); err != nil {
+		return err
+	}
+	return verifyLaunchdServiceRunning(label, runner)
+}
+
+func uninstallLaunchdDaemon(cfg Config, path string, runner launchdCommandRunner) error {
+	label := launchdLabel(cfg)
+	state, err := probeLaunchdService(label, runner)
+	if err != nil {
+		return fmt.Errorf("inspect launchd daemon %s: %w", label, err)
+	}
+	if state.loaded {
+		if !sameLaunchdPlistPath(state.sourcePath, path) {
+			return fmt.Errorf("launchd daemon %s is loaded from %q, not %s; refusing to stop an unexpected daemon", label, state.sourcePath, path)
+		}
+		if err := runLaunchdCommand(runner, []string{"launchctl", "bootout", "system/" + label}); err != nil {
+			return err
+		}
+		state, err = probeLaunchdService(label, runner)
+		if err != nil {
+			return fmt.Errorf("verify launchd daemon %s stopped: %w", label, err)
+		}
+		if state.loaded {
+			return fmt.Errorf("launchd daemon %s is still loaded after bootout", label)
+		}
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove plist: %w", err)
+	}
+	return nil
+}
+
+func verifyLaunchdServiceRunning(label string, runner launchdCommandRunner) error {
+	argv := []string{"launchctl", "print", "system/" + label}
+	out, err := runner(argv)
+	if err != nil {
+		return fmt.Errorf("%s: %w (%s)", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "state = running") {
+		return fmt.Errorf("launchd daemon %s did not reach the running state", label)
+	}
+	return nil
+}
+
 func probeLaunchdService(label string, runner launchdCommandRunner) (launchdServiceState, error) {
 	argv := []string{"launchctl", "print", "system/" + label}
 	out, err := runner(argv)

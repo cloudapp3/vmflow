@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -91,6 +92,23 @@ func TestParseMCPOptionsHelp(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "vmflow mcp") || !strings.Contains(output.String(), "read-only") {
 		t.Fatalf("unexpected MCP help: %q", output.String())
+	}
+}
+
+func TestParseMCPOptionsHelpInChinese(t *testing.T) {
+	var output bytes.Buffer
+	_, err := parseMCPOptionsWithTranslator([]string{"--help"}, &output, i18n.New(i18n.SimplifiedChinese))
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("help error = %v, want flag.ErrHelp", err)
+	}
+	text := output.String()
+	for _, want := range []string{"用法", "只读 MCP 服务器", "本机守护进程管理地址", "跳过服务器证书验证"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Chinese MCP help does not contain %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "cli.mcp") {
+		t.Fatalf("Chinese MCP help leaked a translation key: %s", text)
 	}
 }
 

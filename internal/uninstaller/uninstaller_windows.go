@@ -9,18 +9,21 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/cloudapp3/vmflow/internal/appdirs"
 	"github.com/cloudapp3/vmflow/internal/service"
 )
-
-const windowsDefaultCfg = `C:\ProgramData\vmflow\config.yaml`
-
-func defaultConfigPath() string { return windowsDefaultCfg }
 
 func defaultLogPaths() []string { return []string{`C:\ProgramData\vmflow\logs`} }
 
 func defaultStatePaths() []string { return nil }
 
-func defaultStatsPaths() []string { return []string{`C:\ProgramData\vmflow\stats.json`} }
+func defaultStatsPaths() []string {
+	configPath, err := appdirs.SystemConfigPath()
+	if err != nil {
+		return nil
+	}
+	return []string{strings.TrimSuffix(configPath, `\config.yaml`) + `\stats.json`}
+}
 
 func serviceInstalled() bool {
 	return exec.Command("sc.exe", "query", service.DefaultServiceName).Run() == nil

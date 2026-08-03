@@ -3,8 +3,7 @@ set -euo pipefail
 
 REPO="cloudapp3/vmflow"
 BINARY_NAME="vmflow"
-CONFIG_NAME="config.yaml"
-CONFIG_MARKER_NAME=".vmflow-config-owned"
+MANAGED_MARKER_NAME=".vmflow-managed"
 INSTALL_DIR="${VMFLOW_INSTALL_DIR:-}"
 INSTALL_DIR_EXPLICIT=0
 INSTALL_DIR_FROM_ENV=0
@@ -20,6 +19,11 @@ PATH_RC=""
 PATH_RC_ADDED=0
 PATH_BLOCKS_REMOVED=0
 REUSING_INSTALL=0
+ARCHIVE_URL_OVERRIDE="${VMFLOW_ARCHIVE_URL:-}"
+CHECKSUMS_URL_OVERRIDE="${VMFLOW_CHECKSUMS_URL:-}"
+DOWNLOAD_HEADER_1="${VMFLOW_DOWNLOAD_HEADER_1:-}"
+DOWNLOAD_HEADER_2="${VMFLOW_DOWNLOAD_HEADER_2:-}"
+CUSTOM_RELEASE_SOURCE=0
 
 if [ -n "$INSTALL_DIR" ]; then
   INSTALL_DIR_EXPLICIT=1
@@ -40,13 +44,12 @@ Options:
                     Also available through VMFLOW_INSTALL_DIR.
   --system          Install system-wide to /usr/local/bin (or the explicit --dir).
                     Uses sudo only for target checks and writes when needed.
-                    A newly created config remains root-owned with mode 0600.
   --skip-verify     Skip SHA-256 checksum verification.
   --no-modify-path  Do not add an automatic user install to a shell startup file.
   --print-install-dir
                     Print the selected install directory to stdout after success.
   --uninstall       Uninstall vmflow instead of installing. Stops the service
-                    and removes the binary, config, logs, and cache.
+                    and removes the binary plus vmflow-managed data.
   -h, --help        Show this help message.
 
 Examples:
@@ -74,17 +77,6 @@ validate_option_value() {
     -*) die "invalid value for ${option}: values must not start with '-': ${value}" ;;
   esac
 }
-
-# create_exclusive_file opens target once with noclobber enabled. This prevents
-# a path inserted after validation from redirecting a privileged write through
-# a symlink or overwriting an operator-created file.
-create_exclusive_file() (
-  target="$1"
-  shift
-  umask 077
-  set -o noclobber
-  "$@" >"$target"
-)
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
@@ -117,28 +109,6 @@ run_privileged() {
     "$SUDO_BIN" "$command_path" "$@"
   else
     "$@"
-  fi
-}
-
-create_exclusive_from_file() {
-  local target="$1"
-  local source="$2"
-
-  if [ "$USE_SUDO" -eq 1 ]; then
-    "$SUDO_BIN" /bin/sh -c 'umask 077; set -C; /bin/cat >"$1"' vmflow-install "$target" <"$source"
-  else
-    create_exclusive_file "$target" cat "$source"
-  fi
-}
-
-create_exclusive_with_text() {
-  local target="$1"
-  local value="$2"
-
-  if [ "$USE_SUDO" -eq 1 ]; then
-    "$SUDO_BIN" /bin/sh -c 'umask 077; set -C; printf "%s" "$2" >"$1"' vmflow-install "$target" "$value"
-  else
-    create_exclusive_file "$target" printf '%s' "$value"
   fi
 }
 
@@ -193,7 +163,6 @@ is_reusable_install_dir() {
 
   [ -x "$dir/$BINARY_NAME" ] && [ -f "$dir/$BINARY_NAME" ] \
     && [ ! -L "$dir/$BINARY_NAME" ] \
-    && [ -f "$dir/$CONFIG_NAME" ] && [ ! -L "$dir/$CONFIG_NAME" ] \
     && dir_can_be_created "$dir"
 }
 
@@ -224,9 +193,8 @@ select_install_dir() {
     esac
   fi
 
-  # Preserve the colocated config chosen by earlier installer versions when
-  # vmflow is not currently in PATH. This avoids creating a second binary/config
-  # pair for root users upgrading from the former ~/.local/bin quick start.
+  # Reuse an existing binary in a conventional install directory even when the
+  # current shell has not loaded that directory into PATH.
   for d in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
     if is_reusable_install_dir "$d"; then
       INSTALL_DIR="$d"
@@ -331,7 +299,6 @@ path_has_dir() (
 print_path_hint() {
   local install_dir="$1"
   local target_path="$2"
-  local config_path="$3"
 
   if [ "$USE_SUDO" -eq 1 ]; then
     log "Verify the root-owned system installation with:"
@@ -360,41 +327,204 @@ print_path_hint() {
   fi
 
   log ""
-  log "Review forwarding rules before starting or restarting vmflow:"
-  log "  ${config_path}"
-  log "Upgrades preserve existing rules, including enabled public listeners."
-  log ""
-  if [ "$USE_SUDO" -eq 1 ]; then
-	log "Inspect status and next steps:"
-	log "  \"${SUDO_BIN}\" \"${target_path}\""
-	log "Create the first forwarding rule:"
-	log "  \"${SUDO_BIN}\" \"${target_path}\" init -config \"${config_path}\""
-	log ""
-    log "Start vmflow as root (loads ${config_path} by default):"
-	log "  \"${SUDO_BIN}\" \"${target_path}\" run"
-  else
-	log "Inspect status and next steps:"
-	log "  \"${target_path}\""
-	log "Create the first forwarding rule:"
-	log "  \"${target_path}\" init -config \"${config_path}\""
-	log ""
-    log "Start vmflow (loads ${config_path} by default):"
-	log "  \"${target_path}\" run"
+  log "Initialize vmflow and choose system-service or foreground mode:"
+  log "  \"${target_path}\" init"
+}
+
+managed_config_dir_owned() {
+  local dir="$1"
+  local marker="${dir}/${MANAGED_MARKER_NAME}"
+  local owner=""
+
+  [ -d "$dir" ] && [ ! -L "$dir" ] \
+    && [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  IFS= read -r owner <"$marker" || true
+  [ "$owner" = "vmflow" ]
+}
+
+remove_managed_config_dir() {
+  local dir="$1"
+  local path
+
+  managed_config_dir_owned "$dir" || return 1
+  for path in \
+    "$dir/config.yaml" \
+    "$dir/client.yaml" \
+    "$dir/stats.json"; do
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+      log "warning: refusing to remove directory at managed file path: $path"
+      return 1
+    fi
+    rm -f -- "$path" || return 1
+  done
+  rm -f -- "$dir/$MANAGED_MARKER_NAME" || return 1
+  if ! rmdir "$dir" 2>/dev/null; then
+    log "Preserved remaining non-vmflow files in managed config directory: $dir"
   fi
 }
 
-# stop_service best-effort stops and removes the native service (systemd on
-# Linux, launchd on macOS). Windows is not supported by install.sh.
-stop_service() {
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop "$BINARY_NAME" 2>/dev/null || true
-    systemctl disable "$BINARY_NAME" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${BINARY_NAME}.service" 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-  elif command -v launchctl >/dev/null 2>&1; then
-    launchctl bootout "system/io.cloudapp.${BINARY_NAME}" 2>/dev/null || true
-    rm -f "/Library/LaunchDaemons/io.cloudapp.${BINARY_NAME}.plist" 2>/dev/null || true
+systemd_state_is_stopped() {
+  case "$1" in
+    inactive|failed|unknown) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+SYSTEMD_STATE=""
+SYSTEMD_STATE_DETAIL=""
+probe_systemd_state() {
+  local output
+  local status=0
+
+  output="$(systemctl is-active "$BINARY_NAME" 2>&1)" || status=$?
+  case "$output" in
+    active|reloading|inactive|failed|activating|deactivating|maintenance|refreshing|unknown)
+      SYSTEMD_STATE="$output"
+      SYSTEMD_STATE_DETAIL=""
+      return 0
+      ;;
+  esac
+  SYSTEMD_STATE=""
+  SYSTEMD_STATE_DETAIL="${output:-exit status ${status}}"
+  return 1
+}
+
+stop_systemd_service() {
+  local unit="/etc/systemd/system/${BINARY_NAME}.service"
+  local has_unit=0
+  local output
+
+  if [ -e "$unit" ] || [ -L "$unit" ]; then
+    has_unit=1
   fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    if [ "$has_unit" -eq 1 ]; then
+      log "Error: cannot stop ${BINARY_NAME}: systemctl is unavailable"
+      return 1
+    fi
+    return 0
+  fi
+  if ! probe_systemd_state; then
+    if [ "$has_unit" -eq 0 ]; then
+      return 0
+    fi
+    log "Error: could not determine systemd state for ${BINARY_NAME}: ${SYSTEMD_STATE_DETAIL}"
+    return 1
+  fi
+  if [ "$has_unit" -eq 0 ] && systemd_state_is_stopped "$SYSTEMD_STATE"; then
+    return 0
+  fi
+
+  if ! systemd_state_is_stopped "$SYSTEMD_STATE"; then
+    if ! output="$(systemctl stop "$BINARY_NAME" 2>&1)"; then
+      log "Error: could not stop systemd service ${BINARY_NAME}${output:+: ${output}}"
+      return 1
+    fi
+    if ! probe_systemd_state; then
+      log "Error: could not verify systemd service ${BINARY_NAME} stopped: ${SYSTEMD_STATE_DETAIL}"
+      return 1
+    fi
+    if ! systemd_state_is_stopped "$SYSTEMD_STATE"; then
+      log "Error: systemd service ${BINARY_NAME} is still ${SYSTEMD_STATE} after stop"
+      return 1
+    fi
+  fi
+
+  if ! output="$(systemctl disable "$BINARY_NAME" 2>&1)"; then
+    log "Error: could not disable systemd service ${BINARY_NAME}${output:+: ${output}}"
+    return 1
+  fi
+  if ! rm -f -- "$unit"; then
+    log "Error: could not remove systemd unit ${unit}"
+    return 1
+  fi
+  if ! output="$(systemctl daemon-reload 2>&1)"; then
+    log "Error: systemctl daemon-reload failed${output:+: ${output}}"
+    return 1
+  fi
+}
+
+LAUNCHD_LOADED=0
+LAUNCHD_DETAIL=""
+probe_launchd_state() {
+  local label="$1"
+  local output
+  local status=0
+
+  output="$(launchctl print "system/${label}" 2>&1)" || status=$?
+  if [ "$status" -eq 0 ]; then
+    LAUNCHD_LOADED=1
+    LAUNCHD_DETAIL=""
+    return 0
+  fi
+  case "$output" in
+    *"Could not find service"*|*"could not find service"*|*"Service not found"*|*"service not found"*)
+      LAUNCHD_LOADED=0
+      LAUNCHD_DETAIL=""
+      return 0
+      ;;
+  esac
+  if [ "$status" -eq 113 ]; then
+    LAUNCHD_LOADED=0
+    LAUNCHD_DETAIL=""
+    return 0
+  fi
+  LAUNCHD_LOADED=0
+  LAUNCHD_DETAIL="${output:-exit status ${status}}"
+  return 1
+}
+
+stop_launchd_service() {
+  local label="io.cloudapp.${BINARY_NAME}"
+  local plist="/Library/LaunchDaemons/${label}.plist"
+  local has_plist=0
+  local output
+
+  if [ -e "$plist" ] || [ -L "$plist" ]; then
+    has_plist=1
+  fi
+  if ! command -v launchctl >/dev/null 2>&1; then
+    if [ "$has_plist" -eq 1 ]; then
+      log "Error: cannot stop ${BINARY_NAME}: launchctl is unavailable"
+      return 1
+    fi
+    return 0
+  fi
+  if ! probe_launchd_state "$label"; then
+    if [ "$has_plist" -eq 0 ]; then
+      return 0
+    fi
+    log "Error: could not determine launchd state for ${label}: ${LAUNCHD_DETAIL}"
+    return 1
+  fi
+  if [ "$LAUNCHD_LOADED" -eq 1 ]; then
+    if ! output="$(launchctl bootout "system/${label}" 2>&1)"; then
+      log "Error: could not stop launchd daemon ${label}${output:+: ${output}}"
+      return 1
+    fi
+    if ! probe_launchd_state "$label"; then
+      log "Error: could not verify launchd daemon ${label} stopped: ${LAUNCHD_DETAIL}"
+      return 1
+    fi
+    if [ "$LAUNCHD_LOADED" -eq 1 ]; then
+      log "Error: launchd daemon ${label} is still loaded after bootout"
+      return 1
+    fi
+  fi
+  if ! rm -f -- "$plist"; then
+    log "Error: could not remove launchd plist ${plist}"
+    return 1
+  fi
+}
+
+# stop_service stops and verifies the native service before removing its
+# definition. Windows is not supported by install.sh.
+stop_service() {
+  case "$(uname -s)" in
+    Linux) stop_systemd_service ;;
+    Darwin) stop_launchd_service ;;
+    *) return 0 ;;
+  esac
 }
 
 remove_path_block_from_file() {
@@ -577,34 +707,39 @@ do_uninstall() {
   log "vmflow binary not found (or too old for self-uninstall) at ${TARGET:-<none>}; cleaning up via shell."
 
   case "$(uname -s)" in
-    Linux)  SYSTEM_CFG="/etc/vmflow/config.yaml" ;;
-    Darwin) SYSTEM_CFG="/usr/local/etc/vmflow/config.yaml" ;;
-    *)      SYSTEM_CFG="" ;;
+    Linux)
+      SYSTEM_CONFIG_DIR="/etc/vmflow"
+      USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vmflow"
+      ;;
+    Darwin)
+      SYSTEM_CONFIG_DIR="/Library/Application Support/vmflow"
+      USER_CONFIG_DIR="$HOME/Library/Application Support/vmflow"
+      ;;
+    *)
+      SYSTEM_CONFIG_DIR=""
+      USER_CONFIG_DIR=""
+      ;;
   esac
-  COLOCATED_CFG=""
-  COLOCATED_CFG_MARKER=""
-  if [ -n "$TARGET" ]; then
-    COLOCATED_CFG="$(dirname "$TARGET")/${CONFIG_NAME}"
-    COLOCATED_CFG_MARKER="$(dirname "$TARGET")/${CONFIG_MARKER_NAME}"
-  fi
   CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/vmflow"
   CACHE_FILE="${CACHE_DIR}/update-check.json"
 
   # Build the removal plan (only entries that exist).
   PLAN=()
   if [ -n "$TARGET" ] && [ -x "$TARGET" ]; then PLAN+=("$TARGET"); fi
-  if [ -n "$COLOCATED_CFG_MARKER" ] && [ -f "$COLOCATED_CFG_MARKER" ] && [ ! -L "$COLOCATED_CFG_MARKER" ]; then
-    if [ -e "$COLOCATED_CFG" ] || [ -L "$COLOCATED_CFG" ]; then PLAN+=("$COLOCATED_CFG"); fi
-    PLAN+=("$COLOCATED_CFG_MARKER")
-  elif [ -n "$COLOCATED_CFG" ] && { [ -e "$COLOCATED_CFG" ] || [ -L "$COLOCATED_CFG" ]; }; then
-    log "Preserving unowned colocated config: $COLOCATED_CFG"
-  fi
-  if [ -n "$SYSTEM_CFG" ] && [ "$SYSTEM_CFG" != "$COLOCATED_CFG" ] && [ -e "$SYSTEM_CFG" ]; then PLAN+=("$SYSTEM_CFG"); fi
+  for config_dir in "$SYSTEM_CONFIG_DIR" "$USER_CONFIG_DIR"; do
+    [ -n "$config_dir" ] || continue
+    if managed_config_dir_owned "$config_dir"; then
+      PLAN+=("$config_dir")
+    elif [ -e "$config_dir/config.yaml" ] || [ -L "$config_dir/config.yaml" ]; then
+      log "Preserving unowned config directory: $config_dir"
+    fi
+  done
   if [ -d /var/log/vmflow ]; then PLAN+=("/var/log/vmflow"); fi
   if [ -f "$CACHE_FILE" ]; then PLAN+=("$CACHE_FILE"); fi
 
   if [ "${#PLAN[@]}" -eq 0 ]; then
-    stop_service
+    stop_service \
+      || die "native service cleanup failed; vmflow binary, config, logs, and cache were left in place"
     remove_user_path_blocks "$PATH_CLEANUP_DIR"
     if [ "$PATH_BLOCKS_REMOVED" -eq 0 ]; then
       log "Nothing left to remove."
@@ -627,17 +762,23 @@ do_uninstall() {
     esac
   fi
 
-  stop_service
+  stop_service \
+    || die "native service cleanup failed; vmflow binary, config, logs, and cache were left in place"
 
   for t in "${PLAN[@]}"; do
-    if [ -n "$COLOCATED_CFG" ] && [ "$t" = "$COLOCATED_CFG" ]; then
-      if [ ! -f "$COLOCATED_CFG_MARKER" ] || [ -L "$COLOCATED_CFG_MARKER" ]; then
-        log "warning: preserving colocated config because its ownership marker changed: $t"
+    if { [ -n "$SYSTEM_CONFIG_DIR" ] && [ "$t" = "$SYSTEM_CONFIG_DIR" ]; } \
+      || { [ -n "$USER_CONFIG_DIR" ] && [ "$t" = "$USER_CONFIG_DIR" ]; }; then
+      if ! managed_config_dir_owned "$t"; then
+        log "warning: preserving config directory because its ownership marker changed: $t"
         continue
       fi
-    fi
-
-    if [ "$t" = "/var/log/vmflow" ]; then
+      if remove_managed_config_dir "$t"; then
+        log "removed vmflow-managed config files from $t"
+      else
+        log "warning: could not safely remove vmflow-managed config files from $t"
+      fi
+      continue
+    elif [ "$t" = "/var/log/vmflow" ]; then
       remove_cmd=(rm -rf -- "$t")
     elif [ -d "$t" ] && [ ! -L "$t" ]; then
       log "warning: refusing to recursively remove a directory planned as a file: $t"
@@ -724,6 +865,31 @@ if [ "$UNINSTALL" -eq 1 ]; then
   exit 0
 fi
 
+if [ -n "$ARCHIVE_URL_OVERRIDE" ] || [ -n "$CHECKSUMS_URL_OVERRIDE" ]; then
+  [ -n "$ARCHIVE_URL_OVERRIDE" ] && [ -n "$CHECKSUMS_URL_OVERRIDE" ] \
+    || die "VMFLOW_ARCHIVE_URL and VMFLOW_CHECKSUMS_URL must be set together"
+  [ -n "$VERSION" ] \
+    || die "--version is required with a custom release source"
+  for release_url in "$ARCHIVE_URL_OVERRIDE" "$CHECKSUMS_URL_OVERRIDE"; do
+    case "$release_url" in
+      http://*|https://*) ;;
+      *) die "custom release URLs must start with http:// or https://" ;;
+    esac
+  done
+  CUSTOM_RELEASE_SOURCE=1
+elif [ -n "$DOWNLOAD_HEADER_1" ] || [ -n "$DOWNLOAD_HEADER_2" ]; then
+  die "custom download headers require VMFLOW_ARCHIVE_URL and VMFLOW_CHECKSUMS_URL"
+fi
+
+for download_header in "$DOWNLOAD_HEADER_1" "$DOWNLOAD_HEADER_2"; do
+  [ -z "$download_header" ] && continue
+  case "$download_header" in
+    *$'\r'*|*$'\n'*) die "custom download headers must be single-line values" ;;
+    *:*) ;;
+    *) die "custom download headers must use 'Name: value' syntax" ;;
+  esac
+done
+
 require_cmd curl
 require_cmd tar
 require_cmd uname
@@ -766,6 +932,13 @@ if [ -n "${TOKEN}" ]; then
     -H "X-GitHub-Api-Version: 2022-11-28"
   )
 fi
+DOWNLOAD_CURL_ARGS=("${CURL_ARGS[@]}")
+if [ "$CUSTOM_RELEASE_SOURCE" -eq 1 ]; then
+  # Never forward a GitHub token to an explicitly configured download host.
+  DOWNLOAD_CURL_ARGS=(-fsSL)
+  [ -z "$DOWNLOAD_HEADER_1" ] || DOWNLOAD_CURL_ARGS+=(-H "$DOWNLOAD_HEADER_1")
+  [ -z "$DOWNLOAD_HEADER_2" ] || DOWNLOAD_CURL_ARGS+=(-H "$DOWNLOAD_HEADER_2")
+fi
 
 curl_text() {
   curl "${CURL_ARGS[@]}" "$1"
@@ -774,7 +947,7 @@ curl_text() {
 curl_download() {
   local url="$1"
   local output="$2"
-  curl "${CURL_ARGS[@]}" -o "$output" "$url"
+  curl "${DOWNLOAD_CURL_ARGS[@]}" -o "$output" "$url"
 }
 
 if [ -z "$VERSION" ]; then
@@ -797,8 +970,13 @@ esac
 VERSION_NO_V="${VERSION#v}"
 ARCHIVE_NAME="${BINARY_NAME}-${VERSION_NO_V}-${OS}-${ARCH}.tar.gz"
 BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
-ARCHIVE_URL="${BASE_URL}/${ARCHIVE_NAME}"
-CHECKSUMS_URL="${BASE_URL}/checksums.txt"
+if [ "$CUSTOM_RELEASE_SOURCE" -eq 1 ]; then
+  ARCHIVE_URL="$ARCHIVE_URL_OVERRIDE"
+  CHECKSUMS_URL="$CHECKSUMS_URL_OVERRIDE"
+else
+  ARCHIVE_URL="${BASE_URL}/${ARCHIVE_NAME}"
+  CHECKSUMS_URL="${BASE_URL}/checksums.txt"
+fi
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
@@ -844,19 +1022,6 @@ if [ ! -f "$BINARY_PATH" ]; then
 fi
 [ -n "${BINARY_PATH}" ] && [ -f "$BINARY_PATH" ] || die "failed to find ${BINARY_NAME} in archive"
 
-# Current release archives place config.yaml beside the binary. Stable releases
-# published before that layout used examples/config.yaml.
-CONFIG_SOURCE="${TMPDIR}/${CONFIG_NAME}"
-if [ -f "$CONFIG_SOURCE" ] && [ ! -L "$CONFIG_SOURCE" ]; then
-  :
-elif [ ! -e "$CONFIG_SOURCE" ] && [ ! -L "$CONFIG_SOURCE" ] \
-  && [ -d "${TMPDIR}/examples" ] && [ ! -L "${TMPDIR}/examples" ] \
-  && [ -f "${TMPDIR}/examples/${CONFIG_NAME}" ] && [ ! -L "${TMPDIR}/examples/${CONFIG_NAME}" ]; then
-  CONFIG_SOURCE="${TMPDIR}/examples/${CONFIG_NAME}"
-else
-  die "release ${VERSION} is incompatible with this installer: expected a regular ${CONFIG_NAME} at the archive root or under examples/"
-fi
-
 if ! run_privileged test -d "$INSTALL_DIR"; then
   run_privileged mkdir -p "$INSTALL_DIR" 2>/dev/null \
     || die "cannot create install directory: ${INSTALL_DIR}"
@@ -865,30 +1030,12 @@ run_privileged test -w "$INSTALL_DIR" \
   || die "install directory is not writable: ${INSTALL_DIR}; use --system for a privileged install"
 
 TARGET_PATH="${INSTALL_DIR}/${BINARY_NAME}"
-TARGET_CONFIG_PATH="${INSTALL_DIR}/${CONFIG_NAME}"
-TARGET_CONFIG_MARKER="${INSTALL_DIR}/${CONFIG_MARKER_NAME}"
 if run_privileged test -L "$TARGET_PATH"; then
   die "existing binary path is a symbolic link: ${TARGET_PATH}"
 fi
 if run_privileged test -e "$TARGET_PATH" && ! run_privileged test -f "$TARGET_PATH"; then
   die "existing binary path is not a regular file: ${TARGET_PATH}"
 fi
-CONFIG_MARKER_EXISTS=0
-if run_privileged test -e "$TARGET_CONFIG_MARKER" || run_privileged test -L "$TARGET_CONFIG_MARKER"; then
-  if ! run_privileged test -f "$TARGET_CONFIG_MARKER" || run_privileged test -L "$TARGET_CONFIG_MARKER"; then
-    die "existing config ownership marker is not a regular file: ${TARGET_CONFIG_MARKER}"
-  fi
-  CONFIG_MARKER_EXISTS=1
-fi
-if run_privileged test -e "$TARGET_CONFIG_PATH" || run_privileged test -L "$TARGET_CONFIG_PATH"; then
-  if ! run_privileged test -f "$TARGET_CONFIG_PATH" || run_privileged test -L "$TARGET_CONFIG_PATH"; then
-    die "existing config path is not a regular file: ${TARGET_CONFIG_PATH}"
-  fi
-  INSTALL_CONFIG=0
-else
-  INSTALL_CONFIG=1
-fi
-
 if [ "$USE_SUDO" -eq 1 ]; then
   PRIVILEGED_INSTALL=""
   for candidate in /usr/bin/install /bin/install; do
@@ -911,27 +1058,10 @@ else
     || die "failed to chmod ${TARGET_PATH}"
 fi
 
-if [ "$INSTALL_CONFIG" -eq 1 ]; then
-  create_exclusive_from_file "$TARGET_CONFIG_PATH" "$CONFIG_SOURCE" \
-    || die "failed to create ${CONFIG_NAME} without overwriting an existing path: ${TARGET_CONFIG_PATH}"
-  if [ "$CONFIG_MARKER_EXISTS" -eq 1 ]; then
-    if ! run_privileged test -f "$TARGET_CONFIG_MARKER" || run_privileged test -L "$TARGET_CONFIG_MARKER"; then
-      die "config was installed, but its existing ownership marker changed: ${TARGET_CONFIG_MARKER}"
-    fi
-  elif ! create_exclusive_with_text "$TARGET_CONFIG_MARKER" $'vmflow\n'; then
-    die "config was installed and left in place, but the ownership marker could not be created safely: ${TARGET_CONFIG_MARKER}"
-  fi
-fi
-
 log "Installed ${BINARY_NAME} ${VERSION} to ${TARGET_PATH}"
-if [ "$INSTALL_CONFIG" -eq 1 ]; then
-  log "Installed default config to ${TARGET_CONFIG_PATH}"
-else
-  log "Preserved existing config at ${TARGET_CONFIG_PATH}"
-fi
 
 configure_user_path "$INSTALL_DIR"
-print_path_hint "$INSTALL_DIR" "$TARGET_PATH" "$TARGET_CONFIG_PATH"
+print_path_hint "$INSTALL_DIR" "$TARGET_PATH"
 if [ "$PRINT_INSTALL_DIR" -eq 1 ]; then
   printf '%s\n' "$INSTALL_DIR"
 fi

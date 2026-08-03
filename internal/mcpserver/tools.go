@@ -53,15 +53,17 @@ type listForwardingRulesInput struct {
 // source IPs, and domains. The full rule is available only through an explicit
 // get_forwarding_rule call.
 type forwardingRuleSummary struct {
-	RuleID      string          `json:"rule_id"`
-	Name        string          `json:"name"`
-	Protocol    engine.Protocol `json:"protocol"`
-	Enabled     bool            `json:"enabled"`
-	SpeedLimit  int64           `json:"speed_limit"`
-	MaxConn     int             `json:"max_conn"`
-	IdleTimeout int             `json:"idle_timeout,omitempty"`
-	Revision    int64           `json:"revision,omitempty"`
-	UpdatedTime int64           `json:"updated_time,omitempty"`
+	RuleID       string                 `json:"rule_id"`
+	Name         string                 `json:"name"`
+	Protocol     engine.Protocol        `json:"protocol"`
+	Enabled      bool                   `json:"enabled"`
+	SpeedLimit   int64                  `json:"speed_limit"`
+	Bandwidth    *engine.BandwidthLimit `json:"bandwidth_limit,omitempty"`
+	TrafficQuota *engine.TrafficQuota   `json:"traffic_quota,omitempty"`
+	MaxConn      int                    `json:"max_conn"`
+	IdleTimeout  int                    `json:"idle_timeout,omitempty"`
+	Revision     int64                  `json:"revision,omitempty"`
+	UpdatedTime  int64                  `json:"updated_time,omitempty"`
 }
 
 type listForwardingRulesOutput struct {
@@ -96,6 +98,7 @@ type trafficTotals struct {
 	SourceIPDenied     int64 `json:"source_ip_denied_total"`
 	UDPSessionRejected int64 `json:"udp_session_rejected_total"`
 	UDPPacketsDropped  int64 `json:"udp_packets_dropped_total"`
+	QuotaRejectedBytes int64 `json:"quota_rejected_bytes_total"`
 }
 
 type getTrafficStatsOutput struct {
@@ -132,6 +135,7 @@ type statusCounters struct {
 	SourceIPDenied     int64 `json:"source_ip_denied_total"`
 	UDPSessionRejected int64 `json:"udp_session_rejected_total"`
 	UDPPacketsDropped  int64 `json:"udp_packets_dropped_total"`
+	QuotaRejectedBytes int64 `json:"quota_rejected_bytes_total"`
 }
 
 type getVMFlowStatusOutput struct {
@@ -159,13 +163,13 @@ func registerTools(server *mcp.Server, backend backend, version string) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        toolGetVMFlowStatus,
 		Title:       "Get vmflow status",
-		Description: "Report daemon connectivity, version, API compatibility, configuration health, forwarding rule counts, and aggregate traffic counters.",
+		Description: "Report daemon connectivity, version, API compatibility, configuration health, forwarding rule counts, and aggregate traffic and quota-rejection counters.",
 		Annotations: readOnlyAnnotations,
 	}, handlers.getVMFlowStatus)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        toolListForwardingRules,
 		Title:       "List forwarding rules",
-		Description: "List and filter configured forwarding rules. Summaries omit listen and target addresses, source IPs, and domains.",
+		Description: "List and filter configured forwarding rules, including aggregate bandwidth and traffic quota policies. Summaries omit listen and target addresses, source IPs, and domains.",
 		Annotations: readOnlyAnnotations,
 	}, handlers.listForwardingRules)
 	mcp.AddTool(server, &mcp.Tool{
@@ -177,7 +181,7 @@ func registerTools(server *mcp.Server, backend backend, version string) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        toolGetTrafficStats,
 		Title:       "Get traffic statistics",
-		Description: "Return stable, structured per-rule and aggregate traffic counters from the running daemon.",
+		Description: "Return stable, structured per-rule and aggregate traffic counters, quota status, and rejected bytes from the running daemon.",
 		Annotations: readOnlyAnnotations,
 	}, handlers.getTrafficStats)
 	mcp.AddTool(server, &mcp.Tool{
@@ -298,6 +302,7 @@ func (t *toolHandlers) getVMFlowStatus(ctx context.Context, _ *mcp.CallToolReque
 		result.Counters.SourceIPDenied = totals.SourceIPDenied
 		result.Counters.UDPSessionRejected = totals.UDPSessionRejected
 		result.Counters.UDPPacketsDropped = totals.UDPPacketsDropped
+		result.Counters.QuotaRejectedBytes = totals.QuotaRejectedBytes
 	}
 	return nil, result, nil
 }
@@ -545,16 +550,28 @@ func normalizeProtocolFilter(value string) (string, error) {
 }
 
 func summarizeRule(rule engine.Rule) forwardingRuleSummary {
+	var bandwidth *engine.BandwidthLimit
+	if rule.Bandwidth != nil {
+		value := *rule.Bandwidth
+		bandwidth = &value
+	}
+	var quota *engine.TrafficQuota
+	if rule.TrafficQuota != nil {
+		value := *rule.TrafficQuota
+		quota = &value
+	}
 	return forwardingRuleSummary{
-		RuleID:      rule.RuleID,
-		Name:        rule.Name,
-		Protocol:    rule.Protocol,
-		Enabled:     rule.Enabled,
-		SpeedLimit:  rule.SpeedLimit,
-		MaxConn:     rule.MaxConn,
-		IdleTimeout: rule.IdleTimeout,
-		Revision:    rule.Revision,
-		UpdatedTime: rule.UpdatedTime,
+		RuleID:       rule.RuleID,
+		Name:         rule.Name,
+		Protocol:     rule.Protocol,
+		Enabled:      rule.Enabled,
+		SpeedLimit:   rule.SpeedLimit,
+		Bandwidth:    bandwidth,
+		TrafficQuota: quota,
+		MaxConn:      rule.MaxConn,
+		IdleTimeout:  rule.IdleTimeout,
+		Revision:     rule.Revision,
+		UpdatedTime:  rule.UpdatedTime,
 	}
 }
 
@@ -578,6 +595,7 @@ func sumTraffic(items []controlapi.TrafficSnapshot) trafficTotals {
 		totals.SourceIPDenied += item.SourceIPDenied
 		totals.UDPSessionRejected += item.UDPSessionRejected
 		totals.UDPPacketsDropped += item.UDPPacketsDropped
+		totals.QuotaRejectedBytes += item.QuotaRejectedBytes
 	}
 	return totals
 }

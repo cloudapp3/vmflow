@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
 )
 
 type scriptedRunnerFactory struct {
@@ -26,6 +29,34 @@ func newScriptedManager(collector *Collector, script *scriptedRunnerFactory) *Ma
 type scriptedRunner struct {
 	name    string
 	factory *scriptedRunnerFactory
+}
+
+func TestManagerPassesSharedResolverToOutboundRunners(t *testing.T) {
+	resolver := dnsresolver.New()
+	manager := NewManagerWithOptions(NewCollector(), ManagerOptions{Resolver: resolver})
+	tests := []struct {
+		protocol Protocol
+		check    func([]Runner) bool
+	}{
+		{protocol: ProtocolTCP, check: func(runners []Runner) bool { return runners[0].(*tcpRunner).resolver == resolver }},
+		{protocol: ProtocolUDP, check: func(runners []Runner) bool { return runners[0].(*udpRunner).resolver == resolver }},
+		{protocol: ProtocolTCPUDP, check: func(runners []Runner) bool {
+			return runners[0].(*tcpRunner).resolver == resolver && runners[1].(*udpRunner).resolver == resolver
+		}},
+		{protocol: ProtocolHTTP, check: func(runners []Runner) bool { return runners[0].(*httpProxyRunner).resolver == resolver }},
+		{protocol: ProtocolHTTPS, check: func(runners []Runner) bool { return runners[0].(*httpsRunner).resolver == resolver }},
+	}
+	for _, test := range tests {
+		t.Run(string(test.protocol), func(t *testing.T) {
+			runners, err := manager.buildRunners(Rule{RuleID: "dns-test", Protocol: test.protocol})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !test.check(runners) {
+				t.Fatal("runner did not receive the manager resolver")
+			}
+		})
+	}
 }
 
 func (runner *scriptedRunner) Start() error {
@@ -364,6 +395,89 @@ func TestPendingSnapshotRollbackRestoresRemovedCountersAndDisabledMetadata(t *te
 	}
 }
 
+func TestPendingSnapshotRollbackRestoresTrafficPoliciesAndController(t *testing.T) {
+	manager := NewManager(NewCollector())
+	defer manager.StopAll()
+
+	oldRule := transactionRule("limited", "limited", 65535)
+	oldRule.ListenPort = freeTCPPort(t)
+	oldRule.Bandwidth = &BandwidthLimit{Rate: 1_000_000}
+	oldRule.TrafficQuota = &TrafficQuota{Daily: 100, Timezone: "UTC", Action: "block"}
+	if err := manager.StartRule(oldRule); err != nil {
+		t.Fatal(err)
+	}
+
+	updated := oldRule
+	updated.Bandwidth = &BandwidthLimit{Rate: 2_000_000}
+	updated.TrafficQuota = &TrafficQuota{Daily: 200, Timezone: "UTC", Action: "block"}
+	pending, result := manager.BeginApplySnapshotTransactional([]Rule{updated}, ApplySnapshotOptions{ReplaceAll: true})
+	if pending == nil || result.ApplyFailure != nil {
+		t.Fatalf("begin traffic policy update = (%v, %+v)", pending, result)
+	}
+	assertManagerTrafficPolicy(t, manager, "limited", 2_000_000, 200)
+
+	rollback := pending.Rollback()
+	if !rollback.Attempted || rollback.Failed {
+		t.Fatalf("traffic policy rollback = %+v", rollback)
+	}
+	assertManagerTrafficPolicy(t, manager, "limited", 1_000_000, 100)
+}
+
+func assertManagerTrafficPolicy(t *testing.T, manager *Manager, ruleID string, wantRate, wantDaily int64) {
+	t.Helper()
+	managed, ok := manager.runningRule(ruleID)
+	if !ok || len(managed.runners) != 1 {
+		t.Fatalf("running rule %q = (%v, %v)", ruleID, managed, ok)
+	}
+	runner, ok := managed.runners[0].(*tcpRunner)
+	if !ok || runner.traffic == nil || runner.traffic.upload == nil || runner.traffic.download == nil {
+		t.Fatalf("running traffic controller = %T, %+v", managed.runners[0], runner)
+	}
+	if runner.traffic.upload.rate != wantRate || runner.traffic.download.rate != wantRate {
+		t.Fatalf("controller rates = (%d, %d), want %d", runner.traffic.upload.rate, runner.traffic.download.rate, wantRate)
+	}
+	if runner.traffic.quota == nil || int64(runner.traffic.quota.Daily) != wantDaily {
+		t.Fatalf("controller quota = %+v, want daily %d", runner.traffic.quota, wantDaily)
+	}
+	if policy := manager.BandwidthPolicies()[ruleID]; int64(policy.Rate) != wantRate {
+		t.Fatalf("bandwidth metadata = %+v, want rate %d", policy, wantRate)
+	}
+	snapshot := manager.Snapshot(ruleID)
+	if snapshot.Quota == nil || snapshot.Quota.Daily == nil || snapshot.Quota.Daily.LimitBytes != wantDaily {
+		t.Fatalf("quota metadata snapshot = %+v, want daily %d", snapshot.Quota, wantDaily)
+	}
+}
+
+func TestQuotaUsageSurvivesRuleRemovalAndReAdd(t *testing.T) {
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	ledger, err := newQuotaLedger(nil, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManagerWithOptions(NewCollector(), ManagerOptions{QuotaLedger: ledger})
+	defer manager.StopAll()
+	rule := transactionRule("reused-id", "reused-id", 65535)
+	rule.Enabled = false
+	rule.TrafficQuota = &TrafficQuota{Daily: 100, Timezone: "UTC", Action: "block"}
+
+	if result := manager.ApplySnapshot([]Rule{rule}, ApplySnapshotOptions{ReplaceAll: true}); result.FailedRules != 0 {
+		t.Fatalf("initial rule apply = %+v", result)
+	}
+	allowed, reservation, err := ledger.reserve(rule.RuleID, rule.TrafficQuota, 40, true, 10)
+	if err != nil || allowed != 40 {
+		t.Fatalf("quota reservation = (%d, %v)", allowed, err)
+	}
+	reservation.finish(allowed)
+	manager.RemoveRule(rule.RuleID)
+	if result := manager.ApplySnapshot([]Rule{rule}, ApplySnapshotOptions{ReplaceAll: true}); result.FailedRules != 0 {
+		t.Fatalf("re-added rule apply = %+v", result)
+	}
+	snapshot := manager.Snapshot(rule.RuleID)
+	if snapshot.Quota == nil || snapshot.Quota.Daily == nil || snapshot.Quota.Daily.UsedBytes != 40 {
+		t.Fatalf("re-added rule quota = %+v, want 40 used bytes", snapshot.Quota)
+	}
+}
+
 func TestApplySnapshotTransactionalReportsRollbackFailure(t *testing.T) {
 	collector := NewCollector()
 	script := &scriptedRunnerFactory{startErrors: map[string][]error{
@@ -561,4 +675,33 @@ func TestApplySnapshotConcurrentSafety(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestTCPUDPRunnersShareOneRuleTrafficController(t *testing.T) {
+	manager := NewManager(NewCollector())
+	rule := Rule{
+		RuleID: "combined-limits", Name: "combined-limits", Protocol: ProtocolTCPUDP,
+		ListenAddr: "127.0.0.1", ListenPort: 2201, TargetAddr: "127.0.0.1", TargetPort: 22,
+		Enabled: true, Bandwidth: &BandwidthLimit{Rate: 1_000_000},
+		TrafficQuota: &TrafficQuota{Daily: 1_000_000, Timezone: "UTC", Action: "block"},
+	}
+	runners, err := manager.buildRunners(rule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stopRunnerSet(runners)
+	if len(runners) != 2 {
+		t.Fatalf("runner count = %d, want 2", len(runners))
+	}
+	tcp, tcpOK := runners[0].(*tcpRunner)
+	udp, udpOK := runners[1].(*udpRunner)
+	if !tcpOK || !udpOK {
+		t.Fatalf("runner types = %T, %T", runners[0], runners[1])
+	}
+	if tcp.traffic == nil || tcp.traffic != udp.traffic {
+		t.Fatal("tcp+udp runners do not share one rule traffic controller")
+	}
+	if tcp.traffic.upload != udp.traffic.upload || tcp.traffic.download != udp.traffic.download || tcp.traffic.ledger != udp.traffic.ledger {
+		t.Fatal("tcp+udp runners do not share bandwidth buckets and quota ledger")
+	}
 }

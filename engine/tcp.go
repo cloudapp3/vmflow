@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
 )
 
 // DefaultTCPIdleTimeout bounds how long a TCP forwarding connection may stay
@@ -22,6 +24,8 @@ const DefaultTCPIdleTimeout = 5 * time.Minute
 type tcpRunner struct {
 	rule      Rule
 	stats     boundRuleStats
+	traffic   *ruleTrafficController
+	resolver  *dnsresolver.Resolver
 	ipMatcher *sourceIPMatcher
 	policyErr error
 
@@ -36,11 +40,24 @@ type tcpRunner struct {
 }
 
 func newTCPRunner(rule Rule, collector *Collector) Runner {
+	return newTCPRunnerWithTrafficAndResolver(rule, collector, newRuleTrafficController(rule, nil), nil)
+}
+
+func newTCPRunnerWithTraffic(rule Rule, collector *Collector, traffic *ruleTrafficController) Runner {
+	return newTCPRunnerWithTrafficAndResolver(rule, collector, traffic, nil)
+}
+
+func newTCPRunnerWithTrafficAndResolver(rule Rule, collector *Collector, traffic *ruleTrafficController, resolver *dnsresolver.Resolver) Runner {
 	ctx, cancel := context.WithCancel(context.Background())
 	matcher, policyErr := compileSourceIPMatcher(rule.SourceIPMode, rule.SourceIPs)
+	if resolver == nil {
+		resolver = dnsresolver.New()
+	}
 	return &tcpRunner{
 		rule:      rule,
 		stats:     collector.bindRule(rule.RuleID),
+		traffic:   traffic,
+		resolver:  resolver,
 		ipMatcher: matcher,
 		policyErr: policyErr,
 		ctx:       ctx,
@@ -98,6 +115,10 @@ func (runner *tcpRunner) acceptLoop() {
 				continue
 			}
 		}
+		if runner.traffic.quotaBlocked() {
+			_ = conn.Close()
+			continue
+		}
 
 		if !runner.reserveConnSlot() {
 			_ = conn.Close()
@@ -123,7 +144,7 @@ func (runner *tcpRunner) handleConn(clientConn net.Conn) {
 
 	targetAddr := net.JoinHostPort(strings.TrimSpace(runner.rule.TargetAddr), strconv.Itoa(runner.rule.TargetPort))
 	dialer := net.Dialer{Timeout: 10 * time.Second}
-	targetConn, err := dialer.DialContext(runner.ctx, "tcp", targetAddr)
+	targetConn, err := runner.resolver.DialContext(runner.ctx, &dialer, "tcp", targetAddr)
 	if err != nil {
 		return
 	}
@@ -202,16 +223,18 @@ func (runner *tcpRunner) relayConn(clientConn, targetConn net.Conn) {
 	defer cancel()
 
 	results := make(chan tcpCopyResult, 2)
-	startCopy := func(dst, src net.Conn, onBytes func(int64)) {
+	startCopy := func(dst, src net.Conn, direction trafficDirection, onBytes func(int64)) {
 		go func() {
-			_, err := copyTCPDirection(connCtx, dst, src, runner.rule.SpeedLimit, idle, activity, onBytes)
+			_, err := copyTCPDirection(connCtx, dst, src, runner.rule.SpeedLimit, idle, activity, runner.traffic, direction, func(n int64) {
+				runner.stats.addQuotaRejectedBytes(n)
+			}, onBytes)
 			results <- tcpCopyResult{dst: dst, err: err}
 		}()
 	}
-	startCopy(targetConn, clientConn, func(n int64) {
+	startCopy(targetConn, clientConn, trafficUpload, func(n int64) {
 		runner.stats.addUpload(n)
 	})
-	startCopy(clientConn, targetConn, func(n int64) {
+	startCopy(clientConn, targetConn, trafficDownload, func(n int64) {
 		runner.stats.addDownload(n)
 	})
 
@@ -375,15 +398,19 @@ type copyOptions struct {
 	onPending    func(bool)
 }
 
-func copyTCPDirection(ctx context.Context, dst, src net.Conn, speedLimit int64, writeTimeout time.Duration, activity *tcpActivity, onBytes func(int64)) (int64, error) {
-	return copyWithOptions(ctx, dst, src, speedLimit, copyOptions{
+func copyTCPDirection(ctx context.Context, dst, src net.Conn, speedLimit int64, writeTimeout time.Duration, activity *tcpActivity, traffic *ruleTrafficController, direction trafficDirection, onQuotaRejected, onBytes func(int64)) (int64, error) {
+	return copyWithTrafficOptions(ctx, dst, src, speedLimit, copyOptions{
 		writeTimeout: writeTimeout,
 		onActivity:   activity.touch,
 		onPending:    activity.setPending,
-	}, onBytes)
+	}, traffic, direction, onQuotaRejected, onBytes)
 }
 
 func copyWithOptions(ctx context.Context, dst io.Writer, src io.Reader, speedLimit int64, options copyOptions, onBytes func(int64)) (int64, error) {
+	return copyWithTrafficOptions(ctx, dst, src, speedLimit, options, nil, trafficUpload, nil, onBytes)
+}
+
+func copyWithTrafficOptions(ctx context.Context, dst io.Writer, src io.Reader, speedLimit int64, options copyOptions, traffic *ruleTrafficController, direction trafficDirection, onQuotaRejected, onBytes func(int64)) (int64, error) {
 	buf := tcpCopyBufferPool.Get().(*tcpCopyBuffer)
 	defer tcpCopyBufferPool.Put(buf)
 	limiter := newRateLimiter(speedLimit)
@@ -398,11 +425,15 @@ func copyWithOptions(ctx context.Context, dst io.Writer, src io.Reader, speedLim
 			if options.onActivity != nil {
 				options.onActivity()
 			}
-			if options.onPending != nil && speedLimit > 0 {
+			limited := speedLimit > 0 || (traffic != nil && traffic.rateLimited(direction))
+			if options.onPending != nil && limited {
 				options.onPending(true)
 			}
 			limitErr := limiter.wait(ctx, nr)
-			if options.onPending != nil && speedLimit > 0 {
+			if limitErr == nil && traffic != nil {
+				limitErr = traffic.wait(ctx, direction, nr)
+			}
+			if options.onPending != nil && limited {
 				options.onPending(false)
 			}
 			if limitErr != nil {
@@ -415,7 +446,22 @@ func copyWithOptions(ctx context.Context, dst io.Writer, src io.Reader, speedLim
 					setWriteDeadline(dst, writeDeadline)
 				}
 			}
-			nw, writeErr := dst.Write(buf[:nr])
+			allowed := int64(nr)
+			var reservation *quotaReservation
+			if traffic != nil {
+				var quotaErr error
+				allowed, reservation, quotaErr = traffic.reserve(int64(nr), false)
+				if quotaErr != nil {
+					if onQuotaRejected != nil {
+						onQuotaRejected(int64(nr))
+					}
+					return total, quotaErr
+				}
+			}
+			nw, writeErr := dst.Write(buf[:int(allowed)])
+			if reservation != nil {
+				reservation.finish(int64(nw))
+			}
 			if nw > 0 {
 				if options.onActivity != nil {
 					options.onActivity()
@@ -429,6 +475,12 @@ func copyWithOptions(ctx context.Context, dst io.Writer, src io.Reader, speedLim
 				return total, writeErr
 			}
 			if nw != nr {
+				if int64(nw) == allowed && allowed < int64(nr) {
+					if onQuotaRejected != nil {
+						onQuotaRejected(int64(nr) - allowed)
+					}
+					return total, ErrTrafficQuotaExceeded
+				}
 				return total, io.ErrShortWrite
 			}
 		}

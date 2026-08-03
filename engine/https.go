@@ -12,12 +12,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
 )
 
 type httpsRunner struct {
 	rule      Rule
 	collector *Collector
 	certMgr   CertProvider
+	resolver  *dnsresolver.Resolver
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -28,11 +31,19 @@ type httpsRunner struct {
 }
 
 func newHTTPSRunner(rule Rule, collector *Collector, certMgr CertProvider) Runner {
+	return newHTTPSRunnerWithResolver(rule, collector, certMgr, nil)
+}
+
+func newHTTPSRunnerWithResolver(rule Rule, collector *Collector, certMgr CertProvider, resolver *dnsresolver.Resolver) Runner {
 	ctx, cancel := context.WithCancel(context.Background())
+	if resolver == nil {
+		resolver = dnsresolver.New()
+	}
 	return &httpsRunner{
 		rule:      rule,
 		collector: collector,
 		certMgr:   certMgr,
+		resolver:  resolver,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -121,7 +132,7 @@ func (runner *httpsRunner) handleConn(clientConn net.Conn) {
 
 	// Read and forward the entire request as-is (transparent reverse proxy)
 	targetAddr := net.JoinHostPort(strings.TrimSpace(runner.rule.TargetAddr), strconv.Itoa(runner.rule.TargetPort))
-	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	targetConn, err := runner.resolver.DialContext(runner.ctx, &net.Dialer{Timeout: 10 * time.Second}, "tcp", targetAddr)
 	if err != nil {
 		log.Printf("[https] dial %s failed: %v", targetAddr, err)
 		return

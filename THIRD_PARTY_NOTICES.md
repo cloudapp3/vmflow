@@ -20,6 +20,7 @@ archives.
 | github.com/clipperhouse/uax29/v2 | v2.5.0 | MIT |
 | github.com/cloudapp3/tgbot | v0.1.0 | MIT |
 | github.com/erikgeiser/coninput | v0.0.0-20211004153227-1c3628e74d0f | MIT |
+| github.com/go-ole/go-ole | v1.2.6 | MIT |
 | github.com/google/jsonschema-go | v0.4.3 | MIT |
 | github.com/lucasb-eyer/go-colorful | v1.3.0 | MIT |
 | github.com/mattn/go-isatty | v0.0.20 | MIT |
@@ -29,11 +30,14 @@ archives.
 | github.com/muesli/ansi | v0.0.0-20230316100256-276c6243b2f6 | MIT |
 | github.com/muesli/cancelreader | v0.2.2 | MIT |
 | github.com/muesli/termenv | v0.16.0 | MIT |
+| github.com/power-devops/perfstat | v0.0.0-20210106213030-5aafc221ea8c | MIT |
 | github.com/rivo/uniseg | v0.4.7 | MIT |
 | github.com/segmentio/asm | v1.1.3 | MIT |
 | github.com/segmentio/encoding | v0.5.4 | MIT |
+| github.com/shirou/gopsutil/v3 | v3.24.5 | BSD-3-Clause |
 | github.com/xo/terminfo | v0.0.0-20220910002029-abceb7e1c41e | MIT |
 | github.com/yosida95/uritemplate/v3 | v3.0.2 | BSD-3-Clause |
+| github.com/yusufpapurcu/wmi | v1.2.4 | MIT |
 | golang.org/x/crypto | v0.54.0 | BSD-3-Clause |
 | golang.org/x/oauth2 | v0.35.0 | BSD-3-Clause |
 | golang.org/x/sys | v0.47.0 | BSD-3-Clause |

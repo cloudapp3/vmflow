@@ -22,6 +22,12 @@ func TestWriteMetrics(t *testing.T) {
 		TargetAddr: "127.0.0.1",
 		TargetPort: 2,
 		Enabled:    false,
+		Bandwidth: &engine.BandwidthLimit{
+			Upload: engine.ByteRate(1_000_000), Download: engine.ByteRate(2_000_000),
+		},
+		TrafficQuota: &engine.TrafficQuota{
+			Daily: engine.ByteSize(100), Monthly: engine.ByteSize(1000), Timezone: "UTC", Action: "block",
+		},
 	}}, engine.ApplySnapshotOptions{ReplaceAll: true})
 
 	collector := New(manager)
@@ -31,6 +37,7 @@ func TestWriteMetrics(t *testing.T) {
 	traffic.IncSourceIPDenied("disabled")
 	traffic.IncUDPSessionRejected("disabled")
 	traffic.IncUDPPacketsDropped("disabled")
+	traffic.AddQuotaRejectedBytes("disabled", 7)
 
 	var b strings.Builder
 	if err := collector.Write(&b); err != nil {
@@ -45,6 +52,13 @@ func TestWriteMetrics(t *testing.T) {
 		`vmflow_rule_source_ip_denied_total{rule_id="disabled",protocol="udp"} 1`,
 		`vmflow_udp_session_rejected_total{rule_id="disabled",protocol="udp"} 1`,
 		`vmflow_udp_packets_dropped_total{rule_id="disabled",protocol="udp"} 1`,
+		`vmflow_rule_bandwidth_limit_bytes_per_second{rule_id="disabled",protocol="udp",direction="upload"} 1000000`,
+		`vmflow_rule_bandwidth_limit_bytes_per_second{rule_id="disabled",protocol="udp",direction="download"} 2000000`,
+		`vmflow_rule_quota_used_bytes{rule_id="disabled",protocol="udp",period="daily"} 0`,
+		`vmflow_rule_quota_limit_bytes{rule_id="disabled",protocol="udp",period="monthly"} 1000`,
+		`vmflow_rule_quota_remaining_bytes{rule_id="disabled",protocol="udp",period="daily"} 100`,
+		`vmflow_rule_quota_blocked{rule_id="disabled",protocol="udp"} 0`,
+		`vmflow_rule_quota_rejected_bytes_total{rule_id="disabled",protocol="udp"} 7`,
 		`vmflow_control_requests_total{method="GET",path="/v1/rules",status="200"} 1`,
 		`vmflow_reload_total{status="ok"} 1`,
 		`vmflow_rule_apply_total{action="unchanged",status="ok"} 1`,

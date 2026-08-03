@@ -1,6 +1,7 @@
 package controlapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/netinfo"
 	"github.com/cloudapp3/vmflow/precheck"
 )
 
@@ -81,6 +83,45 @@ func TestAdminTokenCanRead(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestStatsIncludesPartialHostNetworkWithoutFailingRuleStats(t *testing.T) {
+	runtime := testRuntime(config.AuthConfig{})
+	runtime.HostNetwork = func(context.Context) (netinfo.Snapshot, error) {
+		return netinfo.Snapshot{
+			Available:     true,
+			CollectedTime: 1_700_000_000,
+			Hostname:      "vm-01",
+			OS:            "linux",
+			Arch:          "amd64",
+			Interfaces: []netinfo.Interface{{
+				Name:      "eth0",
+				Up:        true,
+				Addresses: []netinfo.Address{{CIDR: "10.0.0.2/24", Family: "ipv4", Scope: "private"}},
+			}},
+			Warnings: []string{netinfo.WarningCountersUnavailable},
+		}, errors.New("network counters unavailable")
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
+	NewHandler(runtime).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("stats status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response StatsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode stats response: %v", err)
+	}
+	if response.Items == nil {
+		t.Fatal("stats items encoded as null")
+	}
+	if response.HostNetwork == nil || !response.HostNetwork.Available || response.HostNetwork.Hostname != "vm-01" {
+		t.Fatalf("host network = %+v", response.HostNetwork)
+	}
+	if len(response.HostNetwork.Warnings) != 1 || response.HostNetwork.Warnings[0] != netinfo.WarningCountersUnavailable {
+		t.Fatalf("host network warnings = %v", response.HostNetwork.Warnings)
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/cloudapp3/vmflow/dnsresolver"
 )
 
 const (
@@ -27,6 +29,8 @@ const (
 type udpRunner struct {
 	rule      Rule
 	stats     boundRuleStats
+	traffic   *ruleTrafficController
+	resolver  *dnsresolver.Resolver
 	target    *net.UDPAddr
 	ipMatcher *sourceIPMatcher
 	policyErr error
@@ -83,18 +87,31 @@ var udpReadBufferPool = sync.Pool{
 }
 
 func newUDPRunner(rule Rule, collector *Collector) Runner {
-	return newUDPRunnerWithBudget(rule, collector, newUDPSessionBudget(DefaultUDPGlobalMaxSessions))
+	return newUDPRunnerWithTrafficAndResolver(rule, collector, newUDPSessionBudget(DefaultUDPGlobalMaxSessions), newRuleTrafficController(rule, nil), nil)
 }
 
 func newUDPRunnerWithBudget(rule Rule, collector *Collector, budget *udpSessionBudget) Runner {
+	return newUDPRunnerWithTrafficAndResolver(rule, collector, budget, newRuleTrafficController(rule, nil), nil)
+}
+
+func newUDPRunnerWithTraffic(rule Rule, collector *Collector, budget *udpSessionBudget, traffic *ruleTrafficController) Runner {
+	return newUDPRunnerWithTrafficAndResolver(rule, collector, budget, traffic, nil)
+}
+
+func newUDPRunnerWithTrafficAndResolver(rule Rule, collector *Collector, budget *udpSessionBudget, traffic *ruleTrafficController, resolver *dnsresolver.Resolver) Runner {
 	ctx, cancel := context.WithCancel(context.Background())
 	matcher, policyErr := compileSourceIPMatcher(rule.SourceIPMode, rule.SourceIPs)
 	if budget == nil {
 		budget = newUDPSessionBudget(DefaultUDPGlobalMaxSessions)
 	}
+	if resolver == nil {
+		resolver = dnsresolver.New()
+	}
 	return &udpRunner{
 		rule:      rule,
 		stats:     collector.bindRule(rule.RuleID),
+		traffic:   traffic,
+		resolver:  resolver,
 		ipMatcher: matcher,
 		policyErr: policyErr,
 		ctx:       ctx,
@@ -112,7 +129,7 @@ func (runner *udpRunner) Start() error {
 	if err != nil {
 		return err
 	}
-	targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(runner.rule.TargetAddr), strconv.Itoa(runner.rule.TargetPort)))
+	targetAddr, err := runner.resolver.ResolveUDPAddr(runner.ctx, "udp", net.JoinHostPort(strings.TrimSpace(runner.rule.TargetAddr), strconv.Itoa(runner.rule.TargetPort)))
 	if err != nil {
 		return err
 	}
@@ -167,6 +184,10 @@ func (runner *udpRunner) handlePacket(clientAddr netip.AddrPort, payload []byte)
 		runner.stats.incSourceIPDenied()
 		return
 	}
+	if runner.traffic.quotaBlocked() {
+		runner.stats.addQuotaRejectedBytes(int64(len(payload)))
+		return
+	}
 	key := clientAddr
 	now := time.Now().UnixNano()
 
@@ -201,6 +222,8 @@ func (runner *udpRunner) handlePacket(clientAddr netip.AddrPort, payload []byte)
 		if runner.rule.SpeedLimit > 0 {
 			session.uploadLimiter = newRateLimiter(runner.rule.SpeedLimit)
 			session.downloadLimiter = newRateLimiter(runner.rule.SpeedLimit)
+		}
+		if runner.rule.SpeedLimit > 0 || runner.traffic.rateLimited(trafficUpload) || runner.rule.TrafficQuota != nil {
 			session.uploadQueue = make(chan *udpQueuedPacket, udpUploadQueueCapacity)
 		}
 		session.lastSeen.Store(now)
@@ -274,11 +297,29 @@ func (runner *udpRunner) uploadLoop(key netip.AddrPort, session *udpSession) {
 				releaseUDPQueuedPacket(packet)
 				return
 			}
+			if err := runner.traffic.wait(session.ctx, trafficUpload, len(payload)); err != nil {
+				session.queuedBytes.Add(-packet.accountedBytes)
+				releaseUDPQueuedPacket(packet)
+				return
+			}
+			allowed, reservation, quotaErr := runner.traffic.reserve(int64(len(payload)), true)
+			if quotaErr != nil || allowed != int64(len(payload)) {
+				runner.stats.addQuotaRejectedBytes(int64(len(payload)))
+				session.queuedBytes.Add(-packet.accountedBytes)
+				releaseUDPQueuedPacket(packet)
+				continue
+			}
 			if err := runner.writeToTarget(session, payload); err != nil {
+				if reservation != nil {
+					reservation.finish(0)
+				}
 				session.queuedBytes.Add(-packet.accountedBytes)
 				releaseUDPQueuedPacket(packet)
 				runner.removeSession(key, session)
 				return
+			}
+			if reservation != nil {
+				reservation.finish(int64(len(payload)))
 			}
 			runner.stats.addUpload(int64(len(payload)))
 			session.lastSeen.Store(time.Now().UnixNano())
@@ -388,10 +429,27 @@ func (runner *udpRunner) readFromTarget(key netip.AddrPort, session *udpSession)
 				return
 			}
 		}
-		if err := runner.writeToClient(buf[:n], session.clientAddr); err != nil {
+		if err := runner.traffic.wait(session.ctx, trafficDownload, n); err != nil {
 			session.pendingDownload.Add(-1)
 			runner.removeSession(key, session)
 			return
+		}
+		allowed, reservation, quotaErr := runner.traffic.reserve(int64(n), true)
+		if quotaErr != nil || allowed != int64(n) {
+			runner.stats.addQuotaRejectedBytes(int64(n))
+			session.pendingDownload.Add(-1)
+			continue
+		}
+		if err := runner.writeToClient(buf[:n], session.clientAddr); err != nil {
+			if reservation != nil {
+				reservation.finish(0)
+			}
+			session.pendingDownload.Add(-1)
+			runner.removeSession(key, session)
+			return
+		}
+		if reservation != nil {
+			reservation.finish(int64(n))
 		}
 		runner.stats.addDownload(int64(n))
 		session.lastSeen.Store(time.Now().UnixNano())

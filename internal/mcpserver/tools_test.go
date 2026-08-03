@@ -98,7 +98,7 @@ func TestGetVMFlowStatusAggregatesDaemonState(t *testing.T) {
 	}
 	client.rules = &controlapi.RulesResponse{Items: []engine.Rule{{RuleID: "enabled"}}}
 	client.stats = &controlapi.StatsResponse{Items: []controlapi.TrafficSnapshot{
-		{RuleID: "enabled", UploadBytes: 10, DownloadBytes: 20, Conns: 2, SourceIPDenied: 3, UDPSessionRejected: 4, UDPPacketsDropped: 5},
+		{RuleID: "enabled", UploadBytes: 10, DownloadBytes: 20, Conns: 2, SourceIPDenied: 3, UDPSessionRejected: 4, UDPPacketsDropped: 5, QuotaRejectedBytes: 6},
 		{RuleID: "removed", UploadBytes: 1, DownloadBytes: 2, Conns: 1},
 	}}
 
@@ -118,7 +118,7 @@ func TestGetVMFlowStatusAggregatesDaemonState(t *testing.T) {
 	want := statusCounters{
 		ConfiguredRules: 2, EnabledRules: 1, DisabledRules: 1, RuntimeRules: 1, TrafficRules: 2,
 		UploadBytes: 11, DownloadBytes: 22, ActiveConnections: 3,
-		SourceIPDenied: 3, UDPSessionRejected: 4, UDPPacketsDropped: 5,
+		SourceIPDenied: 3, UDPSessionRejected: 4, UDPPacketsDropped: 5, QuotaRejectedBytes: 6,
 	}
 	if got.Counters != want {
 		t.Fatalf("counters = %+v, want %+v", got.Counters, want)
@@ -198,7 +198,7 @@ func TestListForwardingRulesFiltersSortsLimitsAndRedacts(t *testing.T) {
 		Revision: "rev-2",
 		Rules: []engine.Rule{
 			{RuleID: "z", Name: "Zulu", Protocol: engine.ProtocolTCP, Enabled: true, ListenAddr: "0.0.0.0", TargetAddr: "secret.internal", SourceIPs: []string{"192.0.2.0/24"}, Domains: []string{"secret.example"}},
-			{RuleID: "a2", Name: "alpha", Protocol: engine.ProtocolUDP, Enabled: true, ListenAddr: "127.0.0.1", TargetAddr: "192.0.2.2"},
+			{RuleID: "a2", Name: "alpha", Protocol: engine.ProtocolUDP, Enabled: true, ListenAddr: "127.0.0.1", TargetAddr: "192.0.2.2", Bandwidth: &engine.BandwidthLimit{Rate: 1_000_000}, TrafficQuota: &engine.TrafficQuota{Daily: 100_000_000_000, Timezone: "UTC", Action: "block"}},
 			{RuleID: "a1", Name: "Alpha", Protocol: engine.ProtocolUDP, Enabled: true, ListenAddr: "127.0.0.1", TargetAddr: "192.0.2.1"},
 			{RuleID: "off", Name: "Alpha disabled", Protocol: engine.ProtocolUDP, Enabled: false},
 		},
@@ -225,6 +225,13 @@ func TestListForwardingRulesFiltersSortsLimitsAndRedacts(t *testing.T) {
 	_, got, err = newToolHandlers(client).listForwardingRules(context.Background(), nil, listForwardingRulesInput{Query: "a2"})
 	if err != nil || got.Matched != 1 || got.Rules[0].RuleID != "a2" {
 		t.Fatalf("rule ID query = %+v, err=%v", got, err)
+	}
+	if got.Rules[0].Bandwidth == nil || got.Rules[0].Bandwidth.Rate != 1_000_000 || got.Rules[0].TrafficQuota == nil || got.Rules[0].TrafficQuota.Daily != 100_000_000_000 {
+		t.Fatalf("traffic policy summary = %+v", got.Rules[0])
+	}
+	got.Rules[0].Bandwidth.Rate = 2
+	if client.config.Rules[1].Bandwidth.Rate != 1_000_000 {
+		t.Fatal("rule summary shares bandwidth storage with configured rule")
 	}
 }
 
@@ -278,7 +285,7 @@ func TestGetTrafficStatsSortsFiltersLimitsAndAggregates(t *testing.T) {
 	client := newFakeManagementClient()
 	client.stats = &controlapi.StatsResponse{Items: []controlapi.TrafficSnapshot{
 		{RuleID: "z", UploadBytes: 10, DownloadBytes: 20, Conns: 2},
-		{RuleID: "a", UploadBytes: 1, DownloadBytes: 2, Conns: 1, SourceIPDenied: 3, UDPSessionRejected: 4, UDPPacketsDropped: 5},
+		{RuleID: "a", UploadBytes: 1, DownloadBytes: 2, Conns: 1, SourceIPDenied: 3, UDPSessionRejected: 4, UDPPacketsDropped: 5, QuotaRejectedBytes: 6},
 	}}
 	handlers := newToolHandlers(client)
 	_, got, err := handlers.getTrafficStats(context.Background(), nil, getTrafficStatsInput{Limit: 1})
@@ -288,7 +295,7 @@ func TestGetTrafficStatsSortsFiltersLimitsAndAggregates(t *testing.T) {
 	if got.Total != 2 || got.Matched != 2 || got.Returned != 1 || got.Items[0].RuleID != "a" {
 		t.Fatalf("unexpected stats result: %+v", got)
 	}
-	if got.Totals.UploadBytes != 11 || got.Totals.DownloadBytes != 22 || got.Totals.ActiveConnections != 3 || got.Totals.SourceIPDenied != 3 || got.Totals.UDPSessionRejected != 4 || got.Totals.UDPPacketsDropped != 5 {
+	if got.Totals.UploadBytes != 11 || got.Totals.DownloadBytes != 22 || got.Totals.ActiveConnections != 3 || got.Totals.SourceIPDenied != 3 || got.Totals.UDPSessionRejected != 4 || got.Totals.UDPPacketsDropped != 5 || got.Totals.QuotaRejectedBytes != 6 {
 		t.Fatalf("unexpected totals: %+v", got.Totals)
 	}
 	_, got, err = handlers.getTrafficStats(context.Background(), nil, getTrafficStatsInput{RuleID: "z"})

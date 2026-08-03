@@ -9,12 +9,7 @@ import (
 	"github.com/cloudapp3/vmflow/internal/service"
 )
 
-const (
-	linuxDefaultCfg = "/etc/vmflow/config.yaml"
-	linuxUnitName   = service.DefaultServiceName + ".service"
-)
-
-func defaultConfigPath() string { return linuxDefaultCfg }
+const linuxUnitName = service.DefaultServiceName + ".service"
 
 func defaultLogPaths() []string { return []string{"/var/log/vmflow"} }
 

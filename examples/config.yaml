@@ -1,4 +1,5 @@
 version: 1
+language: en # CLI/TUI language: en or zh-CN
 control_port: 19090 # internal management always binds to 127.0.0.1
 udp_max_sessions: 256 # total active UDP sessions across all rules; 0 = default 256; maximum 4096
 
@@ -48,7 +49,24 @@ rules:
     target_addr: 127.0.0.1
     target_port: 22
     enabled: false
+    # Legacy per-connection limit in B/s. Prefer bandwidth_limit for a shared
+    # whole-rule limit with readable units.
     speed_limit: 0
+    # One shared budget per direction across every connection/session in this
+    # rule. A tcp+udp rule also shares the same budget across both protocols.
+    # bandwidth_limit:
+    #   rate: 100 Mbps # applies independently to upload and download
+    # Or use asymmetric limits instead of rate (an omitted direction is unlimited):
+    # bandwidth_limit:
+    #   upload: 50 Mbps
+    #   download: 200 Mbps
+    # Successful upload + download payload bytes count toward both calendar
+    # quotas. Quota exhaustion blocks traffic until the next period.
+    # traffic_quota:
+    #   daily: 100 GB
+    #   monthly: 1 TB
+    #   timezone: Asia/Shanghai
+    #   action: block # optional; block is the default and only current action
     max_conn: 0        # TCP: unlimited; UDP: default 256 sessions
     idle_timeout: 300  # seconds; 0 = default 5 min. Reaps silent connections.
     # Source IP policy: off (default), allowlist, or denylist. Entries are

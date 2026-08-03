@@ -3,12 +3,15 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/cloudapp3/vmflow/precheck"
 )
 
@@ -38,7 +41,7 @@ func TestViewerIsReadOnly(t *testing.T) {
 	if result.editor != nil || result.view == viewEditor {
 		t.Fatal("viewer entered rule editor")
 	}
-	if !strings.Contains(result.statusText, "read-only") {
+	if !strings.Contains(strings.ToLower(result.statusText), "read-only") {
 		t.Fatalf("status = %q", result.statusText)
 	}
 }
@@ -122,6 +125,174 @@ func TestPrecheckApplyAndStaleRetainDraft(t *testing.T) {
 	}
 	if m.config == nil || !m.config.Writable {
 		t.Fatalf("apply response without writable did not inherit capability: %+v", m.config)
+	}
+}
+
+func TestApplyStatusSeparatesConfigAndRuntimeChanges(t *testing.T) {
+	m := managedTestModelWithTranslator(i18n.New(i18n.SimplifiedChinese))
+	m.selectedRuleID = "running"
+	m.stageToggle()
+	draft := cloneRules(m.draft.Rules)
+
+	updated, _ := m.handleApplyResult(applyMsg{resp: &ApplyResponse{
+		Revision: "rev-2", UDPMaxSessions: 256, Rules: draft,
+		Result: engine.ApplyResult{TotalRules: len(draft)},
+	}})
+	m = updated.(Model)
+	if !strings.Contains(m.statusText, "配置已保存：1 项配置更改，0 条运行变更") {
+		t.Fatalf("apply status did not distinguish persisted and runtime changes: %q", m.statusText)
+	}
+}
+
+func TestLanguageSelectorIsAvailableOnNormalViews(t *testing.T) {
+	for _, view := range []viewMode{
+		viewDashboard,
+		viewRules,
+		viewDetail,
+		viewPrecheck,
+		viewApplyResult,
+		viewBotConfig,
+	} {
+		t.Run(fmt.Sprintf("view_%d", view), func(t *testing.T) {
+			m := managedTestModel()
+			m.view = view
+			updated, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+			m = updated.(Model)
+			if cmd != nil || m.overlay != overlayLanguage {
+				t.Fatalf("language selector did not open: overlay=%v cmd=%v", m.overlay, cmd)
+			}
+		})
+	}
+}
+
+func TestLanguageSelectorSwitchesBothDirectionsAndCancels(t *testing.T) {
+	m := managedTestModel()
+	m.filterInput.SetValue("running")
+	m.udpInput.SetValue("256")
+	m.udpInputError = m.tf("tui.validation.udp_sessions", engine.MaxUDPGlobalMaxSessions)
+
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if output := ansi.Strip(m.renderOverlay()); !strings.Contains(output, "this session only") || !strings.Contains(output, "current") {
+		t.Fatalf("language selector did not explain its scope or current choice:\n%s", output)
+	}
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	if m.tr.Locale() != i18n.SimplifiedChinese || m.overlay != overlayNone {
+		t.Fatalf("Chinese selection failed: locale=%q overlay=%v", m.tr.Locale(), m.overlay)
+	}
+	if m.filterInput.Value() != "running" || m.udpInput.Value() != "256" {
+		t.Fatalf("language switch changed input values: filter=%q udp=%q", m.filterInput.Value(), m.udpInput.Value())
+	}
+	if m.filterInput.Placeholder != "按名称或 ID 筛选..." || m.udpInput.Placeholder != "全局 UDP 会话数" {
+		t.Fatalf("input placeholders were not localized: filter=%q udp=%q", m.filterInput.Placeholder, m.udpInput.Placeholder)
+	}
+	if !strings.Contains(m.udpInputError, "0-") || !strings.Contains(m.statusText, "语言已切换为简体中文") {
+		t.Fatalf("localized validation/status missing: udp=%q status=%q", m.udpInputError, m.statusText)
+	}
+
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.tr.Locale() != i18n.SimplifiedChinese || m.overlay != overlayNone {
+		t.Fatalf("cancel changed language: locale=%q overlay=%v", m.tr.Locale(), m.overlay)
+	}
+
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	m = updated.(Model)
+	if m.tr.Locale() != i18n.English || !strings.Contains(m.statusText, "Language changed to English") {
+		t.Fatalf("English selection failed: locale=%q status=%q", m.tr.Locale(), m.statusText)
+	}
+}
+
+func TestLanguageSwitchPreservesRuleEditorState(t *testing.T) {
+	m := managedTestModel()
+	m.view = viewEditor
+	m.editor = newRuleEditorWithTranslator(editorEdit, testRule("running", true, 2201), m.config.Rules, m.tr)
+	m.editor.toggleAdvanced()
+	if !m.editor.focusField(fieldMaxConn) {
+		t.Fatal("could not focus max connections")
+	}
+	focus := m.editor.focus
+	m.editor.fields[focus].input.SetValue("invalid")
+	if _, valid := m.editor.rule(); valid || m.editor.errors[fieldMaxConn] != "must be an integer" {
+		t.Fatalf("English validation fixture failed: %+v", m.editor.errors)
+	}
+	editor := m.editor
+
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF1})
+	m = updated.(Model)
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.overlay != overlayLanguage {
+		t.Fatalf("help did not open language selector: overlay=%v", m.overlay)
+	}
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+
+	if m.editor != editor || m.editor.focus != focus || !m.editor.advanced || !m.editor.dirty() {
+		t.Fatalf("language switch rebuilt or reset editor: %+v", m.editor)
+	}
+	if !m.editor.fields[focus].input.Focused() || m.editor.value(fieldMaxConn) != "invalid" {
+		t.Fatalf("language switch lost editor focus/value: focus=%d value=%q", m.editor.focus, m.editor.value(fieldMaxConn))
+	}
+	if m.editor.fields[m.editor.fieldIndex(fieldName)].label != "名称" || m.editor.errors[fieldMaxConn] != "必须是整数" {
+		t.Fatalf("editor labels/errors were not localized: label=%q errors=%+v", m.editor.fields[m.editor.fieldIndex(fieldName)].label, m.editor.errors)
+	}
+}
+
+func TestEditorTextInputKeepsLanguageShortcutRune(t *testing.T) {
+	m := managedTestModel()
+	m.view = viewEditor
+	m.editor = newRuleEditorWithTranslator(editorEdit, testRule("running", true, 2201), m.config.Rules, m.tr)
+	if !m.editor.focusField(fieldName) {
+		t.Fatal("could not focus rule name")
+	}
+	before := m.editor.value(fieldName)
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.overlay != overlayNone || m.editor.value(fieldName) != before+"l" {
+		t.Fatalf("editor intercepted l as a shortcut: overlay=%v value=%q", m.overlay, m.editor.value(fieldName))
+	}
+}
+
+func TestLanguageSwitchPreservesBotEditorState(t *testing.T) {
+	m := managedTestModel()
+	m.view = viewBotEditor
+	m.botConfig = &BotConfigResponse{BotToken: "123:token", BotChat: 42, BotControlToken: "control", ETag: `"bot-1"`}
+	m.botEditor = newBotConfigEditorWithTranslator(m.botConfig, m.tr)
+	m.botEditor.token.SetValue("123:changed")
+	m.botEditor.token.Blur()
+	m.botEditor.chat.SetValue("invalid")
+	m.botEditor.chat.Focus()
+	m.botEditor.focus = 1
+	if _, err := m.botEditor.request(); err == nil || m.botEditor.chatError != "must be an integer" {
+		t.Fatalf("English bot validation fixture failed: error=%v chat=%q", err, m.botEditor.chatError)
+	}
+	m.botEditor.formError = m.t("tui.status.load_latest_before_save")
+	editor := m.botEditor
+
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF1})
+	m = updated.(Model)
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+
+	if m.botEditor != editor || m.botEditor.focus != 1 || !m.botEditor.chat.Focused() || !m.botEditor.dirty() {
+		t.Fatalf("language switch rebuilt or reset bot editor: %+v", m.botEditor)
+	}
+	if m.botEditor.token.Value() != "123:changed" || m.botEditor.chat.Value() != "invalid" {
+		t.Fatalf("language switch lost bot input: token=%q chat=%q", m.botEditor.token.Value(), m.botEditor.chat.Value())
+	}
+	if m.botEditor.token.Placeholder != "Telegram Bot 令牌" || m.botEditor.chatError != "必须是整数" {
+		t.Fatalf("bot placeholders/errors were not localized: placeholder=%q error=%q", m.botEditor.token.Placeholder, m.botEditor.chatError)
+	}
+	if m.botEditor.formError != "保存前请按 Ctrl+R 加载最新远程配置。" {
+		t.Fatalf("bot form error was not localized: %q", m.botEditor.formError)
 	}
 }
 
@@ -341,6 +512,51 @@ func TestEditorSourceIPPolicyAndCopy(t *testing.T) {
 	copied.SourceIPs[0] = "198.51.100.1"
 	if parsed.SourceIPs[0] != "192.0.2.1" {
 		t.Fatalf("copied rule shared source IP storage: %+v", parsed.SourceIPs)
+	}
+}
+
+func TestEditorTrafficControlsRoundTripAndRejectMixedBandwidthModes(t *testing.T) {
+	rule := testRule("limited", true, 2201)
+	rule.Bandwidth = &engine.BandwidthLimit{Rate: engine.ByteRate(12_500_000)}
+	rule.TrafficQuota = &engine.TrafficQuota{
+		Daily:    engine.ByteSize(100_000_000_000),
+		Monthly:  engine.ByteSize(1 << 40),
+		Timezone: "Asia/Shanghai",
+		Action:   "block",
+	}
+	editor := newRuleEditor(editorEdit, rule, []RuleInfo{rule})
+	if got := editor.value(fieldBandwidthRate); got != "100 Mbps" {
+		t.Fatalf("bandwidth editor value = %q", got)
+	}
+	if got := editor.value(fieldQuotaDaily); got != "100 GB" {
+		t.Fatalf("daily quota editor value = %q", got)
+	}
+	if got := editor.value(fieldQuotaMonthly); got != "1 TiB" {
+		t.Fatalf("monthly quota editor value = %q", got)
+	}
+	parsed, valid := editor.rule()
+	if !valid {
+		t.Fatalf("traffic controls did not round-trip: %+v", editor.errors)
+	}
+	if parsed.Bandwidth == nil || parsed.Bandwidth.Rate != rule.Bandwidth.Rate || parsed.TrafficQuota == nil || *parsed.TrafficQuota != *rule.TrafficQuota {
+		t.Fatalf("traffic controls changed during round-trip: %+v", parsed)
+	}
+
+	editor.fields[editor.fieldIndex(fieldBandwidthUpload)].input.SetValue("50 Mbps")
+	if _, valid := editor.rule(); valid || editor.errors[fieldBandwidthRate] == "" || editor.errors[fieldBandwidthUpload] == "" {
+		t.Fatalf("mixed bandwidth modes were accepted: %+v", editor.errors)
+	}
+	editor.fields[editor.fieldIndex(fieldBandwidthUpload)].input.SetValue("")
+	editor.fields[editor.fieldIndex(fieldQuotaTimezone)].input.SetValue("Not/AZone")
+	if _, valid := editor.rule(); valid || editor.errors[fieldQuotaTimezone] == "" {
+		t.Fatalf("invalid quota timezone was accepted: %+v", editor.errors)
+	}
+
+	copied := copyRule(rule, []RuleInfo{rule})
+	copied.Bandwidth.Rate = 1
+	copied.TrafficQuota.Daily = 1
+	if rule.Bandwidth.Rate != engine.ByteRate(12_500_000) || rule.TrafficQuota.Daily != engine.ByteSize(100_000_000_000) {
+		t.Fatal("copied rule shares bandwidth or quota pointers with its source")
 	}
 }
 
@@ -646,10 +862,13 @@ func TestDashboardBotShortcutAndResponsiveLayout(t *testing.T) {
 	m.height = 20
 	m.view = viewRules
 	output = m.View()
-	for _, hint := range []string{"[P]recheck", "[A]pply", "[?]help"} {
+	for _, hint := range []string{"[n]ew", "[enter]detail", "[1]dashboard", "[?]help"} {
 		if !strings.Contains(output, hint) {
 			t.Fatalf("60-column rules view omitted %q:\n%s", hint, output)
 		}
+	}
+	if strings.Contains(output, "[P]recheck") || strings.Contains(output, "[A]pply") {
+		t.Fatalf("rules view advertised unavailable draft actions:\n%s", output)
 	}
 	if lines := strings.Count(output, "\n") + 1; lines > m.height {
 		t.Fatalf("rules height = %d, terminal height = %d\n%s", lines, m.height, output)
@@ -664,8 +883,67 @@ func TestDashboardBotShortcutAndResponsiveLayout(t *testing.T) {
 	}
 }
 
+func TestNumberNavigationAndDraftPrimaryAction(t *testing.T) {
+	m := managedTestModel()
+	m.view = viewDashboard
+
+	updated, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = updated.(Model)
+	if cmd != nil || m.view != viewRules {
+		t.Fatalf("number navigation failed: view=%v cmd=%v", m.view, cmd)
+	}
+
+	m.selectedRuleID = "running"
+	m.stageToggle()
+	updated, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if cmd == nil || m.operation != operationPrechecking {
+		t.Fatalf("Enter did not start the draft precheck: operation=%v cmd=%v", m.operation, cmd)
+	}
+
+	m.operation = operationIdle
+	updated, _ = m.handlePrecheckResult(precheckMsg{resp: &PrecheckResponse{
+		Revision: m.draft.BaseRevision,
+		Precheck: precheck.Result{OK: true, CheckedRules: len(m.draft.Rules), Items: []precheck.Item{}},
+	}})
+	m = updated.(Model)
+	updated, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if cmd != nil || m.overlay != overlayApply {
+		t.Fatalf("Enter did not advance a passed precheck to apply confirmation: overlay=%v cmd=%v", m.overlay, cmd)
+	}
+}
+
+func TestCreateRuleUsesBasicModeAndAutomaticID(t *testing.T) {
+	m := managedTestModel()
+	m.view = viewRules
+	updated, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(Model)
+	if m.editor == nil || m.editor.advanced || m.editor.fields[m.editor.focus].key != fieldName {
+		t.Fatalf("new rule editor did not start in the name-first basic flow: %+v", m.editor)
+	}
+	if got := m.editor.value(fieldRuleID); got != "new-rule" {
+		t.Fatalf("default rule ID = %q, want new-rule", got)
+	}
+
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("Tokyo Edge")})
+	m = updated.(Model)
+	if got := m.editor.value(fieldRuleID); got != "tokyo-edge" {
+		t.Fatalf("automatic rule ID = %q, want tokyo-edge", got)
+	}
+	updated, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyF2})
+	m = updated.(Model)
+	if !m.editor.advanced {
+		t.Fatal("F2 did not reveal advanced settings")
+	}
+}
+
 func managedTestModel() Model {
-	m := newModel(context.Background(), "http://127.0.0.1:19090")
+	return managedTestModelWithTranslator(i18n.New(i18n.English))
+}
+
+func managedTestModelWithTranslator(translator *i18n.Translator) Model {
+	m := newModelWithOptions(context.Background(), "http://127.0.0.1:19090", RunOptions{Translator: translator})
 	m.ready = true
 	m.width = 120
 	m.height = 32

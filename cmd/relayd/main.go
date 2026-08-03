@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,7 +19,9 @@ import (
 	"github.com/cloudapp3/vmflow/controlapi"
 	"github.com/cloudapp3/vmflow/engine"
 	"github.com/cloudapp3/vmflow/internal/logging"
+	"github.com/cloudapp3/vmflow/internal/statsstore"
 	"github.com/cloudapp3/vmflow/metrics"
+	"github.com/cloudapp3/vmflow/netinfo"
 )
 
 func main() {
@@ -61,7 +64,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	manager := engine.NewManagerWithOptions(engine.NewCollector(), engine.ManagerOptions{UDPMaxSessions: cfg.UDPMaxSessions})
+	quotaPath := filepath.Join(filepath.Dir(statsstore.ResolvePath(*configPath, cfg.Stats.Path, relaydStateDirectory())), statsstore.DefaultQuotaFilename)
+	quotaLedger, err := engine.NewQuotaLedger(statsstore.NewQuotaStore(quotaPath))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load quota state failed: %v\n", err)
+		os.Exit(1)
+	}
+	if relaydHasTrafficQuota(cfg) {
+		if err := quotaLedger.SaveExact(); err != nil {
+			fmt.Fprintf(os.Stderr, "initialize quota state failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	manager := engine.NewManagerWithOptions(engine.NewCollector(), engine.ManagerOptions{UDPMaxSessions: cfg.UDPMaxSessions, QuotaLedger: quotaLedger})
 	metricsCollector := metrics.New(manager)
 	result := manager.ApplySnapshot(cfg.Rules, engine.ApplySnapshotOptions{ReplaceAll: true})
 	metricsCollector.ObserveApplyResult(result)
@@ -79,6 +94,7 @@ func main() {
 		Logger:        logger,
 		Auth:          controlapi.NewAuthenticator(cfg.Auth),
 		Metrics:       metricsCollector,
+		HostNetwork:   netinfo.Collect,
 		StartupConfig: &startupConfig,
 	}
 	server := &http.Server{
@@ -117,5 +133,26 @@ func main() {
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
 	manager.StopAll()
+	if err := manager.SaveQuotaStateExact(); err != nil {
+		logger.Warn("quota state shutdown save failed", "component", "quota", "error", err)
+	}
 	logger.Info("relayd stopped", "component", "daemon", "event", "stopped")
+}
+
+func relaydStateDirectory() string {
+	for _, path := range filepath.SplitList(strings.TrimSpace(os.Getenv("STATE_DIRECTORY"))) {
+		if path = strings.TrimSpace(path); filepath.IsAbs(path) {
+			return path
+		}
+	}
+	return ""
+}
+
+func relaydHasTrafficQuota(cfg config.File) bool {
+	for _, rule := range cfg.Rules {
+		if rule.TrafficQuota != nil {
+			return true
+		}
+	}
+	return false
 }

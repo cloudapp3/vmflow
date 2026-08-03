@@ -62,6 +62,7 @@ var PanelIcons = map[string]string{
 	"System":  "◈",
 	"Traffic": "◆",
 	"Rules":   "☰",
+	"Network": "◎",
 	"Detail":  "◉",
 	"Help":    "?",
 }

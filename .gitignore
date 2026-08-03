@@ -26,6 +26,8 @@ coverage-*.out
 *.local.json
 stats.json
 .vmflow-stats-*
+quota-state.json
+.vmflow-quota-*
 
 # IDE / editor
 .idea/

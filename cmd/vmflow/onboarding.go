@@ -18,7 +18,13 @@ import (
 	"github.com/cloudapp3/vmflow/config"
 	"github.com/cloudapp3/vmflow/controlapi"
 	"github.com/cloudapp3/vmflow/engine"
+	"github.com/cloudapp3/vmflow/internal/i18n"
 	"github.com/cloudapp3/vmflow/internal/service"
+)
+
+const (
+	projectGitHubURL     = "https://github.com/cloudapp3/vmflow"
+	communityTelegramURL = "https://t.me/VMPulse"
 )
 
 type statusReport struct {
@@ -35,6 +41,8 @@ type statusReport struct {
 	ControlAddress  string `json:"control_address"`
 	ServiceState    string `json:"service_state,omitempty"`
 	ServiceDetail   string `json:"service_detail,omitempty"`
+	BundledExample  bool   `json:"-"`
+	ConfigIsDefault bool   `json:"-"`
 }
 
 type runtimeReadyInfo struct {
@@ -56,20 +64,25 @@ type statusInspectOptions struct {
 }
 
 func runGuide(args []string) {
+	runGuideWithTranslator(args, defaultTranslator())
+}
+
+func runGuideWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
 	if len(args) != 0 {
-		fmt.Fprintf(os.Stderr, "unexpected argument(s): %v\n", args)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.unexpected_arguments", args))
 		os.Exit(1)
 	}
-	defaults := loadManagementDefaults(os.Stderr)
+	defaults := loadManagementDefaultsWithTranslator(os.Stderr, translator)
+	defaultConfigPath, defaultConfigErr := defaultRuntimeConfigPath()
 	configPath := defaults.ConfigPath
 	if configPath == "" {
-		var err error
-		configPath, err = defaultRuntimeConfigPath()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "resolve default config: %v\n", err)
-			fmt.Fprint(os.Stdout, usageText)
+		if defaultConfigErr != nil {
+			fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.resolve_default_config", defaultConfigErr))
+			fmt.Fprint(os.Stdout, usageTextFor(translator))
 			return
 		}
+		configPath = defaultConfigPath
 	}
 	report := inspectStatus(statusInspectOptions{
 		ConfigPath:       configPath,
@@ -79,31 +92,38 @@ func runGuide(args []string) {
 		Timeout:          800 * time.Millisecond,
 		UseConfigAddress: !defaults.ProfileLoaded && strings.TrimSpace(os.Getenv("VMFLOW_CONTROL_ADDR")) == "",
 	})
-	printGuide(os.Stdout, report)
+	report.ConfigIsDefault = defaultConfigErr == nil && sameFilesystemPath(configPath, defaultConfigPath)
+	printGuideWithTranslator(os.Stdout, report, translator)
 }
 
 func runStatus(args []string) {
-	defaults := loadManagementDefaults(os.Stderr)
+	runStatusWithTranslator(args, defaultTranslator())
+}
+
+func runStatusWithTranslator(args []string, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
+	defaults := loadManagementDefaultsWithTranslator(os.Stderr, translator)
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage:\n  vmflow status [flags]\n\nInspects the local configuration and running daemon.\n\nOptions:")
+		fmt.Fprintln(fs.Output(), translator.T("cli.status.usage"))
 		fs.PrintDefaults()
 	}
-	configPath := fs.String("config", defaults.ConfigPath, "config file path (default: client profile or config.yaml beside vmflow)")
-	address := fs.String("addr", defaults.Address, "daemon management address")
-	token := fs.String("token", defaults.Token, "daemon management token (or environment/client profile)")
-	asJSON := fs.Bool("json", false, "output JSON")
+	configPath := fs.String("config", defaults.ConfigPath, translator.T("cli.status.flag.config"))
+	address := fs.String("addr", defaults.Address, translator.T("cli.tui.flag.address"))
+	token := fs.String("token", defaults.Token, translator.T("cli.tui.flag.token"))
+	asJSON := fs.Bool("json", false, translator.T("cli.status.flag.json"))
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
+	localizeControlClientFlags(fs, translator)
 	fs.Parse(args)
 	if extra := fs.Args(); len(extra) != 0 {
-		fmt.Fprintf(os.Stderr, "unexpected argument(s): %v\n", extra)
+		fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.unexpected_arguments", extra))
 		os.Exit(1)
 	}
 	if strings.TrimSpace(*configPath) == "" {
 		resolved, err := defaultRuntimeConfigPath()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "resolve default config: %v\n", err)
+			fmt.Fprintf(os.Stderr, "%s\n", translator.Tf("cli.error.resolve_default_config", err))
 			os.Exit(1)
 		}
 		*configPath = resolved
@@ -131,13 +151,17 @@ func runStatus(args []string) {
 		report.ServiceState = "unknown"
 		report.ServiceDetail = serviceErr.Error()
 	}
-	if *asJSON {
-		encoder := json.NewEncoder(os.Stdout)
+	_ = writeStatusReport(os.Stdout, report, *asJSON, translator)
+}
+
+func writeStatusReport(w io.Writer, report statusReport, asJSON bool, translator *i18n.Translator) error {
+	if asJSON {
+		encoder := json.NewEncoder(w)
 		encoder.SetIndent("", "  ")
-		_ = encoder.Encode(report)
-		return
+		return encoder.Encode(report)
 	}
-	printStatus(os.Stdout, report)
+	printStatusWithTranslator(w, report, translator)
+	return nil
 }
 
 func inspectStatus(opts statusInspectOptions) statusReport {
@@ -165,6 +189,7 @@ func inspectStatus(opts statusInspectOptions) statusReport {
 	} else {
 		report.ConfigState = "loaded"
 		report.ConfiguredRules = len(cfg.Rules)
+		report.BundledExample = len(cfg.Rules) == 1 && isBundledExampleRule(cfg.Rules[0])
 		for _, rule := range cfg.Rules {
 			if rule.Enabled {
 				report.EnabledRules++
@@ -262,73 +287,179 @@ func clientTLSOptionsFromEnv() controlapi.ClientTLSOptions {
 }
 
 func printGuide(w io.Writer, report statusReport) {
-	fmt.Fprintf(w, "vmflow %s\n\n", displayVersion(report.Version))
-	fmt.Fprintf(w, "Status: %s", report.Status)
-	if report.StatusDetail != "" {
-		fmt.Fprintf(w, " (%s)", report.StatusDetail)
-	}
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Config: %s", report.ConfigPath)
-	switch report.ConfigState {
-	case "missing":
-		fmt.Fprint(w, " (not created)")
-	case "invalid":
-		fmt.Fprintf(w, " (invalid: %s)", report.ConfigError)
-	}
-	fmt.Fprintln(w)
-	if report.ConfigState == "loaded" {
-		fmt.Fprintf(w, "Rules: %d configured, %d enabled\n", report.ConfiguredRules, report.EnabledRules)
-	}
-	fmt.Fprintln(w, "\nNext steps:")
+	printGuideWithTranslator(w, report, defaultTranslator())
+}
+
+func printGuideWithTranslator(w io.Writer, report statusReport, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
+	fmt.Fprintf(w, "vmflow %s\n\n", displayVersionWithTranslator(report.Version, translator))
+
 	switch {
 	case report.Status == "running":
-		fmt.Fprintln(w, "  vmflow tui                   Open the dashboard")
-		fmt.Fprintln(w, "  vmflow status                Inspect daemon details")
-		fmt.Fprintln(w, "  vmflow service status        Inspect the native service")
+		fmt.Fprintln(w, translator.T("cli.guide.running"))
+		if report.ConfigState == "invalid" {
+			fmt.Fprintln(w, translator.T("cli.guide.running_invalid_config"))
+			fmt.Fprintln(w, translator.Tf("cli.output.config", report.ConfigPath))
+			fmt.Fprintln(w, translator.Tf("cli.output.problem", report.ConfigError))
+		} else {
+			printGuideForwardingStateWithTranslator(w, report, translator)
+			fmt.Fprintln(w, translator.Tf("cli.output.config", report.ConfigPath))
+		}
+		fmt.Fprintln(w, translator.T("cli.guide.open_dashboard"))
+		fmt.Fprintln(w, "  vmflow tui")
+		fmt.Fprintln(w, translator.T("cli.guide.other_commands"))
+		fmt.Fprintln(w, translator.T("cli.guide.command.status"))
+		fmt.Fprintln(w, translator.T("cli.guide.command.service_status"))
+	case report.ConfigState == "invalid":
+		fmt.Fprintln(w, translator.T("cli.guide.invalid_config"))
+		fmt.Fprintln(w, translator.Tf("cli.output.config", report.ConfigPath))
+		fmt.Fprintln(w, translator.Tf("cli.output.problem", report.ConfigError))
+		fmt.Fprintln(w, translator.T("cli.guide.fix_config"))
 	case report.Status == "unknown":
-		fmt.Fprintln(w, "  vmflow status                Inspect the process using the management port")
-		fmt.Fprintln(w, "  vmflow help                  Show all commands")
+		fmt.Fprintln(w, translator.T("cli.guide.unverified_port"))
+		if report.StatusDetail != "" {
+			fmt.Fprintln(w, translator.Tf("cli.output.detail", report.StatusDetail))
+		}
+		fmt.Fprintln(w, translator.Tf("cli.output.config", report.ConfigPath))
+		fmt.Fprintln(w, translator.T("cli.guide.inspect_status"))
 	case report.ConfigState != "loaded" || report.EnabledRules == 0:
-		fmt.Fprintf(w, "  vmflow init -config %q   Create your first forwarding rule\n", report.ConfigPath)
-		fmt.Fprintln(w, "  vmflow help                  Show all commands")
+		fmt.Fprintln(w, translator.T("cli.guide.not_running"))
+		printGuideForwardingStateWithTranslator(w, report, translator)
+		if report.ConfigState == "missing" {
+			fmt.Fprintln(w, translator.Tf("cli.output.config_will_create", report.ConfigPath))
+		} else {
+			fmt.Fprintln(w, translator.Tf("cli.output.config", report.ConfigPath))
+		}
+		fmt.Fprintln(w, translator.T("cli.guide.first_time_setup"))
+		fmt.Fprintf(w, "  1. %s\n", guideConfigCommand("vmflow init", report))
+		fmt.Fprintln(w, translator.T("cli.guide.first_time_rule"))
+		fmt.Fprintln(w, translator.T("cli.guide.first_time_start"))
+		fmt.Fprintln(w, translator.T("cli.guide.first_time_tui"))
+		if report.BundledExample {
+			fmt.Fprintln(w, translator.T("cli.guide.example_safe"))
+		}
 	default:
-		fmt.Fprintf(w, "  vmflow run -config %q    Run in the foreground\n", report.ConfigPath)
-		fmt.Fprintf(w, "  vmflow service install --config %q\n", report.ConfigPath)
-		fmt.Fprintln(w, "  vmflow status                Inspect daemon details")
+		fmt.Fprintln(w, translator.T("cli.guide.ready"))
+		printGuideForwardingStateWithTranslator(w, report, translator)
+		fmt.Fprintln(w, translator.Tf("cli.output.config", report.ConfigPath))
+		fmt.Fprintln(w, translator.T("cli.guide.start"))
+		fmt.Fprintln(w, translator.Tf("cli.guide.start_foreground", guideConfigCommand("vmflow run", report)))
+		fmt.Fprintln(w, translator.Tf("cli.guide.start_boot", guideServiceInstallCommand(report)))
+		fmt.Fprintln(w, translator.T("cli.guide.after_start"))
+	}
+
+	printGuideResourcesWithTranslator(w, translator)
+}
+
+func printGuideResources(w io.Writer) {
+	printGuideResourcesWithTranslator(w, defaultTranslator())
+}
+
+func printGuideResourcesWithTranslator(w io.Writer, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
+	fmt.Fprintln(w, translator.T("cli.guide.more"))
+	fmt.Fprintln(w, translator.T("cli.guide.commands"))
+	fmt.Fprintf(w, "  GitHub:    %s\n", projectGitHubURL)
+	fmt.Fprintf(w, "  Telegram:  %s\n", communityTelegramURL)
+}
+
+func printGuideForwardingState(w io.Writer, report statusReport) {
+	printGuideForwardingStateWithTranslator(w, report, defaultTranslator())
+}
+
+func printGuideForwardingStateWithTranslator(w io.Writer, report statusReport, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
+	switch {
+	case report.BundledExample:
+		fmt.Fprintln(w, translator.T("cli.guide.forwarding_example"))
+	case report.ConfigState != "loaded" || report.ConfiguredRules == 0:
+		fmt.Fprintln(w, translator.T("cli.guide.forwarding_none"))
+	default:
+		fmt.Fprintln(w, translator.Tf("cli.guide.forwarding_counts", report.EnabledRules, report.ConfiguredRules))
 	}
 }
 
+func guideConfigCommand(command string, report statusReport) string {
+	if report.ConfigIsDefault || strings.TrimSpace(report.ConfigPath) == "" {
+		return command
+	}
+	return fmt.Sprintf("%s -config %q", command, report.ConfigPath)
+}
+
+func guideServiceInstallCommand(report statusReport) string {
+	if report.ConfigIsDefault || strings.TrimSpace(report.ConfigPath) == "" {
+		return "vmflow service install"
+	}
+	return fmt.Sprintf("vmflow service install --config %q", report.ConfigPath)
+}
+
 func printStatus(w io.Writer, report statusReport) {
-	fmt.Fprintf(w, "vmflow %s\n", displayVersion(report.Version))
-	fmt.Fprintf(w, "Status: %s", report.Status)
+	printStatusWithTranslator(w, report, defaultTranslator())
+}
+
+func printStatusWithTranslator(w io.Writer, report statusReport, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
+	fmt.Fprintf(w, "vmflow %s\n", displayVersionWithTranslator(report.Version, translator))
+	fmt.Fprintf(w, "%s: %s", translator.T("cli.status.label.status"), localizedState(translator, report.Status))
 	if report.StatusDetail != "" {
 		fmt.Fprintf(w, " (%s)", report.StatusDetail)
 	}
 	fmt.Fprintln(w)
 	if report.DaemonVersion != "" {
-		fmt.Fprintf(w, "Daemon: %s\n", displayVersion(report.DaemonVersion))
+		fmt.Fprintf(w, "%s: %s\n", translator.T("cli.status.label.daemon"), displayVersionWithTranslator(report.DaemonVersion, translator))
 	}
-	fmt.Fprintf(w, "Config: %s [%s]\n", report.ConfigPath, report.ConfigState)
+	fmt.Fprintf(w, "%s: %s [%s]\n", translator.T("cli.label.config"), report.ConfigPath, localizedState(translator, report.ConfigState))
 	if report.ConfigError != "" {
-		fmt.Fprintf(w, "Config error: %s\n", report.ConfigError)
+		fmt.Fprintf(w, "%s: %s\n", translator.T("cli.status.label.config_error"), report.ConfigError)
 	}
-	fmt.Fprintf(w, "Rules: %d configured, %d enabled\n", report.ConfiguredRules, report.EnabledRules)
-	fmt.Fprintf(w, "Control: %s\n", report.ControlAddress)
+	fmt.Fprintln(w, translator.Tf("cli.status.rules", report.ConfiguredRules, report.EnabledRules))
+	fmt.Fprintf(w, "%s: %s\n", translator.T("cli.status.label.control"), report.ControlAddress)
 	if report.ServiceState == "" {
-		fmt.Fprintln(w, "Service: not inspected")
+		fmt.Fprintln(w, translator.T("cli.status.service_not_inspected"))
 	} else if report.ServiceDetail == "" {
-		fmt.Fprintf(w, "Service: %s\n", report.ServiceState)
+		fmt.Fprintf(w, "%s: %s\n", translator.T("cli.status.label.service"), localizedState(translator, report.ServiceState))
 	} else {
-		fmt.Fprintf(w, "Service: %s (%s)\n", report.ServiceState, report.ServiceDetail)
+		fmt.Fprintf(w, "%s: %s (%s)\n", translator.T("cli.status.label.service"), localizedState(translator, report.ServiceState), report.ServiceDetail)
 	}
 }
 
 func displayVersion(value string) string {
+	return displayVersionWithTranslator(value, defaultTranslator())
+}
+
+func displayVersionWithTranslator(value string, translator *i18n.Translator) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "unknown"
+		return translatorOrEnglish(translator).T("common.unknown")
 	}
 	return value
+}
+
+func localizedState(translator *i18n.Translator, value string) string {
+	translator = translatorOrEnglish(translator)
+	key := ""
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "running":
+		key = "state.running"
+	case "not running":
+		key = "state.not_running"
+	case "unknown":
+		key = "common.unknown"
+	case "loaded":
+		key = "state.loaded"
+	case "missing":
+		key = "state.missing"
+	case "invalid":
+		key = "state.invalid"
+	case "installed":
+		key = "state.installed"
+	case "not installed":
+		key = "state.not_installed"
+	}
+	if key == "" {
+		return value
+	}
+	return translator.T(key)
 }
 
 func shouldPrintRuntimeSummary(cfg config.File, options foregroundOptions) bool {
@@ -338,18 +469,24 @@ func shouldPrintRuntimeSummary(cfg config.File, options foregroundOptions) bool 
 }
 
 func printRuntimeReady(w io.Writer, info runtimeReadyInfo) {
-	fmt.Fprintln(w, "\nvmflow is running")
-	fmt.Fprintf(w, "Config: %s\n", info.ConfigPath)
-	fmt.Fprintf(w, "Forwarding: %d active / %d enabled / %d configured\n", info.ActiveRules, info.EnabledRules, info.ConfiguredRules)
-	fmt.Fprintf(w, "Control: %s\n", info.ControlAddress)
+	printRuntimeReadyWithTranslator(w, info, defaultTranslator())
+}
+
+func printRuntimeReadyWithTranslator(w io.Writer, info runtimeReadyInfo, translator *i18n.Translator) {
+	translator = translatorOrEnglish(translator)
+	fmt.Fprintln(w, translator.T("cli.runtime.running"))
+	fmt.Fprintln(w, translator.Tf("cli.output.config", info.ConfigPath))
+	fmt.Fprintln(w, translator.Tf("cli.runtime.forwarding", info.ActiveRules, info.EnabledRules, info.ConfiguredRules))
+	fmt.Fprintf(w, "%s: %s\n", translator.T("cli.status.label.control"), info.ControlAddress)
 	if info.ActiveRules == 0 {
-		fmt.Fprintln(w, "No forwarding rules are active.")
-		fmt.Fprintf(w, "Next: press Ctrl+C, then run `vmflow init -config %q`\n", info.ConfigPath)
+		fmt.Fprintln(w, translator.T("cli.runtime.no_active_rules"))
+		fmt.Fprintln(w, translator.Tf("cli.runtime.next_init", info.ConfigPath))
 	} else {
-		fmt.Fprintln(w, "Dashboard: open another terminal and run `vmflow tui`")
-		fmt.Fprintln(w, "Status: vmflow status")
+		fmt.Fprintln(w, translator.T("cli.runtime.dashboard"))
+		fmt.Fprintln(w, translator.T("cli.runtime.status"))
+		fmt.Fprintln(w, translator.Tf("cli.runtime.background", nativeServiceInstallCommand(info.ConfigPath)))
 	}
-	fmt.Fprintln(w, "Stop: Ctrl+C")
+	fmt.Fprintln(w, translator.T("cli.runtime.stop"))
 }
 
 func countEnabledRules(rules []engine.Rule) int {
