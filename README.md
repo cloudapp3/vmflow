@@ -51,65 +51,34 @@ Documentation: [English quick start](https://github.com/cloudapp3/vmdocs/blob/ma
 
 ## Quick start
 
-Install the current stable release (Linux/macOS):
+Install the current stable release and put it on `PATH` for the current shell
+(Linux/macOS):
 
 ```bash
 VMFLOW_BIN_DIR="$(
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
     | bash -s -- --version v0.3.0 --print-install-dir
-)" \
-  && [ -n "$VMFLOW_BIN_DIR" ] \
-  && [ "${VMFLOW_BIN_DIR#/}" != "$VMFLOW_BIN_DIR" ] \
-  && [ -x "$VMFLOW_BIN_DIR/vmflow" ] \
-  && export PATH="$VMFLOW_BIN_DIR:$PATH"
+)" && export PATH="$VMFLOW_BIN_DIR:$PATH"
 ```
 
-Omit `--version v0.3.0` to follow the latest stable release automatically.
-Release archives keep `examples/config.yaml` as a reference; the installer
-never activates or copies it.
+Omit `--version v0.3.0` to follow the latest stable release automatically. For
+directory selection, `--system`, checksum verification, and shell startup-file
+handling, see [Installation details](#installation-details).
 
-Without an explicit `--dir`, the installer first reuses a conventional existing
-vmflow installation directory. A fresh root install
-uses `/usr/local/bin`; an unprivileged user prefers `~/.local/bin` or `~/bin`
-when either is already in `PATH`, then falls back to `~/.local/bin`. For an
-automatic home-directory install, the installer adds an idempotent entry to the
-selected shell's common startup file (`.zshrc`, `.bashrc`, or `.profile`) and
-prints the exact reload command; other shells receive a warning. The captured
-directory and `export` above make the selected binary available in the current
-shell without guessing its location.
-
-The installer writes only the `vmflow` executable. `vmflow init` creates the
-active configuration after the user chooses system-service or foreground mode.
-`vmflow run` uses the current user's config by default; `-config PATH` always
-overrides automatic path selection.
-
-The bundled SSH forwarding example is disabled and listens on loopback only.
-Run the first-use wizard to replace that untouched example with a validated,
-enabled rule. Non-loopback listeners require an explicit exposure confirmation:
+Run the first-use wizard to choose a language, write the active configuration,
+and pick a run mode:
 
 ```bash
 vmflow init
 ```
 
-The wizard also enables authenticated management with a random admin token and
-saves a mode-`0600` local client profile. `vmflow ctl` and `vmflow tui` use that
-profile automatically, so the token is not placed in shell history.
-
-Before loading or writing configuration, an interactive wizard offers three run modes: install
-the native system service and run in the background (recommended), run in the
-current terminal, or do not start yet. System-service installation shows the
-resolved binary and config paths and requires explicit confirmation before any
-administrator handoff. For scripts, `-start` retains its foreground behavior;
-use `-install-service` to explicitly install or update the native service and
-start it in the background. The two flags are mutually exclusive.
-
-The first wizard prompt displays numbered choices for English and Simplified
-Chinese. Select `1` or `2`; pressing Enter keeps the shown default. The choice
-is saved as the top-level `language` value in `config.yaml`. The prompt also
-accepts `en` or `zh-CN` for compatibility. To change it later, set that field
-to `en` or `zh-CN`. For a one-off override, use
-`vmflow --lang zh-CN <command>` or set `VMFLOW_LANG`. Resolution order is
-`--lang`, `VMFLOW_LANG`, `config.yaml`, then English.
+The wizard enables authenticated management with a random admin token saved to
+a mode-`0600` local client profile, so `vmflow ctl` and `vmflow tui` work
+without a token on the command line. The bundled SSH forwarding example is
+disabled and listens on loopback only; non-loopback listeners require an
+explicit exposure confirmation. For the language resolution order and the
+`-start` / `-install-service` script flags, see
+[Installation details](#installation-details).
 
 What happens after setup depends on the run mode selected in `vmflow init`:
 
@@ -155,6 +124,38 @@ vmflow status
 vmflow version -json
 ```
 
+Or build from source:
+
+```bash
+git clone https://github.com/cloudapp3/vmflow.git
+cd vmflow
+go build -trimpath -o vmflow ./cmd/vmflow
+./vmflow init
+./vmflow run
+```
+
+## Installation details
+
+The installer downloads GitHub Release archives, verifies `checksums.txt` with
+SHA-256 by default, and writes only the `vmflow` executable. Release archives
+keep `examples/config.yaml` as a reference; the installer never activates or
+copies it. `vmflow init` creates the active configuration afterward, and
+`vmflow run` uses the current user's config by default; `-config PATH` always
+overrides automatic path selection.
+
+Without an explicit `--dir`, the installer first reuses a conventional existing
+vmflow installation directory. A fresh root install uses `/usr/local/bin`; an
+unprivileged user prefers `~/.local/bin` or `~/bin` when either is already in
+`PATH`, then falls back to `~/.local/bin`. For an automatic home-directory
+install, the installer adds an idempotent entry to the selected shell's common
+startup file (`.zshrc`, `.bashrc`, or `.profile`) and prints the exact reload
+command; other shells receive a warning. Override the automatic directory with
+`--dir PATH` or `VMFLOW_INSTALL_DIR`; explicit directories never modify shell
+startup files. Use `--no-modify-path` to disable startup-file changes for an
+automatic user install, `--print-install-dir` for machine-readable PATH
+integration, and `--skip-verify` to skip checksum verification if needed. For
+private releases or higher GitHub API limits, set `GITHUB_TOKEN` or `GH_TOKEN`.
+
 To explicitly request a system installation, use `--system`. It writes directly
 when already root and otherwise validates sudo before downloading, then uses
 sudo only to prepare, inspect, and write the target directory:
@@ -168,23 +169,23 @@ curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
 still created later by `vmflow init`, which requests administrator privileges
 only when the system-service choice needs the system config path.
 
-The installer downloads GitHub Release archives, verifies `checksums.txt` with
-SHA-256 by default, and installs only `vmflow`. Override the automatic directory with `--dir PATH` or
-`VMFLOW_INSTALL_DIR`; explicit directories never modify shell startup files.
-Use `--no-modify-path` to disable startup-file changes for an automatic user
-install, `--print-install-dir` for machine-readable PATH integration, and
-`--skip-verify` to skip checksum verification if needed. For private releases
-or higher GitHub API limits, set `GITHUB_TOKEN` or `GH_TOKEN`.
+### Run-mode and language options
 
-Or build from source:
+`vmflow init` offers three run modes: install the native system service and run
+in the background (recommended), run in the current terminal, or configure only.
+System-service installation shows the resolved binary and config paths and
+requires explicit confirmation before any administrator handoff. For scripts,
+`-start` retains its foreground behavior; use `-install-service` to explicitly
+install or update the native service and start it in the background. The two
+flags are mutually exclusive.
 
-```bash
-git clone https://github.com/cloudapp3/vmflow.git
-cd vmflow
-go build -trimpath -o vmflow ./cmd/vmflow
-./vmflow init
-./vmflow run
-```
+The first wizard prompt displays numbered choices for English and Simplified
+Chinese. Select `1` or `2`; pressing Enter keeps the shown default. The choice
+is saved as the top-level `language` value in `config.yaml`. The prompt also
+accepts `en` or `zh-CN` for compatibility. To change it later, set that field
+to `en` or `zh-CN`. For a one-off override, use
+`vmflow --lang zh-CN <command>` or set `VMFLOW_LANG`. Resolution order is
+`--lang`, `VMFLOW_LANG`, `config.yaml`, then English.
 
 ## Configuration
 
@@ -406,10 +407,10 @@ Register vmflow as a native OS service so it starts at boot and restarts on cras
 vmflow init --install-service
 ```
 
-The interactive `vmflow init` wizard offers this background-service flow before
-it chooses or writes a config. It verifies the target, hands the prepared config
-to an administrator process for an atomic system-path write, then checks both
-native-service state and the local management endpoint before reporting success.
+`vmflow init --install-service` runs the wizard's background-service flow: it
+verifies the target, hands the prepared config to an administrator process for
+an atomic system-path write, then checks both native-service state and the
+local management endpoint before reporting success.
 
 For safety, `service install` refuses to register a service that points at a
 relative path, a user-writable binary or config file, or either file under
@@ -444,21 +445,32 @@ custom `VMFLOW_CLIENT_CONFIG` targets never start the local service.
 - **macOS**: writes a launchd daemon (`KeepAlive` restarts on crash) and bootstraps it. Logs land under `/var/log/vmflow/` (override with `--log-file`).
 - **Windows**: registers a Windows Service (`start=auto`, restart-on-failure) visible in `services.msc`. Because the SCM provides no stdout, logs default to `C:\ProgramData\vmflow\logs\vmflow.log`; override with `--log-file` if needed.
 
-Uninstall with `sudo vmflow service uninstall` (config and logs are left in place). Inspect with `vmflow service status`.
+Uninstall the native service with `sudo vmflow service uninstall` (config and
+logs are left in place); inspect with `vmflow service status`. For complete
+removal of the binary, state, and the installer's PATH block, see
+[Uninstall](#uninstall).
+
+## Uninstall
+
+Remove just the native OS service, leaving the binary, config, and logs in
+place:
+
+```bash
+sudo vmflow service uninstall
+```
 
 For a complete removal, run `sudo vmflow uninstall`. It prints the full plan
 and requires confirmation before removing the service, binary, vmflow-managed
 system/user config directories, persistent traffic statistics and quota state,
-logs,
-the local management client profile, update cache, and vmflow-owned certificate
-caches. Stats/quota files and the client profile are parsed and
+logs, the local management client profile, update cache, and vmflow-owned
+certificate caches. Stats/quota files and the client profile are parsed and
 revalidated immediately before removal; changed or unrecognized files are kept.
 Config directories without a valid `.vmflow-managed` marker and custom
 `-config` paths are preserved. External TLS certificate and key files are never
-removed because they may be shared with other services. Custom
-certificate cache directories are left in place unless the directory is
-exclusively owned by vmflow and contains a `.vmflow-owned` marker; use
-`--dry-run` to inspect the plan without changing the system.
+removed because they may be shared with other services. Custom certificate cache
+directories are left in place unless the directory is exclusively owned by
+vmflow and contains a `.vmflow-owned` marker; use `--dry-run` to inspect the
+plan without changing the system.
 
 For a user installation created by `install.sh`, run the installer-level
 uninstall so it can also remove its exact PATH block from `.zshrc`, `.bashrc`,
