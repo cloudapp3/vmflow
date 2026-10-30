@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudapp3/vmflow/engine"
@@ -46,6 +48,15 @@ type File struct {
 	CertReview                      CertReviewConfig `json:"cert_review,omitempty" yaml:"cert_review,omitempty"`
 	Stats                           StatsConfig      `json:"stats,omitempty" yaml:"stats,omitempty"`
 	Rules                           []engine.Rule    `json:"rules" yaml:"rules"`
+
+	// UnknownFields records YAML keys this File does not define, with their
+	// document paths (top level, per rule, and inside rule policies). The
+	// config document is an extension point — the management editor preserves
+	// comments, anchors, and custom keys — so unknown keys are kept and
+	// surfaced here instead of failing the parse. Callers should log them: a
+	// misspelled policy key such as "bandwith_limit" would otherwise silently
+	// disable the rule's limit.
+	UnknownFields []string `json:"-" yaml:"-"`
 }
 
 // ControlListenAddress returns the internal management listener. The host is
@@ -130,6 +141,9 @@ func Parse(raw []byte) (File, error) {
 	if len(raw) == 0 {
 		return File{}, fmt.Errorf("empty config")
 	}
+	// File.UnmarshalYAML records unknown keys in UnknownFields instead of
+	// rejecting them, so a typo such as "bandwith_limit" is reported to the
+	// operator rather than silently disabling the rule's policy.
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return File{}, err
 	}
@@ -177,6 +191,121 @@ func Parse(raw []byte) (File, error) {
 	}
 	return cfg, nil
 }
+
+// UnmarshalYAML decodes the config document. Unknown keys anywhere in the
+// document are preserved (the document is an extension point) and collected
+// into File.UnknownFields with their paths, so a misspelled policy key such as
+// "bandwith_limit" is reported instead of silently dropping the policy.
+func (f *File) UnmarshalYAML(value *yaml.Node) error {
+	type fileAlias File
+	var alias fileAlias
+	if err := value.Decode(&alias); err != nil {
+		return err
+	}
+	alias.UnknownFields = collectUnknownFields(value)
+	*f = File(alias)
+	return nil
+}
+
+// ruleNestedMappings maps rule keys whose own mappings are checked against
+// their engine struct so typos cannot hide one level below the rule.
+var ruleNestedMappings = map[string]func() map[string]struct{}{
+	"bandwidth_limit": knownBandwidthKeys,
+	"traffic_quota":   knownQuotaKeys,
+}
+
+func collectUnknownFields(node *yaml.Node) []string {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	var unknown []string
+	known := knownFileKeys()
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key, value := node.Content[index].Value, node.Content[index+1]
+		if _, ok := known[key]; key == "<<" || ok {
+			continue
+		}
+		// A key whose value defines an anchor (e.g. "rule_defaults:
+		// &rule_defaults") feeds fields into other parts of the document via
+		// aliases, so it is load-bearing rather than ignored.
+		if value.Anchor != "" {
+			continue
+		}
+		unknown = append(unknown, key)
+	}
+	unknown = append(unknown, collectUnknownRuleFields(node)...)
+	return unknown
+}
+
+func collectUnknownRuleFields(node *yaml.Node) []string {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key, child := node.Content[index].Value, node.Content[index+1]
+		if key != "rules" || child.Kind != yaml.SequenceNode {
+			continue
+		}
+		var unknown []string
+		known := knownRuleKeys()
+		for ruleIndex, ruleNode := range child.Content {
+			if ruleNode.Kind != yaml.MappingNode {
+				continue
+			}
+			path := fmt.Sprintf("rules[%d]", ruleIndex)
+			for field := 0; field+1 < len(ruleNode.Content); field += 2 {
+				key, nested := ruleNode.Content[field].Value, ruleNode.Content[field+1]
+				if key == "<<" {
+					continue
+				}
+				if nestedKeys, isNested := ruleNestedMappings[key]; isNested {
+					unknown = append(unknown, unknownMappingFields(nested, nestedKeys(), path+"."+key)...)
+					continue
+				}
+				if _, ok := known[key]; !ok {
+					unknown = append(unknown, path+"."+key)
+				}
+			}
+		}
+		return unknown
+	}
+	return nil
+}
+
+func unknownMappingFields(node *yaml.Node, known map[string]struct{}, path string) []string {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	var unknown []string
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key := node.Content[index].Value
+		if _, ok := known[key]; key == "<<" || ok {
+			continue
+		}
+		unknown = append(unknown, path+"."+key)
+	}
+	return unknown
+}
+
+func yamlKeySet[T any]() map[string]struct{} {
+	keys := make(map[string]struct{})
+	typ := reflect.TypeFor[T]()
+	for index := range typ.NumField() {
+		name, _, _ := strings.Cut(typ.Field(index).Tag.Get("yaml"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		keys[name] = struct{}{}
+	}
+	return keys
+}
+
+var (
+	knownFileKeys      = sync.OnceValue(func() map[string]struct{} { return yamlKeySet[File]() })
+	knownRuleKeys      = sync.OnceValue(func() map[string]struct{} { return yamlKeySet[engine.Rule]() })
+	knownBandwidthKeys = sync.OnceValue(func() map[string]struct{} { return yamlKeySet[engine.BandwidthLimit]() })
+	knownQuotaKeys     = sync.OnceValue(func() map[string]struct{} { return yamlKeySet[engine.TrafficQuota]() })
+)
 
 func normalizeLanguage(value string) (language, invalid string) {
 	value = strings.TrimSpace(value)

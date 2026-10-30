@@ -195,6 +195,119 @@ func TestCheckConfigACMEConflict(t *testing.T) {
 	}
 }
 
+func TestCheckConfigDetectsSelfForwardingLoop(t *testing.T) {
+	rule := testForwardRule("self", engine.ProtocolTCP, "127.0.0.1", 2201)
+	rule.TargetPort = 2201
+	result := CheckConfig(config.File{Rules: []engine.Rule{rule}}, nil, Options{})
+	if result.OK || result.ErrorCount != 1 {
+		t.Fatalf("expected one loop error, got %+v", result)
+	}
+	if !hasRuleCheck(result.Items, "forwarding_loop", "self") {
+		t.Fatalf("missing forwarding_loop item for self: %+v", result.Items)
+	}
+}
+
+func TestCheckConfigDetectsCrossRuleForwardingLoop(t *testing.T) {
+	first := testForwardRule("r1", engine.ProtocolTCP, "127.0.0.1", 2201)
+	first.TargetPort = 2202
+	second := testForwardRule("r2", engine.ProtocolTCP, "127.0.0.1", 2202)
+	second.TargetPort = 2201
+	result := CheckConfig(config.File{Rules: []engine.Rule{first, second}}, nil, Options{})
+	if result.OK || result.ErrorCount != 2 {
+		t.Fatalf("expected one loop error per cycle rule, got %+v", result)
+	}
+	if !hasRuleCheck(result.Items, "forwarding_loop", "r1") || !hasRuleCheck(result.Items, "forwarding_loop", "r2") {
+		t.Fatalf("missing forwarding_loop items: %+v", result.Items)
+	}
+}
+
+func TestCheckConfigDetectsLoopThroughWildcardListener(t *testing.T) {
+	first := testForwardRule("wild", engine.ProtocolTCP, "0.0.0.0", 2201)
+	first.TargetPort = 2202
+	second := testForwardRule("back", engine.ProtocolTCP, "127.0.0.1", 2202)
+	second.TargetPort = 2201
+	result := CheckConfig(config.File{Rules: []engine.Rule{first, second}}, nil, Options{})
+	if result.OK {
+		t.Fatalf("wildcard listener must close the loop, got %+v", result)
+	}
+	if !hasRuleCheck(result.Items, "forwarding_loop", "wild") || !hasRuleCheck(result.Items, "forwarding_loop", "back") {
+		t.Fatalf("missing forwarding_loop items: %+v", result.Items)
+	}
+}
+
+func TestCheckConfigForwardingLoopIgnoresDisabledAndInvalidRules(t *testing.T) {
+	first := testForwardRule("off", engine.ProtocolTCP, "127.0.0.1", 2201)
+	first.TargetPort = 2202
+	first.Enabled = false
+	second := testForwardRule("valid", engine.ProtocolTCP, "127.0.0.1", 2202)
+	second.TargetPort = 2201
+	second.ListenPort = 0 // invalid: never runs, so it cannot close a loop
+	result := CheckConfig(config.File{Rules: []engine.Rule{first, second}}, nil, Options{})
+	for _, item := range result.Items {
+		if item.Check == "forwarding_loop" {
+			t.Fatalf("unexpected forwarding_loop item: %+v", item)
+		}
+	}
+}
+
+func TestCheckConfigChainWithoutCycleIsOK(t *testing.T) {
+	first := testForwardRule("r1", engine.ProtocolTCP, "127.0.0.1", 2201)
+	first.TargetPort = 2202
+	second := testForwardRule("r2", engine.ProtocolTCP, "127.0.0.1", 2202)
+	second.TargetPort = 2203
+	third := testForwardRule("r3", engine.ProtocolTCP, "127.0.0.1", 2203)
+	third.TargetPort = 80 // leaves vmflow: a chain, not a cycle
+	result := CheckConfig(config.File{Rules: []engine.Rule{first, second, third}}, nil, Options{})
+	if !result.OK {
+		t.Fatalf("chained rules without a cycle should pass, got %+v", result)
+	}
+}
+
+func TestCheckConfigLoopBlamesOnlyCycleRules(t *testing.T) {
+	feeder := testForwardRule("feeder", engine.ProtocolTCP, "127.0.0.1", 2200)
+	feeder.TargetPort = 2201
+	first := testForwardRule("r1", engine.ProtocolTCP, "127.0.0.1", 2201)
+	first.TargetPort = 2202
+	second := testForwardRule("r2", engine.ProtocolTCP, "127.0.0.1", 2202)
+	second.TargetPort = 2201
+	result := CheckConfig(config.File{Rules: []engine.Rule{feeder, first, second}}, nil, Options{})
+	if hasRuleCheck(result.Items, "forwarding_loop", "feeder") {
+		t.Fatalf("feeder rule must not be blamed for the cycle: %+v", result.Items)
+	}
+	if !hasRuleCheck(result.Items, "forwarding_loop", "r1") || !hasRuleCheck(result.Items, "forwarding_loop", "r2") {
+		t.Fatalf("cycle rules missing forwarding_loop items: %+v", result.Items)
+	}
+}
+
+func TestCheckConfigDetectsUDPLoopThroughTCPUDPRule(t *testing.T) {
+	first := testForwardRule("pair-tcpudp", engine.ProtocolTCPUDP, "127.0.0.1", 5353)
+	first.TargetPort = 5354
+	second := testForwardRule("pair-udp", engine.ProtocolUDP, "127.0.0.1", 5354)
+	second.TargetPort = 5353
+	result := CheckConfig(config.File{Rules: []engine.Rule{first, second}}, nil, Options{})
+	if result.OK || result.ErrorCount != 2 {
+		t.Fatalf("expected one loop error per cycle rule, got %+v", result)
+	}
+	// The TCP side of the tcpudp rule has no cycle; only the UDP graph closes.
+	if !hasRuleCheck(result.Items, "forwarding_loop", "pair-udp") || !hasRuleCheck(result.Items, "forwarding_loop", "pair-tcpudp") {
+		t.Fatalf("missing forwarding_loop items: %+v", result.Items)
+	}
+}
+
+func TestCheckConfigWarnsAboutUnknownConfigKeys(t *testing.T) {
+	cfg := config.File{
+		Rules:         []engine.Rule{testForwardRule("r1", engine.ProtocolTCP, "127.0.0.1", 2201)},
+		UnknownFields: []string{"rules[0].bandwith_limit"},
+	}
+	result := CheckConfig(cfg, nil, Options{})
+	if !result.OK || result.WarningCount != 1 {
+		t.Fatalf("unknown keys must warn without failing, got %+v", result)
+	}
+	if !hasCheck(result.Items, "unknown_config_key") {
+		t.Fatalf("missing unknown_config_key warning: %+v", result.Items)
+	}
+}
+
 func testForwardRule(id string, protocol engine.Protocol, listenAddr string, listenPort int) engine.Rule {
 	return engine.Rule{
 		RuleID:     id,
@@ -211,6 +324,15 @@ func testForwardRule(id string, protocol engine.Protocol, listenAddr string, lis
 func hasCheck(items []Item, check string) bool {
 	for _, item := range items {
 		if item.Check == check {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRuleCheck(items []Item, check, ruleID string) bool {
+	for _, item := range items {
+		if item.Check == check && item.RuleID == ruleID {
 			return true
 		}
 	}

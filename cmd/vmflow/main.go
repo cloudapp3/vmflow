@@ -201,6 +201,10 @@ func runForegroundWithTranslator(args []string, translator *i18n.Translator) {
 	if cfg.UsedDeprecatedControlListenAddr {
 		logger.Warn("control_listen_addr is deprecated; replace it with control_port", "component", "config", "control_port", cfg.ControlPort)
 	}
+	if len(cfg.UnknownFields) > 0 {
+		logger.Warn("config contains unknown keys; they are preserved but ignored and a misspelled policy key silently loses its policy",
+			"component", "config", "keys", strings.Join(cfg.UnknownFields, ", "))
+	}
 
 	// On Windows, when launched by the Service Control Manager, hand off to a
 	// native service runner instead of the foreground loop. No-op elsewhere.

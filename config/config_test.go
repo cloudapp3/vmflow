@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -348,5 +349,92 @@ func TestParseRejectsInvalidStatsFlushInterval(t *testing.T) {
 				t.Fatalf("flush interval %q should fail", interval)
 			}
 		})
+	}
+}
+
+// TestParseCollectsUnknownFieldsWithoutRejecting pins the extension-point
+// contract: unknown keys are preserved and reported with their document paths
+// instead of failing the parse, so a misspelled policy key such as
+// "bandwith_limit" is visible to operators rather than silently dropping the
+// rule's policy.
+func TestParseCollectsUnknownFieldsWithoutRejecting(t *testing.T) {
+	cfg, err := Parse([]byte(`
+custom_extension: keep
+rules:
+  - rule_id: typo
+    name: typo
+    protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: 2201
+    target_addr: 127.0.0.1
+    target_port: 22
+    enabled: false
+    bandwith_limit:
+      rate: 1024
+`))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	want := []string{"custom_extension", "rules[0].bandwith_limit"}
+	if !reflect.DeepEqual(cfg.UnknownFields, want) {
+		t.Fatalf("unknown fields = %v, want %v", cfg.UnknownFields, want)
+	}
+}
+
+func TestParseCollectsUnknownNestedPolicyFields(t *testing.T) {
+	cfg, err := Parse([]byte(`
+rules:
+  - rule_id: nested-typo
+    name: nested-typo
+    protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: 2201
+    target_addr: 127.0.0.1
+    target_port: 22
+    enabled: false
+    bandwidth_limit:
+      rate: 1024
+      raate: 2048
+    traffic_quota:
+      daily: 1000
+      action: block
+      timezne: UTC
+`))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	want := []string{"rules[0].bandwidth_limit.raate", "rules[0].traffic_quota.timezne"}
+	if !reflect.DeepEqual(cfg.UnknownFields, want) {
+		t.Fatalf("unknown fields = %v, want %v", cfg.UnknownFields, want)
+	}
+}
+
+func TestParseKnownConfigYieldsNoUnknownFields(t *testing.T) {
+	cfg, err := Parse([]byte(`version: 1
+rule_defaults: &rule_defaults
+  protocol: tcp
+  enabled: false
+rules: # keep rules comment
+  - <<: *rule_defaults
+    rule_id: known
+    name: known
+    listen_addr: 127.0.0.1
+    listen_port: 2201
+    target_addr: 127.0.0.1
+    target_port: 22
+    bandwidth_limit:
+      rate: 1024
+    traffic_quota:
+      daily: 1000
+      action: block
+`))
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if len(cfg.UnknownFields) != 0 {
+		t.Fatalf("unknown fields = %v, want none", cfg.UnknownFields)
+	}
+	if cfg.Rules[0].Bandwidth == nil || cfg.Rules[0].TrafficQuota == nil {
+		t.Fatalf("anchor-merged policy was lost: %+v", cfg.Rules[0])
 	}
 }

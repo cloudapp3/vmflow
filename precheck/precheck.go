@@ -76,7 +76,9 @@ func CheckConfig(cfg config.File, running []engine.Rule, opts Options) Result {
 		runningEndpoints: indexRunningEndpoints(running),
 		resolver:         dnsresolver.New(),
 	}
+	checker.checkUnknownFields()
 	checker.checkRules()
+	checker.checkForwardingLoops()
 	checker.checkACME()
 
 	result := Result{
@@ -382,6 +384,160 @@ func (c *checker) addError(check, ruleID, message string) {
 func (c *checker) addWarning(check, ruleID, message string) {
 	c.warnings++
 	c.items = append(c.items, Item{Severity: SeverityWarning, Check: check, RuleID: ruleID, Message: message})
+}
+
+// checkUnknownFields reports config keys vmflow does not know. They are kept
+// for compatibility, but a misspelled policy key silently loses its policy, so
+// operators must see them before relying on the configuration.
+func (c *checker) checkUnknownFields() {
+	for _, field := range c.cfg.UnknownFields {
+		c.addWarning("unknown_config_key", "", fmt.Sprintf("unknown config key %q is preserved but ignored", field))
+	}
+}
+
+// flowNode is one endpoint traffic can enter through, normalized so wildcard
+// listen addresses (0.0.0.0, ::) share one node per network and port.
+type flowNode struct {
+	Network string
+	Addr    string
+	Port    int
+}
+
+// loopRule is one enabled rule's place in the forwarding graph: the rule id and
+// the literal endpoint its traffic exits towards on one network.
+type loopRule struct {
+	ruleID string
+	target flowNode
+}
+
+type loopVisitState uint8
+
+const (
+	loopUnvisited loopVisitState = iota
+	loopOnPath
+	loopDone
+)
+
+// checkForwardingLoops reports rules whose forwarding target is served by
+// another vmflow listener and closes a cycle, including a rule forwarding
+// straight into its own listener. Such a chain loops traffic inside vmflow
+// until a bandwidth or quota limit stops it, so every rule in the cycle is an
+// error. Only literal target addresses can be followed statically; hostname
+// targets are ignored here.
+func (c *checker) checkForwardingLoops() {
+	byNode := make(map[flowNode][]loopRule)
+	for _, rawRule := range c.cfg.Rules {
+		rule := rawRule.Standardize()
+		if !rule.Enabled || rule.Validate() != nil {
+			continue
+		}
+		networks, ok := forwardedNetworks(rule.Protocol)
+		if !ok {
+			continue
+		}
+		for _, network := range networks {
+			node := flowNode{Network: network, Addr: normalizeAddr(rule.ListenAddr), Port: rule.ListenPort}
+			byNode[node] = append(byNode[node], loopRule{
+				ruleID: rule.RuleID,
+				target: flowNode{Network: network, Addr: normalizeAddr(rule.TargetAddr), Port: rule.TargetPort},
+			})
+		}
+	}
+	if len(byNode) == 0 {
+		return
+	}
+	detector := &loopDetector{byNode: byNode, state: make(map[flowNode]loopVisitState), reported: make(map[string]bool), checker: c}
+	for node := range byNode {
+		detector.visit(node)
+	}
+}
+
+func forwardedNetworks(protocol engine.Protocol) ([]string, bool) {
+	switch protocol {
+	case engine.ProtocolTCP, engine.ProtocolHTTP, engine.ProtocolHTTPS:
+		return []string{"tcp"}, true
+	case engine.ProtocolUDP:
+		return []string{"udp"}, true
+	case engine.ProtocolTCPUDP:
+		return []string{"tcp", "udp"}, true
+	default:
+		return nil, false
+	}
+}
+
+// loopDetector walks the forwarding graph depth-first. A rule is part of a
+// cycle when following targets from its listener leads back to a listener that
+// is already on the current path; rules on the path before that entry point
+// merely feed the cycle and are not blamed.
+type loopDetector struct {
+	byNode    map[flowNode][]loopRule
+	state     map[flowNode]loopVisitState
+	pathNodes []flowNode
+	pathRules []loopRule
+	reported  map[string]bool
+	checker   *checker
+}
+
+func (d *loopDetector) visit(node flowNode) {
+	if d.state[node] != loopUnvisited {
+		return
+	}
+	d.state[node] = loopOnPath
+	d.pathNodes = append(d.pathNodes, node)
+	for _, rule := range d.byNode[node] {
+		d.pathRules = append(d.pathRules, rule)
+		for _, listener := range d.servingListener(rule.target) {
+			switch d.state[listener] {
+			case loopOnPath:
+				d.reportCycle(listener)
+			case loopUnvisited:
+				d.visit(listener)
+			}
+		}
+		d.pathRules = d.pathRules[:len(d.pathRules)-1]
+	}
+	d.pathNodes = d.pathNodes[:len(d.pathNodes)-1]
+	d.state[node] = loopDone
+}
+
+// servingListener resolves the listener node that receives traffic sent to
+// target: the exact endpoint, or a wildcard listener on the same network and
+// port, which accepts every local address.
+func (d *loopDetector) servingListener(target flowNode) []flowNode {
+	if len(d.byNode[target]) > 0 {
+		return []flowNode{target}
+	}
+	wildcard := flowNode{Network: target.Network, Addr: "", Port: target.Port}
+	if len(d.byNode[wildcard]) > 0 {
+		return []flowNode{wildcard}
+	}
+	return nil
+}
+
+func (d *loopDetector) reportCycle(entry flowNode) {
+	start := 0
+	for index, node := range d.pathNodes {
+		if node == entry {
+			start = index
+			break
+		}
+	}
+	var blamed, chain []string
+	for _, rule := range d.pathRules[start:] {
+		if !d.reported[rule.ruleID] {
+			d.reported[rule.ruleID] = true
+			blamed = append(blamed, rule.ruleID)
+		}
+		chain = append(chain, rule.ruleID)
+	}
+	if len(blamed) == 0 {
+		return
+	}
+	chain = append(chain, chain[0])
+	message := fmt.Sprintf("forwarding loop detected: %s", strings.Join(chain, " -> "))
+	for _, ruleID := range blamed {
+		d.checker.addError("forwarding_loop", ruleID, message)
+	}
 }
 
 func endpointsForRule(rule engine.Rule) []endpoint {
