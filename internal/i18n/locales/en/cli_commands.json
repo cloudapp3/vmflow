@@ -34,7 +34,7 @@
   "cli.mcp.error.tls_requires_https": "MCP TLS options require an https daemon management address",
   "cli.mcp.flag.address": "local daemon management address",
   "cli.mcp.flag.token": "daemon management token (or environment/client profile)",
-  "cli.mcp.usage": "Usage:\n  vmflow mcp [flags]\n\nStarts a read-only MCP server over stdio for a running local vmflow daemon.\n\nOptions:",
+  "cli.mcp.usage": "Usage:\n  vmflow mcp [flags]\n\nStarts an MCP server over stdio for a running local vmflow daemon. The server\nis read-only unless --write is passed, which adds single-rule write tools\n(requiring an admin management token).\n\nOptions:",
   "cli.service.error.failed": "service %s failed: %v",
   "cli.service.error.unknown_action": "unknown service action: %s (expected install|start|uninstall|status)",
   "cli.service.flag.binary": "path to the vmflow binary (default: this executable; install requires a trusted root/admin-owned absolute path)",
@@ -112,5 +112,7 @@
   "cli.update.output.success": "updated successfully to %s",
   "cli.update.output.target_available": "target release available: %s (current %s)",
   "cli.update.output.updating": "updating from %s to %s",
-  "cli.update.usage": "Usage:\n  vmflow update [--check] [--version <tag>]\n\nOptions:"
+  "cli.update.usage": "Usage:\n  vmflow update [--check] [--version <tag>]\n\nOptions:",
+  "cli.mcp.flag.write": "enable forwarding-rule write tools (also VMFLOW_MCP_WRITE=1)",
+  "cli.mcp.error.write_env": "invalid VMFLOW_MCP_WRITE value: %v"
 }

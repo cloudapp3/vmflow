@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ import (
 type mcpOptions struct {
 	addr    string
 	token   string
+	write   bool
 	tls     controlapi.ClientTLSOptions
 	headers controlapi.HeaderFlags
 }
@@ -67,7 +69,8 @@ func runMCPWithIOAndTranslator(ctx context.Context, args []string, stdin io.Read
 	client.SetHTTPClient(httpClient)
 	client.SetHeaders(opts.headers.HTTPHeader())
 
-	if err := mcpserver.RunStdio(ctx, stdin, stdout, client, version); err != nil {
+	serverOptions := mcpserver.Options{WriteEnabled: opts.write}
+	if err := mcpserver.RunStdio(ctx, stdin, stdout, client, version, serverOptions); err != nil {
 		return fmt.Errorf("%s", translator.Tf("cli.mcp.error.serve_stdio", err))
 	}
 	return nil
@@ -88,6 +91,11 @@ func parseMCPOptionsWithTranslator(args []string, output io.Writer, translator *
 	}
 	addr := fs.String("addr", defaults.Address, translator.T("cli.mcp.flag.address"))
 	token := fs.String("token", defaults.Token, translator.T("cli.mcp.flag.token"))
+	writeDefault, err := mcpWriteEnvDefault(os.Getenv("VMFLOW_MCP_WRITE"))
+	if err != nil {
+		return mcpOptions{}, fmt.Errorf("%s", translator.Tf("cli.mcp.error.write_env", err))
+	}
+	write := fs.Bool("write", writeDefault, translator.T("cli.mcp.flag.write"))
 	tlsFlags := controlapi.AddClientTLSFlags(fs)
 	headerFlags := controlapi.AddHeaderFlags(fs)
 	localizeControlClientFlags(fs, translator)
@@ -110,9 +118,24 @@ func parseMCPOptionsWithTranslator(args []string, output io.Writer, translator *
 	return mcpOptions{
 		addr:    address,
 		token:   strings.TrimSpace(*token),
+		write:   *write,
 		tls:     tlsOpts,
 		headers: *headerFlags,
 	}, nil
+}
+
+// mcpWriteEnvDefault parses VMFLOW_MCP_WRITE. An unset or empty value keeps
+// read-only mode; an unparsable value is an error rather than a silent no-op.
+func mcpWriteEnvDefault(raw string) (bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("VMFLOW_MCP_WRITE must be a boolean value, got %q", raw)
+	}
+	return value, nil
 }
 
 func normalizeMCPControlAddress(raw string) (string, error) {

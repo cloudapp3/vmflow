@@ -53,17 +53,17 @@ type listForwardingRulesInput struct {
 // source IPs, and domains. The full rule is available only through an explicit
 // get_forwarding_rule call.
 type forwardingRuleSummary struct {
-	RuleID       string                 `json:"rule_id"`
-	Name         string                 `json:"name"`
-	Protocol     engine.Protocol        `json:"protocol"`
-	Enabled      bool                   `json:"enabled"`
-	SpeedLimit   int64                  `json:"speed_limit"`
-	Bandwidth    *engine.BandwidthLimit `json:"bandwidth_limit,omitempty"`
-	TrafficQuota *engine.TrafficQuota   `json:"traffic_quota,omitempty"`
-	MaxConn      int                    `json:"max_conn"`
-	IdleTimeout  int                    `json:"idle_timeout,omitempty"`
-	Revision     int64                  `json:"revision,omitempty"`
-	UpdatedTime  int64                  `json:"updated_time,omitempty"`
+	RuleID       string              `json:"rule_id"`
+	Name         string              `json:"name"`
+	Protocol     engine.Protocol     `json:"protocol"`
+	Enabled      bool                `json:"enabled"`
+	SpeedLimit   int64               `json:"speed_limit"`
+	Bandwidth    *bandwidthLimitView `json:"bandwidth_limit,omitempty"`
+	TrafficQuota *trafficQuotaView   `json:"traffic_quota,omitempty"`
+	MaxConn      int                 `json:"max_conn"`
+	IdleTimeout  int                 `json:"idle_timeout,omitempty"`
+	Revision     int64               `json:"revision,omitempty"`
+	UpdatedTime  int64               `json:"updated_time,omitempty"`
 }
 
 type listForwardingRulesOutput struct {
@@ -80,7 +80,7 @@ type getForwardingRuleInput struct {
 
 type getForwardingRuleOutput struct {
 	Revision       string                     `json:"revision"`
-	Rule           engine.Rule                `json:"rule"`
+	Rule           forwardingRuleView         `json:"rule"`
 	Running        bool                       `json:"running"`
 	StatsAvailable bool                       `json:"stats_available"`
 	Stats          controlapi.TrafficSnapshot `json:"stats"`
@@ -158,8 +158,8 @@ type getVMFlowStatusOutput struct {
 	Issues               []string                       `json:"issues"`
 }
 
-func registerTools(server *mcp.Server, backend backend, version string) {
-	handlers := newToolHandlersForBackend(backend, version)
+func registerTools(server *mcp.Server, backend backend, write writeBackend, version string) {
+	handlers := newToolHandlersForBackend(backend, write, version)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        toolGetVMFlowStatus,
 		Title:       "Get vmflow status",
@@ -190,17 +190,22 @@ func registerTools(server *mcp.Server, backend backend, version string) {
 		Description: "Validate the daemon's current on-disk configuration, including listen availability and target resolution, without applying changes.",
 		Annotations: precheckAnnotations,
 	}, handlers.runConfigPrecheck)
+	if write != nil {
+		registerWriteTools(server, handlers)
+	}
 }
 
 type toolHandlers struct {
 	backend backend
+	write   writeBackend
 	version string
 	gate    chan struct{}
 }
 
-func newToolHandlersForBackend(backend backend, version string) *toolHandlers {
+func newToolHandlersForBackend(backend backend, write writeBackend, version string) *toolHandlers {
 	return &toolHandlers{
 		backend: backend,
+		write:   write,
 		version: version,
 		gate:    make(chan struct{}, maxConcurrentTools),
 	}
@@ -209,7 +214,7 @@ func newToolHandlersForBackend(backend backend, version string) *toolHandlers {
 func (t *toolHandlers) getVMFlowStatus(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, getVMFlowStatusOutput, error) {
 	result := getVMFlowStatusOutput{
 		MCPServerVersion: t.version,
-		MCPReadOnly:      true,
+		MCPReadOnly:      t.write == nil,
 		Issues:           []string{},
 	}
 	ctx, release, err := t.acquire(ctx, toolTimeout)
@@ -251,6 +256,9 @@ func (t *toolHandlers) getVMFlowStatus(ctx context.Context, _ *mcp.CallToolReque
 	result.DaemonCapabilities = session.Capabilities
 	result.Degraded = session.Degraded
 	result.DegradedCause = session.DegradedCause
+	if t.write != nil && !session.Capabilities.RulesWrite {
+		result.Issues = append(result.Issues, "MCP write mode is enabled but this session cannot write rules; use an admin management token")
+	}
 	if result.APIVersion == "" {
 		result.Issues = append(result.Issues, "daemon API version is unavailable; the daemon may be older than this MCP server or may need to be restarted")
 	} else if result.APIVersion != controlapi.ManagementAPIVersion {
@@ -420,7 +428,7 @@ func (t *toolHandlers) getForwardingRule(ctx context.Context, _ *mcp.CallToolReq
 		}
 		return nil, getForwardingRuleOutput{
 			Revision:       snapshot.Revision,
-			Rule:           rule,
+			Rule:           newForwardingRuleView(rule),
 			Running:        running,
 			StatsAvailable: statsAvailable,
 			Stats:          stats,
@@ -550,24 +558,14 @@ func normalizeProtocolFilter(value string) (string, error) {
 }
 
 func summarizeRule(rule engine.Rule) forwardingRuleSummary {
-	var bandwidth *engine.BandwidthLimit
-	if rule.Bandwidth != nil {
-		value := *rule.Bandwidth
-		bandwidth = &value
-	}
-	var quota *engine.TrafficQuota
-	if rule.TrafficQuota != nil {
-		value := *rule.TrafficQuota
-		quota = &value
-	}
 	return forwardingRuleSummary{
 		RuleID:       rule.RuleID,
 		Name:         rule.Name,
 		Protocol:     rule.Protocol,
 		Enabled:      rule.Enabled,
 		SpeedLimit:   rule.SpeedLimit,
-		Bandwidth:    bandwidth,
-		TrafficQuota: quota,
+		Bandwidth:    newBandwidthLimitView(rule.Bandwidth),
+		TrafficQuota: newTrafficQuotaView(rule.TrafficQuota),
 		MaxConn:      rule.MaxConn,
 		IdleTimeout:  rule.IdleTimeout,
 		Revision:     rule.Revision,

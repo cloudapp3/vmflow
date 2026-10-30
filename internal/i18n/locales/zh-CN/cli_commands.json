@@ -34,7 +34,7 @@
   "cli.mcp.error.tls_requires_https": "MCP TLS 参数要求守护进程管理地址使用 https",
   "cli.mcp.flag.address": "本机守护进程管理地址",
   "cli.mcp.flag.token": "守护进程管理令牌（也可使用环境变量或客户端配置）",
-  "cli.mcp.usage": "用法：\n  vmflow mcp [参数]\n\n通过 stdio 为本机运行中的 vmflow 守护进程启动只读 MCP 服务器。\n\n参数：",
+  "cli.mcp.usage": "用法：\n  vmflow mcp [参数]\n\n通过 stdio 为本机运行中的 vmflow 守护进程启动 MCP 服务器。默认只读；\n传入 --write 后额外提供单规则写工具（需要 admin 管理令牌）。\n\n参数：",
   "cli.service.error.failed": "系统服务 %s 失败：%v",
   "cli.service.error.unknown_action": "未知系统服务操作：%s（应为 install、start、uninstall 或 status）",
   "cli.service.flag.binary": "vmflow 二进制路径（默认使用当前程序；安装要求由 root/管理员拥有且受信任的绝对路径）",
@@ -112,5 +112,7 @@
   "cli.update.output.success": "已成功更新到 %s",
   "cli.update.output.target_available": "指定版本可用：%s（当前 %s）",
   "cli.update.output.updating": "正在从 %s 更新到 %s",
-  "cli.update.usage": "用法：\n  vmflow update [--check] [--version <tag>]\n\n参数："
+  "cli.update.usage": "用法：\n  vmflow update [--check] [--version <tag>]\n\n参数：",
+  "cli.mcp.flag.write": "启用转发规则写工具（也可用 VMFLOW_MCP_WRITE=1）",
+  "cli.mcp.error.write_env": "VMFLOW_MCP_WRITE 的值无效：%v"
 }

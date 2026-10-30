@@ -23,17 +23,29 @@ type fakeManagementClient struct {
 	stats    *controlapi.StatsResponse
 	precheck *controlapi.CurrentPrecheckResponse
 
-	sessionErr  error
-	configErr   error
-	rulesErr    error
-	statsErr    error
-	precheckErr error
+	precheckDraft *controlapi.PrecheckResponse
+	applyDraft    *controlapi.ApplyResponse
 
-	sessionCalls  int
-	configCalls   int
-	rulesCalls    int
-	statsCalls    int
-	precheckCalls int
+	sessionErr    error
+	configErr     error
+	rulesErr      error
+	statsErr      error
+	precheckErr   error
+	precheckDoErr error
+	applyErr      error
+
+	sessionCalls    int
+	configCalls     int
+	rulesCalls      int
+	statsCalls      int
+	precheckCalls   int
+	precheckDoCalls int
+	applyCalls      int
+
+	precheckMatch string
+	applyMatch    string
+	precheckSeen  []controlapi.ConfigRulesRequest
+	applySeen     []controlapi.ConfigRulesRequest
 }
 
 func newFakeManagementClient() *fakeManagementClient {
@@ -71,8 +83,28 @@ func (f *fakeManagementClient) CurrentPrecheck(context.Context) (*controlapi.Cur
 	return f.precheck, f.precheckErr
 }
 
+func (f *fakeManagementClient) Precheck(_ context.Context, match string, draft controlapi.ConfigRulesRequest) (*controlapi.PrecheckResponse, error) {
+	f.precheckDoCalls++
+	f.precheckMatch = match
+	f.precheckSeen = append(f.precheckSeen, draft)
+	if f.precheckDraft == nil {
+		return &controlapi.PrecheckResponse{Precheck: precheck.Result{OK: true, Items: []precheck.Item{}}}, nil
+	}
+	return f.precheckDraft, f.precheckDoErr
+}
+
+func (f *fakeManagementClient) Apply(_ context.Context, match string, draft controlapi.ConfigRulesRequest) (*controlapi.ApplyResponse, error) {
+	f.applyCalls++
+	f.applyMatch = match
+	f.applySeen = append(f.applySeen, draft)
+	if f.applyDraft == nil {
+		return &controlapi.ApplyResponse{Revision: "rev-applied", Rules: draft.Rules}, f.applyErr
+	}
+	return f.applyDraft, f.applyErr
+}
+
 func newToolHandlers(client ManagementClient) *toolHandlers {
-	return newToolHandlersForBackend(newManagementBackend(client), "vtest")
+	return newToolHandlersForBackend(newManagementBackend(client), nil, "vtest")
 }
 
 func TestGetVMFlowStatusAggregatesDaemonState(t *testing.T) {
@@ -226,10 +258,10 @@ func TestListForwardingRulesFiltersSortsLimitsAndRedacts(t *testing.T) {
 	if err != nil || got.Matched != 1 || got.Rules[0].RuleID != "a2" {
 		t.Fatalf("rule ID query = %+v, err=%v", got, err)
 	}
-	if got.Rules[0].Bandwidth == nil || got.Rules[0].Bandwidth.Rate != 1_000_000 || got.Rules[0].TrafficQuota == nil || got.Rules[0].TrafficQuota.Daily != 100_000_000_000 {
+	if got.Rules[0].Bandwidth == nil || got.Rules[0].Bandwidth.Rate != engine.ByteRate(1_000_000).String() || got.Rules[0].TrafficQuota == nil || got.Rules[0].TrafficQuota.Daily != engine.ByteSize(100_000_000_000).String() {
 		t.Fatalf("traffic policy summary = %+v", got.Rules[0])
 	}
-	got.Rules[0].Bandwidth.Rate = 2
+	got.Rules[0].Bandwidth.Rate = "2 B/s"
 	if client.config.Rules[1].Bandwidth.Rate != 1_000_000 {
 		t.Fatal("rule summary shares bandwidth storage with configured rule")
 	}
@@ -405,7 +437,7 @@ func TestToolHandlersLimitConcurrentBackendCalls(t *testing.T) {
 		entered: make(chan struct{}, maxConcurrentTools+1),
 		release: make(chan struct{}),
 	}
-	handlers := newToolHandlersForBackend(backend, "vtest")
+	handlers := newToolHandlersForBackend(backend, nil, "vtest")
 	var wg sync.WaitGroup
 	errors := make(chan error, maxConcurrentTools+1)
 	for range maxConcurrentTools + 1 {

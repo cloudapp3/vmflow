@@ -14,7 +14,7 @@ import (
 )
 
 func TestServerAdvertisesOnlyReadOnlyTools(t *testing.T) {
-	session := connectClient(t, NewServer(newFakeManagementClient(), "v1.2.3"))
+	session := connectClient(t, NewServer(newFakeManagementClient(), "v1.2.3", Options{}))
 	capabilities := session.InitializeResult().Capabilities
 	if capabilities.Tools == nil || capabilities.Logging != nil || capabilities.Prompts != nil || capabilities.Resources != nil {
 		t.Fatalf("unexpected server capabilities: %+v", capabilities)
@@ -59,7 +59,7 @@ func TestServerAdvertisesOnlyReadOnlyTools(t *testing.T) {
 func TestServerReturnsDisconnectedStatusAsStructuredSuccess(t *testing.T) {
 	backend := newFakeManagementClient()
 	backend.sessionErr = errors.New("connection refused")
-	session := connectClient(t, NewServer(backend, "vtest"))
+	session := connectClient(t, NewServer(backend, "vtest", Options{}))
 
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: toolGetVMFlowStatus})
 	if err != nil {
@@ -82,7 +82,7 @@ func TestServerReturnsDisconnectedStatusAsStructuredSuccess(t *testing.T) {
 }
 
 func TestServerReturnsToolValidationErrors(t *testing.T) {
-	session := connectClient(t, NewServer(newFakeManagementClient(), "vtest"))
+	session := connectClient(t, NewServer(newFakeManagementClient(), "vtest", Options{}))
 	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      toolListForwardingRules,
 		Arguments: map[string]any{"protocol": "quic"},
@@ -100,14 +100,14 @@ func TestServerReturnsToolValidationErrors(t *testing.T) {
 
 func TestRunStdioValidatesStreamsAndKeepsEOFQuiet(t *testing.T) {
 	backend := newFakeManagementClient()
-	if err := RunStdio(context.Background(), nil, &bytes.Buffer{}, backend, "vtest"); err == nil {
+	if err := RunStdio(context.Background(), nil, &bytes.Buffer{}, backend, "vtest", Options{}); err == nil {
 		t.Fatal("RunStdio accepted nil stdin")
 	}
-	if err := RunStdio(context.Background(), strings.NewReader(""), nil, backend, "vtest"); err == nil {
+	if err := RunStdio(context.Background(), strings.NewReader(""), nil, backend, "vtest", Options{}); err == nil {
 		t.Fatal("RunStdio accepted nil stdout")
 	}
 	var stdout bytes.Buffer
-	if err := RunStdio(context.Background(), strings.NewReader(""), &stdout, backend, "vtest"); err != nil {
+	if err := RunStdio(context.Background(), strings.NewReader(""), &stdout, backend, "vtest", Options{}); err != nil {
 		t.Fatalf("RunStdio on EOF returned error: %v", err)
 	}
 	if stdout.Len() != 0 {

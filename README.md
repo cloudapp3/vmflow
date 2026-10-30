@@ -32,7 +32,7 @@ Documentation: [English quick start](https://github.com/cloudapp3/vmdocs/blob/ma
 - Rule lifecycle management: start, stop, restart, and full snapshot apply
 - Config-driven foreground process with hot reload
 - Local CLI/TUI management for rules, stats, precheck, reload, and metrics
-- Read-only stdio MCP server for local AI-assisted diagnostics
+- Read-only stdio MCP server for local AI-assisted diagnostics, with opt-in single-rule write tools
 - Bearer-token auth with viewer/admin roles
 - Structured logs in text or JSON format
 - Prometheus-compatible `/metrics`
@@ -46,7 +46,7 @@ Documentation: [English quick start](https://github.com/cloudapp3/vmdocs/blob/ma
 - Forward TCP services such as SSH, databases, and internal APIs between hosts.
 - Relay UDP services with bounded sessions, queues, idle cleanup, and drop metrics.
 - Run a self-hosted Layer 4 proxy on Linux, macOS, or Windows as a native service.
-- Inspect forwarding state and traffic from a local MCP client without exposing a new network service.
+- Inspect forwarding state and traffic from a local MCP client without exposing a new network service, and let an AI assistant configure single rules with the opt-in write mode.
 - Embed TCP/UDP forwarding into a Go application, VPS panel, or network control plane.
 
 ## Quick start
@@ -57,11 +57,11 @@ Install the current stable release and put it on `PATH` for the current shell
 ```bash
 VMFLOW_BIN_DIR="$(
   curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-    | bash -s -- --version v0.3.0 --print-install-dir
+    | bash -s -- --version v0.4.0 --print-install-dir
 )" && export PATH="$VMFLOW_BIN_DIR:$PATH"
 ```
 
-Omit `--version v0.3.0` to follow the latest stable release automatically. For
+Omit `--version v0.4.0` to follow the latest stable release automatically. For
 directory selection, `--system`, checksum verification, and shell startup-file
 handling, see [Installation details](#installation-details).
 
@@ -162,7 +162,7 @@ sudo only to prepare, inspect, and write the target directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cloudapp3/vmflow/main/install.sh \
-  | bash -s -- --version v0.3.0 --system
+  | bash -s -- --version v0.4.0 --system
 ```
 
 `--system` changes only the executable installation directory. Configuration is
@@ -382,7 +382,7 @@ vmflow run           [-config path] [-control-port 19090]
 vmflow status        [-config path] [-json]
 vmflow ctl           [-token TOKEN] <health|rules|stats|metrics|precheck|reload>
 vmflow tui           [-token TOKEN]
-vmflow mcp           [-token TOKEN]
+vmflow mcp           [-token TOKEN] [--write]
 vmflow version       [-json]
 vmflow update        [--check] [--version tag]
 vmflow service       (install|start|uninstall|status) [--config path] [--binary path] [--user name] [--log-file path]
@@ -489,7 +489,8 @@ PATH lines and symlinked or non-writable shell startup files are left untouched.
 ## Local management
 
 The supported management interfaces are `vmflow ctl`, `vmflow tui`, and the
-read-only `vmflow mcp` adapter. The daemon uses an internal loopback-only
+`vmflow mcp` adapter (read-only by default, with opt-in write tools). The
+daemon uses an internal loopback-only
 control channel to implement them; that transport is not a public integration
 API and carries no compatibility promise. `control_port` changes the local port
 without making it externally reachable.
@@ -526,7 +527,10 @@ use fixed values (`upload`/`download` and `daily`/`monthly`).
 `vmflow mcp` starts a foreground, tools-only MCP server over stdio. It connects
 to an already running local vmflow daemon and exits when the MCP client
 disconnects. It does not start forwarding, listen on an MCP network port, or
-modify the daemon configuration.
+modify the daemon configuration unless write mode is enabled. Write mode is
+opt-in (`--write` or `VMFLOW_MCP_WRITE=1`), registers only single-rule tools,
+requires an admin management token, and every change is revalidated by the
+daemon's precheck before the atomic hot-reload apply.
 
 Available tools:
 
@@ -537,6 +541,9 @@ Available tools:
 | `get_forwarding_rule` | Full configuration, running state, and statistics for one rule |
 | `get_traffic_stats` | Filtered and sorted per-rule counters, quota status, and aggregate totals |
 | `run_config_precheck` | Read-only validation of the daemon's current persisted configuration |
+| `upsert_forwarding_rule` | `--write` only: create one rule or replace one rule's configuration; supports `dry_run` and a non-loopback confirmation |
+| `delete_forwarding_rule` | `--write` only: remove one rule; supports `dry_run` |
+| `set_forwarding_rule_enabled` | `--write` only: start or stop one rule; supports `dry_run` |
 
 Use a dedicated viewer token when daemon authentication is enabled. Prefer the
 `VMFLOW_CONTROL_TOKEN` environment variable so the token is not visible in the
@@ -549,9 +556,12 @@ auth:
     - name: mcp-viewer
       token: replace-with-a-long-random-token
       role: viewer
+    - name: mcp-admin
+      token: replace-with-a-longer-random-token
+      role: admin
 ```
 
-Claude Desktop configuration:
+Claude Desktop configuration (read-only):
 
 ```json
 {
@@ -567,12 +577,28 @@ Claude Desktop configuration:
 }
 ```
 
+To let the model configure forwarding, add `--write` and use an admin token:
+
+```json
+{
+  "mcpServers": {
+    "vmflow": {
+      "command": "/usr/local/bin/vmflow",
+      "args": ["mcp", "--write"],
+      "env": {
+        "VMFLOW_CONTROL_TOKEN": "replace-with-a-longer-random-token"
+      }
+    }
+  }
+}
+```
+
 Codex configuration:
 
 ```toml
 [mcp_servers.vmflow]
 command = "/usr/local/bin/vmflow"
-args = ["mcp"]
+args = ["mcp"] # add "--write" and an admin token to enable configuration
 env = { VMFLOW_CONTROL_TOKEN = "replace-with-a-long-random-token" }
 ```
 
@@ -584,10 +610,18 @@ listener.
 
 Rule details contain target addresses, source IP policies, domains, and remarks;
 traffic and precheck results can also reveal local network topology. Tool
-results are sent to the model configured by the MCP client. The server exposes
-no write tools, raw configuration, bot tokens, certificate private keys, shell
-execution, file access, prompts, or resources. Precheck may resolve the targets
-already present in the daemon configuration.
+results are sent to the model configured by the MCP client. By default the
+server exposes no write tools, raw configuration, bot tokens, certificate
+private keys, shell execution, file access, prompts, or resources. Precheck may
+resolve the targets already present in the daemon configuration.
+
+With `--write`, the write tools still change at most one rule per call, keep
+every other rule untouched, and pass daemon-side precheck plus revision-checked
+apply (a concurrent edit is rejected with a retry hint instead of overwriting).
+Creating or changing a listener on a non-loopback address additionally requires
+the explicit `allow_non_loopback` tool argument, so a model cannot silently
+expose a port to other hosts. Set `dry_run` on any write tool to validate a
+change without applying it.
 
 ## Telegram Bot
 

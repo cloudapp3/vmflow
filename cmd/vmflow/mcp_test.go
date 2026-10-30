@@ -102,7 +102,7 @@ func TestParseMCPOptionsHelpInChinese(t *testing.T) {
 		t.Fatalf("help error = %v, want flag.ErrHelp", err)
 	}
 	text := output.String()
-	for _, want := range []string{"用法", "只读 MCP 服务器", "本机守护进程管理地址", "跳过服务器证书验证"} {
+	for _, want := range []string{"用法", "默认只读", "写工具", "本机守护进程管理地址", "跳过服务器证书验证"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("Chinese MCP help does not contain %q: %s", want, text)
 		}
@@ -157,5 +157,39 @@ func TestMCPCommandTransport(t *testing.T) {
 	}
 	if err := session.Close(); err != nil {
 		t.Fatalf("close MCP command session: %v; stderr=%s", err, childStderr.String())
+	}
+}
+
+func TestParseMCPOptionsWriteMode(t *testing.T) {
+	var output bytes.Buffer
+	opts, err := parseMCPOptions([]string{"-addr", "http://127.0.0.1:19090"}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.write {
+		t.Fatalf("write mode must default to off: %+v", opts)
+	}
+
+	t.Setenv("VMFLOW_MCP_WRITE", "1")
+	opts, err = parseMCPOptions([]string{"-addr", "http://127.0.0.1:19090"}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.write {
+		t.Fatalf("VMFLOW_MCP_WRITE=1 did not enable write mode: %+v", opts)
+	}
+
+	// An explicit flag overrides the environment variable.
+	opts, err = parseMCPOptions([]string{"-addr", "http://127.0.0.1:19090", "-write=false"}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.write {
+		t.Fatalf("-write=false did not override the environment: %+v", opts)
+	}
+
+	t.Setenv("VMFLOW_MCP_WRITE", "yes-please")
+	if _, err := parseMCPOptions([]string{"-addr", "http://127.0.0.1:19090"}, &output); err == nil || !strings.Contains(err.Error(), "VMFLOW_MCP_WRITE") {
+		t.Fatalf("invalid VMFLOW_MCP_WRITE error = %v", err)
 	}
 }
