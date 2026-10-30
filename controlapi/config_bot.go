@@ -13,15 +13,33 @@ import (
 	"github.com/cloudapp3/vmflow/config"
 )
 
-// botConfigResponse is the GET /v1/config/bot payload. Tokens are returned in
-// plaintext because the caller is an authenticated admin (who can already read
-// config.yaml); the TUI masks them in its editor.
+// botConfigResponse is the GET /v1/config/bot payload. With authentication
+// enabled, tokens are returned in plaintext because the caller is an
+// authenticated admin (who can already read config.yaml); the TUI masks them in
+// its editor. Without authentication the caller is only an anonymous local
+// user, so configured tokens are reported as maskedBotSecret instead of
+// plaintext.
 type botConfigResponse struct {
 	Revision        string `json:"revision"`
 	BotToken        string `json:"bot_token"`
 	BotChat         int64  `json:"bot_chat"`
 	BotControlToken string `json:"bot_control_token"`
 	Running         bool   `json:"running"`
+}
+
+// maskedBotSecret replaces configured bot tokens in GET responses when the
+// control API runs without authentication: anonymous callers must not learn
+// the credentials. It is a placeholder that no Telegram token can match, and
+// the write path rejects it so a masked value can never be persisted.
+const maskedBotSecret = "__vmflow_masked__"
+
+// maskBotSecret hides a configured token while keeping an unset token empty so
+// callers can still tell whether a bot token is configured at all.
+func maskBotSecret(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return maskedBotSecret
 }
 
 type botConfigRequest struct {
@@ -109,12 +127,17 @@ func (runtime *Runtime) getBotConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	running := runtime.Bot != nil && runtime.Bot.Running()
+	botToken, botControlToken := document.Config.BotToken, document.Config.BotControlToken
+	if !runtime.authenticator().Enabled() {
+		botToken = maskBotSecret(botToken)
+		botControlToken = maskBotSecret(botControlToken)
+	}
 	w.Header().Set("ETag", configETag(document.Revision))
 	writeJSON(w, http.StatusOK, botConfigResponse{
 		Revision:        document.Revision,
-		BotToken:        document.Config.BotToken,
+		BotToken:        botToken,
 		BotChat:         document.Config.BotChat,
-		BotControlToken: document.Config.BotControlToken,
+		BotControlToken: botControlToken,
 		Running:         running,
 	})
 }
@@ -287,6 +310,9 @@ func decodeBotConfigRequest(w http.ResponseWriter, r *http.Request) (botConfigRe
 	}
 	if err := ensureJSONEOF(decoder); err != nil {
 		return botConfigRequest{}, err
+	}
+	if strings.TrimSpace(req.BotToken) == maskedBotSecret || strings.TrimSpace(req.BotControlToken) == maskedBotSecret {
+		return botConfigRequest{}, errors.New("masked bot token placeholder cannot be saved; enter a real value or leave the field empty")
 	}
 	return req, nil
 }

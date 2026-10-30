@@ -433,3 +433,80 @@ func TestGetBotConfigViewerForbidden(t *testing.T) {
 		t.Fatalf("expected 403 for viewer, got %v", err)
 	}
 }
+
+func TestGetBotConfigMasksTokensWithoutAuth(t *testing.T) {
+	writeConfig := func(t *testing.T, token, control string) *Runtime {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		raw := fmt.Sprintf(`version: 1
+bot_token: %q
+bot_chat: 111
+bot_control_token: %q
+rules: []
+`, token, control)
+		if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rt := testRuntime(config.AuthConfig{})
+		rt.ConfigPath = configPath
+		rt.Bot = &fakeBotController{running: true}
+		return rt
+	}
+
+	t.Run("configured tokens are masked", func(t *testing.T) {
+		rt := writeConfig(t, "123:abc", "ctrl")
+		server := httptest.NewServer(NewHandler(rt))
+		defer server.Close()
+
+		resp, err := NewClient(server.URL, "").BotConfig(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.BotToken != maskedBotSecret || resp.BotControlToken != maskedBotSecret {
+			t.Fatalf("configured tokens must be masked without auth: %+v", resp)
+		}
+		if !resp.Running {
+			t.Fatalf("running state must still be reported: %+v", resp)
+		}
+	})
+
+	t.Run("unset tokens stay empty", func(t *testing.T) {
+		rt := writeConfig(t, "", "")
+		server := httptest.NewServer(NewHandler(rt))
+		defer server.Close()
+
+		resp, err := NewClient(server.URL, "").BotConfig(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.BotToken != "" || resp.BotControlToken != "" {
+			t.Fatalf("unset tokens must stay empty: %+v", resp)
+		}
+	})
+}
+
+func TestPutBotConfigRejectsMaskedPlaceholder(t *testing.T) {
+	fake := &fakeBotController{}
+	rt := botTestRuntime(t, botConfigYAML("123:abc", 111, "ctrl"), fake)
+	server := httptest.NewServer(NewHandler(rt))
+	defer server.Close()
+
+	client := NewClient(server.URL, "secret")
+	cfg, err := client.BotConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ApplyBotConfig(context.Background(), cfg.ETag, BotConfigRequest{
+		BotToken:        maskedBotSecret,
+		BotChat:         111,
+		BotControlToken: "ctrl",
+	}); APIStatus(err) != http.StatusBadRequest {
+		t.Fatalf("expected 400 for masked placeholder, got %v", err)
+	}
+	fake.mu.Lock()
+	applied := len(fake.applied)
+	fake.mu.Unlock()
+	if applied != 0 {
+		t.Fatalf("bot controller must not be touched by a rejected save: %d applies", applied)
+	}
+}
