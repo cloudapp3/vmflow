@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"sync"
@@ -495,6 +496,100 @@ func TestUDPQuotaBlocksWholeDatagramsAndReopensNextDay(t *testing.T) {
 	nowUnix.Add(int64(24 * time.Hour / time.Second))
 	sendAndReceive()
 	waitForPeriod("2026-08-03")
+}
+
+// TestUDPPersistFailureTearsDownSessionWithoutQuotaReject pins that a quota
+// state persistence failure is not misreported as quota rejection: the session
+// is torn down and quota_rejected_bytes stays at zero while the persist gate
+// blocks traffic.
+func TestUDPPersistFailureTearsDownSessionWithoutQuotaReject(t *testing.T) {
+	target, stopTarget := startUDPEchoTarget(t)
+	defer stopTarget()
+
+	store := &memoryQuotaStore{saveErr: errors.New("disk on fire")}
+	ledger, err := newQuotaLedger(store, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("persist")
+	rule := udpTestRule("udp-persist", target)
+	rule.TrafficQuota = &TrafficQuota{
+		Daily: ByteSize(1 << 20), Timezone: "UTC", Action: "block",
+	}
+	collector := NewCollector()
+	runner := newUDPRunnerWithTraffic(
+		rule,
+		collector,
+		newUDPSessionBudget(DefaultUDPGlobalMaxSessions),
+		newRuleTrafficController(rule, ledger),
+	).(*udpRunner)
+	if err := runner.Start(); err != nil {
+		t.Fatalf("start UDP persist runner: %v", err)
+	}
+	defer runner.Stop()
+
+	client := listenUDPClient(t)
+	defer client.Close()
+	forwardAddr := runner.ln.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	send := func() {
+		t.Helper()
+		if _, err := client.WriteToUDPAddrPort(payload, forwardAddr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForSessions := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			runner.mu.Lock()
+			count := len(runner.sessions)
+			runner.mu.Unlock()
+			if count == want {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		runner.mu.Lock()
+		count := len(runner.sessions)
+		runner.mu.Unlock()
+		t.Fatalf("active sessions = %d, want %d", count, want)
+	}
+	waitForUsed := func(minBytes int64) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if snapshot := ledger.snapshot(rule.RuleID, rule.TrafficQuota); snapshot != nil && snapshot.Daily != nil && snapshot.Daily.UsedBytes >= minBytes {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("used bytes never reached %d: %+v", minBytes, ledger.snapshot(rule.RuleID, rule.TrafficQuota))
+	}
+
+	// The first datagram is granted and forwarded; its watermark flush fails
+	// in the background and raises the persist gate (either copy direction may
+	// already have torn the session down by then).
+	send()
+	waitForUsed(int64(len(payload)))
+	ledger.waitIdle()
+	if _, _, err := ledger.reserve(rule.RuleID, rule.TrafficQuota, 1, true, 1); !errors.Is(err, ErrQuotaStatePersist) {
+		t.Fatalf("persist gate not observable: %v", err)
+	}
+	// The next datagram must tear its session down instead of being counted
+	// as quota rejection, and no echo arrives while the gate is up.
+	send()
+	waitForSessions(0)
+	if err := client.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(payload))
+	if _, _, err := client.ReadFromUDPAddrPort(buf); err == nil {
+		t.Fatal("gated datagram unexpectedly received a response")
+	}
+	if got := collector.Snapshot(rule.RuleID).QuotaRejectedBytes; got != 0 {
+		t.Fatalf("persist failure counted as quota rejection: %d bytes", got)
+	}
 }
 
 func TestUDPForwardsZeroLengthDatagram(t *testing.T) {

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -452,7 +453,10 @@ func copyWithTrafficOptions(ctx context.Context, dst io.Writer, src io.Reader, s
 				var quotaErr error
 				allowed, reservation, quotaErr = traffic.reserve(int64(nr), false)
 				if quotaErr != nil {
-					if onQuotaRejected != nil {
+					// A persistence failure is not a quota decision and must
+					// not inflate quota_rejected_bytes; the relay still tears
+					// the connection down on the returned error.
+					if onQuotaRejected != nil && !errors.Is(quotaErr, ErrQuotaStatePersist) {
 						onQuotaRejected(int64(nr))
 					}
 					return total, quotaErr

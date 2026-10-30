@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -22,6 +23,12 @@ type QuotaPersistentState struct {
 }
 
 // QuotaStateStore provides strict persistence for enforced traffic quotas.
+//
+// Durability contract with QuotaLedger's write-behind flush: a LoadQuotaState
+// error stays fatal at startup, but a SaveQuotaState error does not roll back
+// the traffic granted in that round. The failed save gates every further
+// reserve (fail-closed going forward) until one succeeds, and a crash may
+// under-count usage by up to one durable chunk per rule and period.
 type QuotaStateStore interface {
 	LoadQuotaState() ([]QuotaPersistentState, error)
 	SaveQuotaState([]QuotaPersistentState) error
@@ -40,6 +47,19 @@ type QuotaLedger struct {
 	now       func() time.Time
 	states    map[string]*quotaRuleUsage
 	locations map[string]*time.Location
+
+	// Write-behind persistence: durable watermark bumps are applied under mu
+	// but persisted by a background single-flight flush goroutine, so a slow
+	// store (fsync) never blocks any rule's chunk accounting. Every field
+	// below is guarded by mu; flushing is the single-flight guard for the
+	// in-progress save round and flushCond wakes waiters when it completes.
+	// flushFailAt throttles retry attempts after a failed save so a broken
+	// store cannot be hammered once per packet or connection.
+	flushPending bool
+	flushErr     error
+	flushing     bool
+	flushFailAt  time.Time
+	flushCond    *sync.Cond
 }
 
 func NewQuotaLedger(store QuotaStateStore) (*QuotaLedger, error) {
@@ -56,6 +76,7 @@ func newQuotaLedger(store QuotaStateStore, now func() time.Time) (*QuotaLedger, 
 		states:    make(map[string]*quotaRuleUsage),
 		locations: make(map[string]*time.Location),
 	}
+	ledger.flushCond = sync.NewCond(&ledger.mu)
 	if store == nil {
 		return ledger, nil
 	}
@@ -148,15 +169,51 @@ func refundQuotaPeriod(periods map[string]int64, period string, amount int64) {
 	}
 }
 
+// quotaPersistRetryCooldown throttles save attempts while the gate is up, so a
+// broken store is retried once per cooldown instead of once per packet.
+const quotaPersistRetryCooldown = time.Second
+
+// reserve grants quota bytes for one forwarding chunk. The durable watermark
+// is bumped under mu, but the store save runs outside mu (write-behind), so an
+// fsync in the store never holds up other rules' reserves. Durability
+// contract: a crash may under-count usage by up to one durable chunk per rule
+// and period; a failed save gates further reserves (fail-closed) until one
+// succeeds.
 func (ledger *QuotaLedger) reserve(ruleID string, quota *TrafficQuota, requested int64, allOrNothing bool, durableChunk int64) (int64, *quotaReservation, error) {
 	if requested <= 0 || quota == nil || (quota.Daily <= 0 && quota.Monthly <= 0) {
 		return requested, nil, nil
 	}
+
 	ledger.mu.Lock()
-	defer ledger.mu.Unlock()
+	if ledger.flushErr != nil {
+		persistErr := ledger.flushErr
+		if ledger.now().Sub(ledger.flushFailAt) < quotaPersistRetryCooldown {
+			// Still inside the retry cooldown: fail closed without another
+			// doomed save attempt on the forwarding data path.
+			ledger.mu.Unlock()
+			return 0, nil, fmt.Errorf("%w: %v", ErrQuotaStatePersist, persistErr)
+		}
+		ledger.flushPending = true
+		retry := false
+		if !ledger.flushing {
+			ledger.flushing = true
+			retry = true
+		}
+		ledger.mu.Unlock()
+		if !retry {
+			// Another goroutine is already saving; fail closed and let the
+			// next reserve observe its outcome.
+			return 0, nil, fmt.Errorf("%w: %v", ErrQuotaStatePersist, persistErr)
+		}
+		if err := ledger.runFlush(); err != nil {
+			return 0, nil, fmt.Errorf("%w: %v", ErrQuotaStatePersist, err)
+		}
+		ledger.mu.Lock()
+	}
 
 	periods, err := ledger.periodsLocked(quota)
 	if err != nil {
+		ledger.mu.Unlock()
 		return 0, nil, err
 	}
 	state := ledger.states[ruleID]
@@ -164,6 +221,7 @@ func (ledger *QuotaLedger) reserve(ruleID string, quota *TrafficQuota, requested
 		state = newQuotaRuleUsage()
 		ledger.states[ruleID] = state
 	}
+	pruneQuotaPeriods(state, periods)
 	allowed := requested
 	if quota.Daily > 0 {
 		allowed = min(allowed, max(0, int64(quota.Daily)-state.dailyUsed[periods.daily]))
@@ -172,24 +230,28 @@ func (ledger *QuotaLedger) reserve(ruleID string, quota *TrafficQuota, requested
 		allowed = min(allowed, max(0, int64(quota.Monthly)-state.monthlyUsed[periods.monthly]))
 	}
 	if allowed <= 0 || (allOrNothing && allowed < requested) {
+		ledger.mu.Unlock()
 		return 0, nil, ErrTrafficQuotaExceeded
 	}
 	if durableChunk <= 0 {
 		durableChunk = 8 << 20
 	}
-
-	rollback := captureDurablePeriods(state, periods)
 	changed := false
 	if quota.Daily > 0 {
+		// growDurablePeriod must run for monthly even when the daily call
+		// already returned true, hence grow(...) || changed and not the
+		// reverse; reordering would silently drop monthly durable marks.
 		changed = growDurablePeriod(state.dailyDurable, state.dailyUsed, periods.daily, int64(quota.Daily), allowed, durableChunk) || changed
 	}
 	if quota.Monthly > 0 {
 		changed = growDurablePeriod(state.monthlyDurable, state.monthlyUsed, periods.monthly, int64(quota.Monthly), allowed, durableChunk) || changed
 	}
+	flush := false
 	if changed && ledger.store != nil {
-		if err := ledger.store.SaveQuotaState(ledger.persistentStateLocked()); err != nil {
-			rollback.restore(state)
-			return 0, nil, fmt.Errorf("%w: %v", ErrQuotaStatePersist, err)
+		ledger.flushPending = true
+		if !ledger.flushing {
+			ledger.flushing = true
+			flush = true
 		}
 	}
 	if quota.Daily > 0 {
@@ -198,13 +260,99 @@ func (ledger *QuotaLedger) reserve(ruleID string, quota *TrafficQuota, requested
 	if quota.Monthly > 0 {
 		state.monthlyUsed[periods.monthly] += allowed
 	}
-	return allowed, &quotaReservation{
+	reservation := &quotaReservation{
 		ledger:        ledger,
 		ruleID:        ruleID,
 		dailyPeriod:   activePeriod(quota.Daily > 0, periods.daily),
 		monthlyPeriod: activePeriod(quota.Monthly > 0, periods.monthly),
 		bytes:         allowed,
-	}, nil
+	}
+	ledger.mu.Unlock()
+
+	// The grant is complete; hand the watermark save to a background
+	// single-flight flusher so no forwarding goroutine waits on store I/O.
+	if flush {
+		go ledger.runFlush()
+	}
+	return allowed, reservation, nil
+}
+
+// runFlush persists pending watermark bumps and must be entered only after
+// winning the flushing single-flight guard. Each round snapshots under mu and
+// saves outside it, then keeps draining until no bump is pending, so requests
+// raised during a save coalesce into the next round. A failed save is recorded
+// in flushErr (gating later reserves, throttled by quotaPersistRetryCooldown);
+// a drained round clears it.
+func (ledger *QuotaLedger) runFlush() error {
+	for {
+		ledger.mu.Lock()
+		if !ledger.flushPending {
+			ledger.flushErr = nil
+			// Clear the single-flight guard under mu: a goroutine that just
+			// set flushPending then either sees flushing==false and takes
+			// over, or is covered by this drain loop's next iteration.
+			ledger.flushing = false
+			ledger.flushCond.Broadcast()
+			ledger.mu.Unlock()
+			return nil
+		}
+		snapshot := ledger.persistentStateLocked()
+		ledger.flushPending = false
+		ledger.mu.Unlock()
+		if err := ledger.store.SaveQuotaState(snapshot); err != nil {
+			ledger.mu.Lock()
+			ledger.flushErr = err
+			ledger.flushFailAt = ledger.now()
+			ledger.flushing = false
+			ledger.flushCond.Broadcast()
+			ledger.mu.Unlock()
+			// Attempting is throttled by the retry cooldown, so this logs at
+			// most once per cooldown while a store stays broken.
+			log.Printf("[vmflow] persist quota state failed, gating new traffic until a save succeeds: %v", err)
+			return err
+		}
+	}
+}
+
+// quotaRetainedPastPeriods is how many calendar periods before the active one
+// keep their usage keys. Older keys are pruned so quota-state.json cannot grow
+// without bound, while a recent clock rollback still cannot recreate an empty
+// period (which would re-open allowance).
+const quotaRetainedPastPeriods = 2
+
+// pruneQuotaPeriods drops usage and durable keys older than the retained
+// window. Period keys are fixed-width UTC-format calendar strings, so cutoff
+// comparison is a plain lexicographic test.
+func pruneQuotaPeriods(state *quotaRuleUsage, periods quotaPeriods) {
+	if len(state.dailyUsed) > quotaRetainedPastPeriods+1 {
+		dailyCutoff := periods.dailyReset.AddDate(0, 0, -(quotaRetainedPastPeriods + 1)).Format("2006-01-02")
+		prunePeriodMap(state.dailyUsed, dailyCutoff)
+		prunePeriodMap(state.dailyDurable, dailyCutoff)
+	}
+	if len(state.monthlyUsed) > quotaRetainedPastPeriods+1 {
+		monthlyCutoff := periods.monthlyReset.AddDate(0, -(quotaRetainedPastPeriods + 1), 0).Format("2006-01")
+		prunePeriodMap(state.monthlyUsed, monthlyCutoff)
+		prunePeriodMap(state.monthlyDurable, monthlyCutoff)
+	}
+}
+
+func prunePeriodMap(values map[string]int64, cutoff string) {
+	for period := range values {
+		if period < cutoff {
+			delete(values, period)
+		}
+	}
+}
+
+// waitIdle blocks until no watermark bump is pending and no flush round is in
+// flight. It makes asynchronous persistence observable for callers that need
+// the durable state settled (tests and shutdown paths).
+func (ledger *QuotaLedger) waitIdle() {
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	for ledger.flushPending || ledger.flushing {
+		ledger.flushCond.Wait()
+	}
 }
 
 func activePeriod(enabled bool, period string) string {
@@ -222,35 +370,6 @@ func growDurablePeriod(durable, used map[string]int64, period string, limit, all
 	target := max(required, durable[period]+chunk)
 	durable[period] = min(limit, target)
 	return true
-}
-
-type durableRollback struct {
-	dailyValue, monthlyValue   int64
-	dailyFound, monthlyFound   bool
-	dailyPeriod, monthlyPeriod string
-}
-
-func captureDurablePeriods(state *quotaRuleUsage, periods quotaPeriods) durableRollback {
-	daily, dailyFound := state.dailyDurable[periods.daily]
-	monthly, monthlyFound := state.monthlyDurable[periods.monthly]
-	return durableRollback{
-		dailyValue: daily, monthlyValue: monthly,
-		dailyFound: dailyFound, monthlyFound: monthlyFound,
-		dailyPeriod: periods.daily, monthlyPeriod: periods.monthly,
-	}
-}
-
-func (rollback durableRollback) restore(state *quotaRuleUsage) {
-	restoreMapValue(state.dailyDurable, rollback.dailyPeriod, rollback.dailyValue, rollback.dailyFound)
-	restoreMapValue(state.monthlyDurable, rollback.monthlyPeriod, rollback.monthlyValue, rollback.monthlyFound)
-}
-
-func restoreMapValue(values map[string]int64, key string, value int64, found bool) {
-	if found {
-		values[key] = value
-	} else {
-		delete(values, key)
-	}
 }
 
 type quotaPeriods struct {
@@ -355,6 +474,12 @@ func (ledger *QuotaLedger) SaveExact() error {
 	}
 	ledger.mu.Lock()
 	defer ledger.mu.Unlock()
+	// Wait out any in-flight write-behind round so its conservative snapshot
+	// cannot overwrite the exact state written below.
+	for ledger.flushing {
+		ledger.flushCond.Wait()
+	}
+	ledger.flushPending = false // this exact save supersedes any pending bump
 	for _, state := range ledger.states {
 		state.dailyDurable = clonePeriodMap(state.dailyUsed)
 		state.monthlyDurable = clonePeriodMap(state.monthlyUsed)
@@ -362,6 +487,9 @@ func (ledger *QuotaLedger) SaveExact() error {
 	if err := ledger.store.SaveQuotaState(ledger.persistentStateLocked()); err != nil {
 		return fmt.Errorf("%w: %v", ErrQuotaStatePersist, err)
 	}
+	// The exact save succeeded with no runner left to fail later: lift the
+	// gate so reserves resume without a redundant retry round.
+	ledger.flushErr = nil
 	return nil
 }
 

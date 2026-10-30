@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strconv"
@@ -303,7 +304,20 @@ func (runner *udpRunner) uploadLoop(key netip.AddrPort, session *udpSession) {
 				return
 			}
 			allowed, reservation, quotaErr := runner.traffic.reserve(int64(len(payload)), true)
-			if quotaErr != nil || allowed != int64(len(payload)) {
+			if quotaErr != nil {
+				session.queuedBytes.Add(-packet.accountedBytes)
+				releaseUDPQueuedPacket(packet)
+				if errors.Is(quotaErr, ErrQuotaStatePersist) {
+					// A persistence failure is not a quota decision; tearing
+					// the session down beats silently blackholing datagrams
+					// one at a time while the persist gate is up.
+					runner.removeSession(key, session)
+					return
+				}
+				runner.stats.addQuotaRejectedBytes(int64(len(payload)))
+				continue
+			}
+			if allowed != int64(len(payload)) {
 				runner.stats.addQuotaRejectedBytes(int64(len(payload)))
 				session.queuedBytes.Add(-packet.accountedBytes)
 				releaseUDPQueuedPacket(packet)
@@ -435,7 +449,18 @@ func (runner *udpRunner) readFromTarget(key netip.AddrPort, session *udpSession)
 			return
 		}
 		allowed, reservation, quotaErr := runner.traffic.reserve(int64(n), true)
-		if quotaErr != nil || allowed != int64(n) {
+		if quotaErr != nil {
+			session.pendingDownload.Add(-1)
+			if errors.Is(quotaErr, ErrQuotaStatePersist) {
+				// Mirror the upload path: tear the session down instead of
+				// dropping datagrams one at a time against a broken store.
+				runner.removeSession(key, session)
+				return
+			}
+			runner.stats.addQuotaRejectedBytes(int64(n))
+			continue
+		}
+		if allowed != int64(n) {
 			runner.stats.addQuotaRejectedBytes(int64(n))
 			session.pendingDownload.Add(-1)
 			continue

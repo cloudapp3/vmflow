@@ -15,7 +15,10 @@ import (
 const quotaDocumentVersion = 1
 
 // DefaultQuotaFilename is kept separate from cumulative counters because quota
-// enforcement treats corrupt or unwritable state as fatal rather than resetting.
+// enforcement treats corrupt state at load time as fatal rather than resetting.
+// A failed runtime save does not roll back granted traffic: the ledger gates
+// further reserves until a save succeeds, and a crash may under-count usage by
+// up to one durable chunk per rule and period (see engine.QuotaStateStore).
 const DefaultQuotaFilename = "quota-state.json"
 
 type QuotaStore struct {
